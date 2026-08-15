@@ -8,10 +8,13 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod config;
 pub mod domain;
 pub mod error;
 pub mod launch;
 pub mod linux_process;
+pub mod theme;
 pub mod tmux;
+pub mod ui;
 
 pub use error::{MuxError, Result};

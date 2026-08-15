@@ -1,0 +1,620 @@
+//! Keyboard-first state model and deterministic Ratatui renderer.
+
+pub mod terminal;
+
+use std::cmp;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::Style,
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+};
+
+use crate::{
+    domain::{Pane, PaneId, TerminalSize, ThemeId},
+    theme::{Theme, theme},
+};
+
+/// Responsive rendering profile selected from the terminal dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayoutKind {
+    /// Full list plus persistent command sidebar.
+    Wide,
+    /// Full-width list with a footer command bar.
+    Compact,
+    /// Single-line rows and abbreviated phone controls.
+    Phone,
+    /// Minimal selected-session view for severely constrained terminals.
+    Tiny,
+}
+
+/// Chooses a stable layout without depending on frame history.
+#[must_use]
+pub const fn layout_kind(size: TerminalSize) -> LayoutKind {
+    if size.width < 40 || size.height < 12 {
+        LayoutKind::Tiny
+    } else if size.width <= 62 || size.height < 20 {
+        LayoutKind::Phone
+    } else if size.is_compact() {
+        LayoutKind::Compact
+    } else {
+        LayoutKind::Wide
+    }
+}
+
+/// High-level action requested by a key press.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Action {
+    /// Activate the selected tmux pane.
+    Activate(PaneId),
+    /// Start a new Codex session.
+    New,
+    /// Start Codex with its resume subcommand.
+    Resume,
+    /// Close the pane after explicit confirmation.
+    Close(PaneId),
+    /// Persist a theme chosen in the live-preview picker.
+    PersistTheme(ThemeId),
+    /// Leave the popup without changing tmux state.
+    Quit,
+}
+
+/// Per-invocation policy controlling whether colored themes may be selected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ColorPolicy {
+    /// Allow normal live preview and theme persistence.
+    #[default]
+    Allow,
+    /// Force monochrome and disable theme selection without changing preferences.
+    ForceMonochrome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Mode {
+    Browse,
+    ConfirmClose(PaneId),
+    ThemePicker { original: ThemeId },
+}
+
+/// Complete renderer-independent UI state.
+#[derive(Clone, Debug)]
+pub struct App {
+    panes: Vec<Pane>,
+    selected: Option<PaneId>,
+    theme: ThemeId,
+    color_policy: ColorPolicy,
+    mode: Mode,
+    warning: Option<String>,
+}
+
+impl App {
+    /// Creates an application with the first pane selected.
+    #[must_use]
+    pub fn new(panes: Vec<Pane>, theme: ThemeId, warning: Option<String>) -> Self {
+        Self::with_color_policy(panes, theme, warning, ColorPolicy::Allow)
+    }
+
+    /// Creates an application with an explicit per-invocation color policy.
+    #[must_use]
+    pub fn with_color_policy(
+        panes: Vec<Pane>,
+        theme: ThemeId,
+        warning: Option<String>,
+        color_policy: ColorPolicy,
+    ) -> Self {
+        let selected = panes.first().map(|pane| pane.id.clone());
+        Self {
+            panes,
+            selected,
+            theme: if color_policy == ColorPolicy::ForceMonochrome {
+                ThemeId::Monochrome
+            } else {
+                theme
+            },
+            color_policy,
+            mode: Mode::Browse,
+            warning,
+        }
+    }
+
+    /// Returns the panes in their display order.
+    #[must_use]
+    pub fn panes(&self) -> &[Pane] {
+        &self.panes
+    }
+
+    /// Returns the selected stable pane identity.
+    #[must_use]
+    pub fn selected_pane_id(&self) -> Option<&PaneId> {
+        self.selected.as_ref()
+    }
+
+    /// Returns the theme currently shown, including picker live previews.
+    #[must_use]
+    pub const fn active_theme(&self) -> ThemeId {
+        self.theme
+    }
+
+    /// Replaces discovery results while preserving selection by pane identity.
+    pub fn replace_panes(&mut self, panes: Vec<Pane>) {
+        let old_index = self.selected_index().unwrap_or(0);
+        let old_selection = self.selected.clone();
+        self.panes = panes;
+        self.selected = old_selection
+            .filter(|id| self.panes.iter().any(|pane| &pane.id == id))
+            .or_else(|| {
+                let index = cmp::min(old_index, self.panes.len().saturating_sub(1));
+                self.panes.get(index).map(|pane| pane.id.clone())
+            });
+        if matches!(&self.mode, Mode::ConfirmClose(id) if !self.panes.iter().any(|pane| &pane.id == id))
+        {
+            self.mode = Mode::Browse;
+        }
+    }
+
+    /// Applies a key event and returns an action for the tmux/application layer.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        match self.mode.clone() {
+            Mode::Browse => self.handle_browse_key(key.code),
+            Mode::ConfirmClose(id) => self.handle_confirmation_key(key, id),
+            Mode::ThemePicker { original } => self.handle_theme_key(key.code, original),
+        }
+    }
+
+    fn handle_browse_key(&mut self, code: KeyCode) -> Option<Action> {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_selection(1);
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_selection(-1);
+                None
+            }
+            KeyCode::Enter => self.selected.clone().map(Action::Activate),
+            KeyCode::Char('n') => Some(Action::New),
+            KeyCode::Char('r') => Some(Action::Resume),
+            KeyCode::Char('x') => {
+                if let Some(id) = self.selected.clone() {
+                    self.mode = Mode::ConfirmClose(id);
+                }
+                None
+            }
+            KeyCode::Char('t') => {
+                if self.color_policy == ColorPolicy::Allow {
+                    self.mode = Mode::ThemePicker {
+                        original: self.theme,
+                    };
+                }
+                None
+            }
+            KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+            _ => None,
+        }
+    }
+
+    fn handle_confirmation_key(&mut self, key: KeyEvent, id: PaneId) -> Option<Action> {
+        if key.kind != KeyEventKind::Press {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('x') | KeyCode::Enter => {
+                self.mode = Mode::Browse;
+                Some(Action::Close(id))
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Browse;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_theme_key(&mut self, code: KeyCode, original: ThemeId) -> Option<Action> {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('t') => {
+                self.cycle_theme(1);
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.cycle_theme(-1);
+                None
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Browse;
+                Some(Action::PersistTheme(self.theme))
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.theme = original;
+                self.mode = Mode::Browse;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        self.panes.iter().position(|pane| &pane.id == selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.panes.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let current = self.selected_index().unwrap_or(0);
+        let last = self.panes.len() - 1;
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize).min(last)
+        };
+        self.selected = Some(self.panes[next].id.clone());
+    }
+
+    fn cycle_theme(&mut self, delta: isize) {
+        let current = ThemeId::ALL
+            .iter()
+            .position(|candidate| *candidate == self.theme)
+            .unwrap_or(0);
+        let count = ThemeId::ALL.len() as isize;
+        let next = (current as isize + delta).rem_euclid(count) as usize;
+        self.theme = ThemeId::ALL[next];
+    }
+}
+
+/// Renders the current application state into one deterministic frame.
+pub fn render(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    if area.is_empty() {
+        return;
+    }
+    let palette = theme(app.theme);
+    frame.render_widget(Block::default().style(palette.text), area);
+    match layout_kind(TerminalSize {
+        width: area.width,
+        height: area.height,
+    }) {
+        LayoutKind::Wide => render_wide(frame, area, app, palette),
+        LayoutKind::Compact => render_compact(frame, area, app, palette, false),
+        LayoutKind::Phone => render_compact(frame, area, app, palette, true),
+        LayoutKind::Tiny => render_tiny(frame, area, app, palette),
+    }
+    if matches!(app.mode, Mode::ThemePicker { .. }) {
+        render_theme_picker(frame, area, app, palette);
+    }
+}
+
+fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
+    let outer = Block::default()
+        .title(" codex-mux ")
+        .borders(Borders::ALL)
+        .border_style(palette.accent);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(45), Constraint::Length(29)])
+        .split(inner);
+    render_list(frame, columns[0], app, palette, false);
+    let mut help_lines = vec![
+        Line::styled("Commands", palette.accent),
+        Line::from("Enter  switch"),
+        Line::from("n      new session"),
+        Line::from("r      resume"),
+        Line::from("x x    close"),
+        Line::from("t      themes"),
+        Line::from("q/Esc  quit"),
+    ];
+    if matches!(app.mode, Mode::ConfirmClose(_)) {
+        help_lines.push(Line::default());
+        help_lines.push(Line::styled("Close selected pane?", palette.warning));
+        help_lines.push(Line::styled("x/Enter yes · Esc no", palette.warning));
+    } else if let Some(warning) = &app.warning {
+        help_lines.push(Line::default());
+        help_lines.push(Line::styled("Preference warning", palette.warning));
+        help_lines.push(Line::styled(sanitized(warning), palette.warning));
+    }
+    let help = Paragraph::new(help_lines)
+        .block(Block::default().borders(Borders::LEFT).title(" keys "))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(help, columns[1]);
+}
+
+fn render_compact(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, phone: bool) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(if app.warning.is_some() { 2 } else { 1 }),
+        ])
+        .split(area);
+    frame.render_widget(Paragraph::new("codex-mux").style(palette.accent), chunks[0]);
+    render_list(frame, chunks[1], app, palette, phone);
+    let footer = if matches!(app.mode, Mode::ConfirmClose(_)) {
+        Paragraph::new("press x/Enter again to close · Esc cancels").style(palette.warning)
+    } else if let Some(warning) = &app.warning {
+        Paragraph::new(sanitized(warning))
+            .style(palette.warning)
+            .wrap(Wrap { trim: true })
+    } else if phone {
+        Paragraph::new("↕/jk move · Enter open · n new · r resume · x close · t theme")
+            .style(palette.muted)
+    } else {
+        Paragraph::new("jk/↕ move  Enter switch  n new  r resume  x close  t theme  q quit")
+            .style(palette.muted)
+    };
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn render_tiny(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
+    let title = app
+        .selected_index()
+        .and_then(|index| app.panes.get(index))
+        .map(|pane| sanitized(&pane.display_title()))
+        .unwrap_or_else(|| "No Codex panes".to_owned());
+    let lines = if matches!(app.mode, Mode::ConfirmClose(_)) {
+        vec![
+            Line::styled("Close pane?", palette.warning),
+            Line::from(title),
+            Line::styled("x=yes Esc=no", palette.muted),
+        ]
+    } else {
+        vec![
+            Line::styled("codex-mux", palette.accent),
+            Line::styled(title, palette.selected),
+            Line::styled("↕ open n r x t q", palette.muted),
+        ]
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, single_line: bool) {
+    let items = app.panes.iter().map(|pane| {
+        let title = sanitized(&pane.display_title());
+        let path = sanitized(&pane.current_path.to_string_lossy());
+        if single_line {
+            ListItem::new(Line::from(vec![
+                Span::raw(title),
+                Span::styled(format!("  {path}"), palette.muted),
+            ]))
+        } else {
+            ListItem::new(vec![
+                Line::from(title),
+                Line::styled(format!("  {path}"), palette.muted),
+            ])
+        }
+    });
+    let mut state = ListState::default().with_selected(app.selected_index());
+    let list = List::new(items)
+        .highlight_style(palette.selected)
+        .highlight_symbol("› ")
+        .block(Block::default().title(" sessions "));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
+    let popup = centered_rect(area, if area.width <= 62 { 92 } else { 48 }, 9);
+    frame.render_widget(Clear, popup);
+    let lines = ThemeId::ALL.into_iter().map(|candidate| {
+        let marker = if candidate == app.theme { "› " } else { "  " };
+        let style = if candidate == app.theme {
+            palette.selected
+        } else {
+            Style::default()
+        };
+        Line::styled(format!("{marker}{candidate}"), style)
+    });
+    let picker = Paragraph::new(lines.collect::<Vec<_>>())
+        .block(
+            Block::default()
+                .title(" theme · live preview ")
+                .borders(Borders::ALL)
+                .border_style(palette.accent),
+        )
+        .alignment(Alignment::Left);
+    frame.render_widget(picker, popup);
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
+    let width = area.width.saturating_mul(width_percent).saturating_div(100);
+    let width = width.max(1).min(area.width);
+    let height = height.min(area.height).max(1);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn sanitized(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+
+    use crossterm::event::{KeyEventKind, KeyModifiers};
+
+    use super::terminal::{TerminalControl, with_restoration};
+    use super::{
+        Action, App, ColorPolicy, KeyCode, KeyEvent, LayoutKind, Pane, PaneId, TerminalSize,
+        ThemeId, layout_kind,
+    };
+    use crate::domain::SessionId;
+
+    fn pane(id: &str, title: &str) -> Pane {
+        Pane {
+            id: PaneId::new(id).unwrap(),
+            session_id: SessionId::new("$1").unwrap(),
+            title: Some(title.to_owned()),
+            current_path: PathBuf::from(format!("/work/{title}")),
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn responsive_breakpoints_include_phone_and_tiny() {
+        assert_eq!(
+            layout_kind(TerminalSize {
+                width: 120,
+                height: 40
+            }),
+            LayoutKind::Wide
+        );
+        assert_eq!(
+            layout_kind(TerminalSize {
+                width: 89,
+                height: 40
+            }),
+            LayoutKind::Compact
+        );
+        assert_eq!(
+            layout_kind(TerminalSize {
+                width: 62,
+                height: 28
+            }),
+            LayoutKind::Phone
+        );
+        assert_eq!(
+            layout_kind(TerminalSize {
+                width: 39,
+                height: 28
+            }),
+            LayoutKind::Tiny
+        );
+    }
+
+    #[test]
+    fn selection_survives_reordering_and_uses_nearest_row_on_disappearance() {
+        let mut app = App::new(
+            vec![pane("%1", "one"), pane("%2", "two"), pane("%3", "three")],
+            ThemeId::default(),
+            None,
+        );
+        app.handle_key(key(KeyCode::Char('j')));
+        app.replace_panes(vec![
+            pane("%3", "three"),
+            pane("%2", "two"),
+            pane("%1", "one"),
+        ]);
+        assert_eq!(app.selected_pane_id().unwrap().as_str(), "%2");
+        app.replace_panes(vec![pane("%3", "three"), pane("%1", "one")]);
+        assert_eq!(app.selected_pane_id().unwrap().as_str(), "%1");
+    }
+
+    #[test]
+    fn close_requires_a_second_deliberate_key() {
+        let mut app = App::new(vec![pane("%1", "one")], ThemeId::default(), None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), None);
+        assert_eq!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            None
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('x'))),
+            Some(Action::Close(PaneId::new("%1").unwrap()))
+        );
+    }
+
+    #[test]
+    fn forced_monochrome_disables_colored_preview_and_persistence() {
+        let mut app = App::with_color_policy(
+            vec![],
+            ThemeId::EmberOrange,
+            None,
+            ColorPolicy::ForceMonochrome,
+        );
+        assert_eq!(app.active_theme(), ThemeId::Monochrome);
+        assert_eq!(app.handle_key(key(KeyCode::Char('t'))), None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('j'))), None);
+        assert_eq!(app.active_theme(), ThemeId::Monochrome);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn theme_picker_previews_then_reverts_or_persists() {
+        let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);
+        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_theme(), ThemeId::BlueCommandPalette);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.active_theme(), ThemeId::AdaptiveCyan);
+        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Action::PersistTheme(ThemeId::BlueCommandPalette))
+        );
+    }
+
+    #[derive(Clone)]
+    struct FakeTerminal(Arc<Mutex<Vec<&'static str>>>);
+
+    impl TerminalControl for FakeTerminal {
+        fn enter(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().push("enter");
+            Ok(())
+        }
+        fn leave(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().push("leave");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminal_restores_after_success_error_and_panic() {
+        for outcome in ["ok", "error"] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let result = with_restoration(FakeTerminal(calls.clone()), |_| {
+                if outcome == "ok" {
+                    Ok(())
+                } else {
+                    Err("failed")
+                }
+            })
+            .unwrap();
+            assert_eq!(result.is_ok(), outcome == "ok");
+            assert_eq!(*calls.lock().unwrap(), vec!["enter", "leave"]);
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let _ = std::panic::catch_unwind({
+            let calls = calls.clone();
+            move || {
+                let _ = with_restoration(FakeTerminal(calls), |_| -> Result<(), ()> {
+                    panic!("boom")
+                });
+            }
+        });
+        assert_eq!(*calls.lock().unwrap(), vec!["enter", "leave"]);
+    }
+}
