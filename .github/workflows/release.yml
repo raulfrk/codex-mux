@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+      SOURCE_DATE_EPOCH: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate tag and select version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! $RELEASE_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          version=${RELEASE_TAG#v}
+          scripts/release-channel.sh "$version" >/dev/null
+          crate_version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' Cargo.toml)
+          if [[ $version != "$crate_version" ]]; then
+            echo "tag version $version does not match Cargo.toml version $crate_version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install Rust 1.85 target
+        run: rustup toolchain install 1.85.0 --profile minimal --target "${{ matrix.target }}"
+      - name: Build locked release binary
+        run: cargo +1.85.0 build --locked --release --target "${{ matrix.target }}"
+      - name: Package deterministic archive
+        run: >-
+          scripts/package-release.sh
+          "${{ steps.version.outputs.version }}"
+          "${{ matrix.target }}"
+          "target/${{ matrix.target }}/release/codex-mux"
+          dist
+      - name: Smoke packaged native binary
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          archive="dist/codex-mux-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"
+          smoke=$(mktemp -d)
+          tar -xzf "$archive" -C "$smoke"
+          packaged="$smoke/codex-mux-${RELEASE_VERSION}-${RELEASE_TARGET}/codex-mux"
+          test -x "$packaged"
+          test "$("$packaged" --version)" = "codex-mux ${RELEASE_VERSION}"
+      - name: Upload architecture archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Download architecture archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Validate assets and write checksum manifest
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=${RELEASE_TAG#v}
+          expected=$(printf '%s\n' \
+            "codex-mux-${version}-aarch64-unknown-linux-gnu.tar.gz" \
+            "codex-mux-${version}-x86_64-unknown-linux-gnu.tar.gz")
+          actual=$(find dist -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | LC_ALL=C sort)
+          if [[ $actual != "$expected" ]]; then
+            echo "unexpected release assets:" >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+          scripts/write-checksums.sh dist
+          (cd dist && sha256sum -c SHA256SUMS)
+      - name: Publish immutable tag assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          release_flags=()
+          if [[ $(scripts/release-channel.sh "$version") == prerelease ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            dist/* \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "${release_flags[@]}"
