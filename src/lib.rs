@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod install;
 pub mod launch;
 pub mod linux_process;
 pub mod theme;
