@@ -10,6 +10,7 @@
 pub mod cli;
 pub mod domain;
 pub mod error;
+pub mod launch;
 pub mod linux_process;
 pub mod tmux;
 
