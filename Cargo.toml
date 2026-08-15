@@ -1,0 +1,17 @@
+[package]
+name = "codex-mux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A tmux-native switcher for Codex sessions"
+keywords = ["codex", "tmux", "tui"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5.32", features = ["derive"] }
+crossterm = "0.28.1"
+ratatui = "0.29.0"
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.12"
+toml = "0.8.20"
