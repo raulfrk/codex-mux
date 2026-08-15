@@ -28,10 +28,11 @@ fn tmux_help_exposes_install_status_and_uninstall() {
 }
 
 #[test]
-fn bootstrap_runtime_fails_explicitly_without_touching_tmux() {
+fn interactive_runtime_requires_explicit_tmux_context() {
     let output = binary().output().unwrap();
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("interactive TUI is not available"));
+    assert!(stderr.contains("invoking path"));
+    assert!(stderr.contains("required when opening the interactive popup"));
 }

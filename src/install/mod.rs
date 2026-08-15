@@ -55,8 +55,8 @@ pub enum InstallError {
         #[source]
         source: io::Error,
     },
-    /// The file was written, but the running tmux server rejected its reload.
-    #[error("configuration was written to {path}, but tmux reload failed: {message}")]
+    /// The file was written, but the running tmux server could not be synchronized.
+    #[error("could not synchronize running tmux with {path}: {message}")]
     ReloadFailed {
         /// Successfully updated configuration path.
         path: PathBuf,
@@ -225,6 +225,8 @@ impl ExecutablePaths {
 pub trait TmuxReloader {
     /// Returns whether a server is currently available for reload.
     fn is_running(&self) -> bool;
+    /// Removes an old owned prefix binding before the updated host file is sourced.
+    fn unbind(&mut self, key: &str) -> std::result::Result<(), String>;
     /// Sources the exact updated entrypoint in the running server.
     fn reload(&mut self, path: &Path) -> std::result::Result<(), String>;
 }
@@ -236,6 +238,10 @@ pub struct NoRunningServer;
 impl TmuxReloader for NoRunningServer {
     fn is_running(&self) -> bool {
         false
+    }
+
+    fn unbind(&mut self, _key: &str) -> std::result::Result<(), String> {
+        Ok(())
     }
 
     fn reload(&mut self, _path: &Path) -> std::result::Result<(), String> {
@@ -267,6 +273,7 @@ pub fn install(
     let metadata = validate_regular_writable(path)?;
     let original = read(path)?;
     let markers = locate_markers(&original)?;
+    let previous_key = markers.and_then(|region| block_field(&original, region, KEY_FIELD));
     let owned_leading_newline = markers.map_or(
         !original.is_empty() && !original.ends_with(b"\n"),
         |region| owned_leading_newline(&original, region),
@@ -275,12 +282,23 @@ pub fn install(
     let replacement =
         replace_or_append(&original, markers, owned_leading_newline, block.as_bytes());
 
+    let running = reloader.is_running();
     if replacement == original {
+        let mut reloaded = false;
+        if running {
+            reloader
+                .reload(path)
+                .map_err(|message| InstallError::ReloadFailed {
+                    path: path.to_owned(),
+                    message,
+                })?;
+            reloaded = true;
+        }
         return Ok(InstallOutcome {
             path: path.to_owned(),
             backup: None,
             changed: false,
-            reloaded: false,
+            reloaded,
         });
     }
 
@@ -289,10 +307,26 @@ pub fn install(
     } else {
         None
     };
-    atomic_replace(path, &replacement, metadata.mode())?;
+    let changed_key = previous_key.as_deref().filter(|previous| *previous != key);
+    if running {
+        if let Some(previous) = changed_key {
+            reloader
+                .unbind(previous)
+                .map_err(|message| InstallError::ReloadFailed {
+                    path: path.to_owned(),
+                    message,
+                })?;
+        }
+    }
+    if let Err(error) = atomic_replace(path, &replacement, metadata.mode()) {
+        if running && changed_key.is_some() {
+            let _ = reloader.reload(path);
+        }
+        return Err(error);
+    }
 
     let mut reloaded = false;
-    if reloader.is_running() {
+    if running {
         reloader
             .reload(path)
             .map_err(|message| InstallError::ReloadFailed {
@@ -378,8 +412,19 @@ pub fn uninstall(path: &Path, reloader: &mut dyn TmuxReloader) -> InstallResult<
     let metadata = validate_regular_writable(path)?;
     let original = read(path)?;
     let Some(region) = locate_markers(&original)? else {
+        if reloader.is_running() {
+            reloader
+                .reload(path)
+                .map_err(|message| InstallError::ReloadFailed {
+                    path: path.to_owned(),
+                    message,
+                })?;
+        }
         return Ok(false);
     };
+    let key = block_field(&original, region, KEY_FIELD).ok_or_else(|| {
+        InstallError::Markers("owned block is missing its binding key".to_owned())
+    })?;
     let start = if owned_leading_newline(&original, region) && region.start > 0 {
         region.start - 1
     } else {
@@ -387,8 +432,22 @@ pub fn uninstall(path: &Path, reloader: &mut dyn TmuxReloader) -> InstallResult<
     };
     let mut replacement = original;
     replacement.drain(start..region.end);
-    atomic_replace(path, &replacement, metadata.mode())?;
-    if reloader.is_running() {
+    let running = reloader.is_running();
+    if running {
+        reloader
+            .unbind(&key)
+            .map_err(|message| InstallError::ReloadFailed {
+                path: path.to_owned(),
+                message,
+            })?;
+    }
+    if let Err(error) = atomic_replace(path, &replacement, metadata.mode()) {
+        if running {
+            let _ = reloader.reload(path);
+        }
+        return Err(error);
+    }
+    if running {
         reloader
             .reload(path)
             .map_err(|message| InstallError::ReloadFailed {
@@ -489,10 +548,14 @@ fn render_block(key: &str, executables: &ExecutablePaths, owned_leading_newline:
 }
 
 fn owned_leading_newline(bytes: &[u8], region: MarkerRegion) -> bool {
+    block_field(bytes, region, LEADING_NEWLINE_FIELD).as_deref() == Some("true")
+}
+
+fn block_field(bytes: &[u8], region: MarkerRegion, prefix: &str) -> Option<String> {
     std::str::from_utf8(&bytes[region.marker_start..region.end])
         .ok()
-        .and_then(|block| field(block, LEADING_NEWLINE_FIELD))
-        == Some("true")
+        .and_then(|block| field(block, prefix))
+        .map(ToOwned::to_owned)
 }
 
 fn validate_key(key: &str) -> InstallResult<()> {

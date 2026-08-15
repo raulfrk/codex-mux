@@ -1,15 +1,15 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use codex_mux::{MuxError, cli::Cli};
+use codex_mux::{app, cli::Cli};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let surface = if cli.command.is_some() {
-        "tmux configuration management"
-    } else {
-        "interactive TUI"
-    };
-    eprintln!("{}", MuxError::Unavailable(surface));
-    ExitCode::from(2)
+    match app::run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("codex-mux: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }

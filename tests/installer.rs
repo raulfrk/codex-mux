@@ -36,12 +36,18 @@ fn executables() -> ExecutablePaths {
 struct Reloader {
     running: bool,
     calls: Vec<PathBuf>,
+    unbound: Vec<String>,
     failure: Option<String>,
 }
 
 impl TmuxReloader for Reloader {
     fn is_running(&self) -> bool {
         self.running
+    }
+
+    fn unbind(&mut self, key: &str) -> Result<(), String> {
+        self.unbound.push(key.to_owned());
+        Ok(())
     }
 
     fn reload(&mut self, path: &Path) -> Result<(), String> {
@@ -228,6 +234,7 @@ fn successful_write_reloads_once_and_reload_failure_is_explicitly_recoverable() 
     let outcome = install(&config, "a", &executables(), &mut reload).unwrap();
     assert!(outcome.reloaded);
     assert_eq!(reload.calls, vec![config.clone()]);
+    assert!(reload.unbound.is_empty());
 
     let mut failure = Reloader {
         running: true,
@@ -235,12 +242,52 @@ fn successful_write_reloads_once_and_reload_failure_is_explicitly_recoverable() 
         ..Reloader::default()
     };
     let error = install(&config, "b", &executables(), &mut failure).unwrap_err();
-    assert!(error.to_string().contains("configuration was written"));
+    assert!(
+        error
+            .to_string()
+            .contains("could not synchronize running tmux")
+    );
+    assert_eq!(failure.unbound, vec!["a"]);
     assert!(
         String::from_utf8(fs::read(&config).unwrap())
             .unwrap()
             .contains("codex-mux-key: b")
     );
+}
+
+#[test]
+fn key_change_and_uninstall_remove_only_the_previous_live_binding() {
+    let root = scratch("live-key-cleanup");
+    let config = root.join("tmux.conf");
+    fs::write(&config, b"host\n").unwrap();
+    let mut reload = Reloader {
+        running: true,
+        ..Reloader::default()
+    };
+    install(&config, "a", &executables(), &mut reload).unwrap();
+    install(&config, "g", &executables(), &mut reload).unwrap();
+    assert_eq!(reload.unbound, vec!["a"]);
+    assert!(uninstall(&config, &mut reload).unwrap());
+    assert_eq!(reload.unbound, vec!["a", "g"]);
+    assert_eq!(reload.calls, vec![config.clone(), config.clone(), config]);
+}
+
+#[test]
+fn retry_after_reload_failure_resynchronizes_an_unchanged_file() {
+    let root = scratch("reload-retry");
+    let config = root.join("tmux.conf");
+    fs::write(&config, b"host\n").unwrap();
+    let mut reload = Reloader {
+        running: true,
+        failure: Some("temporary source failure".to_owned()),
+        ..Reloader::default()
+    };
+    assert!(install(&config, "a", &executables(), &mut reload).is_err());
+    reload.failure = None;
+    let retry = install(&config, "a", &executables(), &mut reload).unwrap();
+    assert!(!retry.changed);
+    assert!(retry.reloaded);
+    assert_eq!(reload.calls, vec![config.clone(), config]);
 }
 
 #[test]

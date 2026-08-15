@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod app;
 pub mod cli;
 pub mod config;
 pub mod domain;

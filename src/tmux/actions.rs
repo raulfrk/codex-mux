@@ -24,7 +24,11 @@ where
         Self { runner, executable }
     }
 
-    /// Switches only the invoking client to `pane` and leaves its window zoomed.
+    /// Switches the invoking client to `pane` and leaves its window zoomed.
+    ///
+    /// tmux stores active-window and zoom state on the session/window, so clients
+    /// already attached to the target session observe those shared state changes.
+    /// Clients attached to other sessions are not switched.
     pub fn switch_and_zoom(&self, context: &InvocationContext, pane: &Pane) -> Result<()> {
         let zoom_query = os_strings([
             "display-message",
@@ -83,6 +87,8 @@ where
     }
 
     fn switch_client(&self, context: &InvocationContext, pane_id: &PaneId) -> Result<()> {
+        self.run_checked(&os_strings(["select-window", "-t", pane_id.as_str()]))?;
+        self.run_checked(&os_strings(["select-pane", "-Z", "-t", pane_id.as_str()]))?;
         self.run_checked(&os_strings([
             "switch-client",
             "-Z",

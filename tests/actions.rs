@@ -74,7 +74,7 @@ fn pane(id: &str, path: &str) -> Pane {
 }
 
 #[test]
-fn switch_targets_only_invoking_client_and_does_not_unzoom() {
+fn switch_selects_exact_window_and_pane_then_targets_the_invoking_client() {
     let runner = RecordingRunner::with_outputs([stdout("1\n"), ok()]);
     let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
     let actions = TmuxActions::new(&runner, &executable);
@@ -93,6 +93,8 @@ fn switch_targets_only_invoking_client_and_does_not_unzoom() {
                 "%73",
                 "#{window_zoomed_flag}",
             ]),
+            args(&["select-window", "-t", "%73",]),
+            args(&["select-pane", "-Z", "-t", "%73",]),
             args(&[
                 "switch-client",
                 "-Z",
@@ -116,7 +118,7 @@ fn switch_zooms_selected_pane_only_when_needed() {
     actions.switch_and_zoom(&context, &selected).unwrap();
 
     assert_eq!(
-        runner.commands()[2],
+        runner.commands()[4],
         args(&["resize-pane", "-Z", "-t", "%73"])
     );
 }
@@ -152,6 +154,8 @@ fn new_session_uses_selected_cwd_and_direct_custom_executable_arguments() {
                 "-c",
                 TERMINAL_TITLE_CONFIG,
             ]),
+            args(&["select-window", "-t", "%91",]),
+            args(&["select-pane", "-Z", "-t", "%91",]),
             args(&[
                 "switch-client",
                 "-Z",
