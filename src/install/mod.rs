@@ -540,8 +540,14 @@ fn render_block(key: &str, executables: &ExecutablePaths, owned_leading_newline:
     ]
     .join(" ");
     let command = tmux_word(&command);
+    let compact = "#{||:#{<:#{client_width},90},#{<:#{client_height},28}}";
+    let width = format!("#{{?{compact},100%,80%}}");
+    let height = format!("#{{?{compact},100%,70%}}");
+    let popup = tmux_word(&format!(
+        "display-popup -E -w '{width}' -h '{height}' {command}"
+    ));
     format!(
-        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\nbind-key {key} if-shell -F '#{{||:#{{<:#{{client_width}},90}},#{{<:#{{client_height}},28}}}}' {{ display-popup -E -w 100% -h 100% {command} }} {{ display-popup -E -w 80% -h 70% {command} }}\n{END_MARKER}\n",
+        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\nbind-key {key} run-shell -C {popup}\n{END_MARKER}\n",
         executables.mux.display(),
         executables.codex.display(),
     )

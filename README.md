@@ -117,6 +117,20 @@ codex-mux tmux uninstall --config "$HOME/.tmux.conf"
 
 See [SECURITY.md](SECURITY.md). In short, configuration values are validated and passed as argument vectors where possible, the installer refuses unsafe config paths, and close/switch actions use exact tmux targets. `codex-mux` stores only a theme name. It does not store prompts, transcripts, Codex session metadata, credentials, or private Codex files.
 
+## Verify from source
+
+The ordinary Rust checks exercise unit and integration contracts. The packaged matrix additionally builds an optimized archive, verifies its checksum, extracts it, and drives that exact binary through isolated tmux servers and pseudo-terminals inside a read-only-root bubblewrap sandbox:
+
+```sh
+cargo +1.85 fmt --all -- --check
+cargo +1.85 clippy --locked --all-targets --all-features -- -D warnings
+cargo +1.85 test --locked --all-features
+tests/release_packaging.sh
+scripts/e2e.sh
+```
+
+The packaged matrix requires `bwrap`, `tmux`, util-linux `script`, GNU tar/gzip, and Rust 1.85. It fails when a prerequisite is absent and asserts that disposable tmux sockets and scratch roots are removed.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -74,8 +74,11 @@ fn installer_cli_loads_a_real_prefix_binding_with_responsive_geometry() {
     for literal in [
         "client_width",
         "client_height",
-        "display-popup -E -h \"100%\" -w \"100%\"",
-        "display-popup -E -h \"70%\" -w \"80%\"",
+        "run-shell -C",
+        "display-popup -E",
+        "100%",
+        "80%",
+        "70%",
         "--client",
         "--invoking-pane",
         "--invoking-session",
