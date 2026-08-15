@@ -1,0 +1,252 @@
+//! Server-wide tmux pane discovery and conservative Codex identity matching.
+
+use std::{
+    collections::HashSet,
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
+use crate::{
+    MuxError, Result,
+    domain::{CodexExecutable, Pane, PaneId, ProcessInspector, SessionId, TmuxCommandRunner},
+};
+
+const FIELD_SEPARATOR: u8 = 0x1f;
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}";
+
+/// Discovers Codex panes through injectable tmux and process boundaries.
+pub struct PaneInventory<R, I> {
+    runner: R,
+    processes: I,
+    codex: CodexExecutable,
+}
+
+impl<R, I> PaneInventory<R, I>
+where
+    R: TmuxCommandRunner,
+    I: ProcessInspector,
+{
+    /// Creates an inventory for one configured Codex executable.
+    #[must_use]
+    pub fn new(runner: R, processes: I, codex: CodexExecutable) -> Self {
+        Self {
+            runner,
+            processes,
+            codex,
+        }
+    }
+
+    /// Lists every pane in the current server whose foreground process is Codex.
+    ///
+    /// Invalid rows and panes whose process has exited or cannot be inspected are
+    /// omitted. A failed tmux command remains an error because no trustworthy
+    /// server-wide inventory can be produced from it.
+    pub fn discover(&self) -> Result<Vec<Pane>> {
+        let arguments = [
+            OsString::from("list-panes"),
+            OsString::from("-a"),
+            OsString::from("-F"),
+            OsString::from(PANE_FORMAT),
+        ];
+        let output = self.runner.run(&arguments)?;
+        if output.status != Some(0) {
+            return Err(MuxError::Command(command_failure(
+                &output.stderr,
+                output.status,
+            )));
+        }
+
+        let mut seen = HashSet::new();
+        let mut panes = Vec::new();
+        for line in output.stdout.split(|byte| *byte == b'\n') {
+            let Some(record) = TmuxPaneRecord::parse(line) else {
+                continue;
+            };
+            if !seen.insert(record.pane_id.clone()) {
+                continue;
+            }
+
+            let Ok(Some(executable)) = self.processes.foreground_executable(record.pane_pid) else {
+                continue;
+            };
+            if !matches_executable(&executable, self.codex.as_path(), &record.command) {
+                continue;
+            }
+
+            let Ok(id) = PaneId::new(record.pane_id) else {
+                continue;
+            };
+            let Ok(session_id) = SessionId::new(record.session_id) else {
+                continue;
+            };
+            panes.push(Pane {
+                id,
+                session_id,
+                title: nonempty_title(record.title),
+                current_path: record.current_path,
+            });
+        }
+        Ok(panes)
+    }
+}
+
+fn command_failure(stderr: &[u8], status: Option<i32>) -> String {
+    let detail = String::from_utf8_lossy(stderr);
+    let detail = detail.trim();
+    let status = status
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_owned());
+    if detail.is_empty() {
+        format!("tmux list-panes exited with {status}")
+    } else {
+        format!("tmux list-panes exited with {status}: {detail}")
+    }
+}
+
+fn nonempty_title(title: String) -> Option<String> {
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn matches_executable(actual: &Path, configured: &Path, pane_command: &OsStr) -> bool {
+    if actual == configured {
+        return true;
+    }
+
+    let same_basename = actual.file_name().is_some()
+        && actual.file_name() == configured.file_name()
+        && pane_command == configured.file_name().unwrap_or_default();
+    if !same_basename {
+        return false;
+    }
+
+    // A basename is only a hint. Canonical file identity is mandatory so an
+    // unrelated executable called `codex` cannot enter the inventory.
+    match (actual.canonicalize(), configured.canonicalize()) {
+        (Ok(actual), Ok(configured)) => actual == configured,
+        _ => false,
+    }
+}
+
+struct TmuxPaneRecord {
+    pane_id: String,
+    session_id: String,
+    #[allow(dead_code)]
+    window_id: String,
+    #[allow(dead_code)]
+    window_name: String,
+    title: String,
+    current_path: PathBuf,
+    command: OsString,
+    pane_pid: u32,
+    #[allow(dead_code)]
+    tty: OsString,
+}
+
+impl TmuxPaneRecord {
+    fn parse(line: &[u8]) -> Option<Self> {
+        if line.is_empty() || line.contains(&b'\r') {
+            return None;
+        }
+        let fields = line
+            .split(|byte| *byte == FIELD_SEPARATOR)
+            .collect::<Vec<_>>();
+        if fields.len() != 9 {
+            return None;
+        }
+
+        let pane_id = utf8_nonempty(fields[0])?;
+        let session_id = utf8_nonempty(fields[1])?;
+        let window_id = utf8_nonempty(fields[2])?;
+        let window_name = String::from_utf8_lossy(fields[3]).into_owned();
+        let title = String::from_utf8_lossy(fields[4]).into_owned();
+        let current_path = path_from_bytes(fields[5]);
+        if !current_path.is_absolute() {
+            return None;
+        }
+        let command = os_string_from_bytes(fields[6]);
+        if command.is_empty() {
+            return None;
+        }
+        let pane_pid = std::str::from_utf8(fields[7]).ok()?.parse().ok()?;
+        if pane_pid == 0 || fields[8].is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            pane_id,
+            session_id,
+            window_id,
+            window_name,
+            title,
+            current_path,
+            command,
+            pane_pid,
+            tty: os_string_from_bytes(fields[8]),
+        })
+    }
+}
+
+fn utf8_nonempty(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+#[cfg(unix)]
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    OsString::from_vec(bytes.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(os_string_from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TmuxPaneRecord, matches_executable};
+    use std::{ffi::OsStr, path::Path};
+
+    #[test]
+    fn parser_rejects_wrong_field_count_and_relative_paths() {
+        assert!(TmuxPaneRecord::parse(b"%1\x1f$1").is_none());
+        assert!(
+            TmuxPaneRecord::parse(
+                b"%1\x1f$1\x1f@1\x1fmain\x1ftitle\x1frelative\x1fcodex\x1f42\x1f/dev/pts/1"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_executable_match_does_not_need_basename_fallback() {
+        assert!(matches_executable(
+            Path::new("/opt/codex/bin/renamed-agent"),
+            Path::new("/opt/codex/bin/renamed-agent"),
+            OsStr::new("anything"),
+        ));
+    }
+
+    #[test]
+    fn basename_collision_is_rejected() {
+        assert!(!matches_executable(
+            Path::new("/tmp/unrelated/codex"),
+            Path::new("/opt/codex/bin/codex"),
+            OsStr::new("codex"),
+        ));
+    }
+}
