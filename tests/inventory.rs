@@ -354,6 +354,7 @@ fn malformed_or_missing_proc_entries_return_none() {
 }
 
 #[test]
+#[ignore = "host tmux smoke; packaged E2E provides the isolated CI gate"]
 fn disposable_tmux_server_smoke_discovers_a_foreground_process() {
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("tmux is unavailable; skipping disposable-server smoke test");
