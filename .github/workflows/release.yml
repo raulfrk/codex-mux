@@ -11,6 +11,11 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    container:
+      image: rust:1.85.0-bullseye@sha256:0fdb1727a6c81e0811df9d67bd6defa9a4a07d2a44373ab0a017aedad9fcba3f
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 25
     env:
       CARGO_INCREMENTAL: "0"
@@ -45,8 +50,8 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Install Rust 1.85 target
-        run: rustup toolchain install 1.85.0 --profile minimal --target "${{ matrix.target }}"
+      - name: Ensure Rust 1.85 target
+        run: rustup target add "${{ matrix.target }}" --toolchain 1.85.0
       - name: Build locked release binary
         run: cargo +1.85.0 build --locked --release --target "${{ matrix.target }}"
       - name: Package deterministic archive
