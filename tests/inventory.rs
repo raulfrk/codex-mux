@@ -370,6 +370,48 @@ fn disposable_tmux_server_smoke_discovers_a_foreground_process() {
     );
     let server = TmuxServer::start(&socket);
     let executable = fs::canonicalize("/usr/bin/sleep").unwrap();
+    let pane_pid = Command::new("tmux")
+        .args(["-L", &socket, "list-panes", "-a", "-F", "#{pane_pid}"])
+        .output()
+        .unwrap();
+    assert!(
+        pane_pid.status.success(),
+        "could not inspect disposable tmux pane: {}",
+        String::from_utf8_lossy(&pane_pid.stderr)
+    );
+    let pane_pid = String::from_utf8(pane_pid.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let proc_executable = format!("/proc/{pane_pid}/exe");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::read_link(&proc_executable) {
+            Ok(actual) if actual == executable => break,
+            Ok(actual) if Instant::now() >= deadline => {
+                panic!(
+                    "disposable pane process did not become {}: {}",
+                    executable.display(),
+                    actual.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "runner denies /proc/{pane_pid}/exe inspection; skipping disposable-server smoke test"
+                );
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not inspect disposable pane process {pane_pid}: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disposable pane process {pane_pid} never became inspectable"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     let runner = PrefixedRunner {
         inner: SystemTmuxRunner::default(),
         socket: socket.clone(),
