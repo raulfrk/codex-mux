@@ -12,8 +12,23 @@ for tool in bwrap cargo gzip rustc script sha256sum tar tmux; do
 done
 
 toolchain=${CODEX_MUX_E2E_TOOLCHAIN:-1.85}
+network_mode=${CODEX_MUX_E2E_NETWORK_MODE:-isolated}
 version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' Cargo.toml)
 target=x86_64-unknown-linux-gnu
+
+case "$network_mode" in
+  isolated)
+    network_args=(--unshare-net)
+    ;;
+  host)
+    network_args=()
+    echo "packaged E2E is using the host network namespace" >&2
+    ;;
+  *)
+    echo "invalid CODEX_MUX_E2E_NETWORK_MODE: $network_mode" >&2
+    exit 1
+    ;;
+esac
 
 if [[ ${CODEX_MUX_E2E_SANDBOXED:-0} != 1 ]]; then
   cargo "+$toolchain" fetch --locked
@@ -25,7 +40,7 @@ if [[ ${CODEX_MUX_E2E_SANDBOXED:-0} != 1 ]]; then
   cargo_home=${CARGO_HOME:-$host_home/.cargo}
   rustup_home=${RUSTUP_HOME:-$host_home/.rustup}
   bwrap \
-    --unshare-net \
+    "${network_args[@]}" \
     --unshare-pid \
     --die-with-parent \
     --ro-bind / / \
@@ -44,6 +59,7 @@ if [[ ${CODEX_MUX_E2E_SANDBOXED:-0} != 1 ]]; then
     --setenv CARGO_HOME "$cargo_home" \
     --setenv RUSTUP_HOME "$rustup_home" \
     --setenv CODEX_MUX_E2E_TOOLCHAIN "$toolchain" \
+    --setenv CODEX_MUX_E2E_NETWORK_MODE "$network_mode" \
     /usr/bin/env bash scripts/e2e.sh
   exit
 fi

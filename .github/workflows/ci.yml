@@ -33,3 +33,5 @@ jobs:
         run: tests/release_packaging.sh
       - name: Test extracted release end to end
         run: scripts/e2e.sh
+        env:
+          CODEX_MUX_E2E_NETWORK_MODE: host
