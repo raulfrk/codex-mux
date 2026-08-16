@@ -132,7 +132,18 @@ impl TmuxServer {
             }
             thread::sleep(POLL_INTERVAL);
         }
-        panic!("timed out waiting for {description}");
+        let messages = self.run(&["show-messages"]);
+        let panes = self.run(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{pane_pid} #{pane_current_command} #{cursor_x} #{cursor_y}",
+        ]);
+        panic!(
+            "timed out waiting for {description}; messages={} panes={}",
+            String::from_utf8_lossy(&messages.stdout),
+            String::from_utf8_lossy(&panes.stdout)
+        );
     }
 }
 
@@ -153,6 +164,21 @@ impl PtyProcess {
             server.socket()
         );
         Self::spawn_shell(&shell_command, &[])
+    }
+
+    pub fn attach_captured(
+        server: &TmuxServer,
+        session: &str,
+        columns: u16,
+        rows: u16,
+        output: &Path,
+    ) -> Self {
+        let shell_command = format!(
+            "stty cols {columns} rows {rows}; exec tmux -L {} attach-session -t {session}",
+            server.socket()
+        );
+        let output = fs::File::create(output).expect("create attached-client PTY capture");
+        Self::spawn_shell_with_stdout(&shell_command, &[], Stdio::from(output))
     }
 
     pub fn run_binary(arguments: &[String], environment: &[(&str, &str)]) -> Self {
@@ -248,15 +274,20 @@ pub fn wait_for_file(path: &Path) -> String {
 
 pub fn wait_for_file_text(path: &Path, expected: &str) -> String {
     let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut last = String::new();
     while Instant::now() < deadline {
         if let Ok(contents) = fs::read_to_string(path) {
             if contents.contains(expected) {
                 return contents;
             }
+            last = contents;
         }
         thread::sleep(POLL_INTERVAL);
     }
-    panic!("timed out waiting for {expected:?} in {}", path.display());
+    panic!(
+        "timed out waiting for {expected:?} in {}; capture={last:?}",
+        path.display()
+    );
 }
 
 pub fn assert_success(output: &Output, operation: &str) {

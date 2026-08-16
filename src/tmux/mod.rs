@@ -3,3 +3,4 @@
 pub mod actions;
 pub mod inventory;
 pub mod runner;
+pub mod smart_left;

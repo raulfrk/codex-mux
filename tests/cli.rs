@@ -28,6 +28,28 @@ fn tmux_help_exposes_install_status_and_uninstall() {
 }
 
 #[test]
+fn install_help_exposes_smart_left_without_exposing_internal_probe_command() {
+    let install = binary()
+        .args(["tmux", "install", "--help"])
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    assert!(
+        String::from_utf8(install.stdout)
+            .unwrap()
+            .contains("--smart-left")
+    );
+
+    let root = binary().arg("--help").output().unwrap();
+    assert!(root.status.success());
+    assert!(
+        !String::from_utf8(root.stdout)
+            .unwrap()
+            .contains("smart-left")
+    );
+}
+
+#[test]
 fn interactive_runtime_requires_explicit_tmux_context() {
     let output = binary().output().unwrap();
 

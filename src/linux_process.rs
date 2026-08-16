@@ -36,6 +36,23 @@ impl LinuxProcessInspector {
         }
     }
 
+    /// Returns whether `pid` itself is the exact configured Codex executable.
+    ///
+    /// Unlike foreground-group discovery, this deliberately excludes wrappers.
+    /// Smart Left uses it to keep its prefixless interception fail-closed.
+    pub fn process_is_exact(&self, pid: u32) -> Result<bool> {
+        self.read_process(pid)
+            .map(|process| {
+                process
+                    .as_ref()
+                    .is_some_and(|process| self.is_exact_configured_executable(process))
+            })
+            .map_err(|source| MuxError::Filesystem {
+                path: self.proc_root.clone(),
+                source,
+            })
+    }
+
     fn inspect(&self, pane_pid: u32) -> std::io::Result<Option<PathBuf>> {
         let pane = match self.read_process(pane_pid)? {
             Some(process) => process,

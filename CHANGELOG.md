@@ -4,6 +4,10 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+### Added
+
+- Optional marker-managed Smart Left activation opens the mux from the absolute beginning of a directly verified Codex composer while preserving ordinary Left behavior everywhere else.
+
 ## [0.1.1] - 2026-08-16
 
 ### Fixed

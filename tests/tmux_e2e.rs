@@ -152,6 +152,247 @@ fn installer_refuses_to_write_when_tmux_config_inspection_fails() {
 }
 
 #[test]
+fn uninstall_refuses_a_foreign_live_root_left_and_restores_its_prefix_binding() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
+        return;
+    }
+
+    let scratch = Scratch::new("foreign-smart-left");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let codex = fake_codex(&scratch);
+    let server = TmuxServer::start(&config, "origin", scratch.path());
+    let tmux = server.tmux_environment();
+    let installed = binary()
+        .env("TMUX", &tmux)
+        .args([
+            "--codex",
+            path(&codex),
+            "tmux",
+            "install",
+            "--smart-left",
+            "--config",
+            path(&config),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&installed, "install Smart Left before live drift");
+    let before = fs::read(&config).unwrap();
+    server.checked(&[
+        "bind-key",
+        "-T",
+        "root",
+        "Left",
+        "display-message",
+        "foreign-left",
+    ]);
+
+    let uninstalled = binary()
+        .env("TMUX", &tmux)
+        .args(["tmux", "uninstall", "--config", path(&config)])
+        .output()
+        .unwrap();
+    assert!(!uninstalled.status.success());
+    assert!(
+        String::from_utf8_lossy(&uninstalled.stderr)
+            .contains("no longer matches the codex-mux-owned binding")
+    );
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(
+        server
+            .checked(&["list-keys", "-T", "root", "Left"])
+            .contains("foreign-left")
+    );
+    assert!(
+        server
+            .run(&["list-keys", "-T", "prefix", "a"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn smart_left_live_ownership_survives_tmux_escaping_in_the_mux_path() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
+        return;
+    }
+
+    let scratch = Scratch::new("escaped-smart-left-owner");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let codex = fake_codex(&scratch);
+    let mux = scratch.join("mux executable'; semicolon");
+    fs::copy(env!("CARGO_BIN_EXE_codex-mux"), &mux).unwrap();
+    let server = TmuxServer::start(&config, "origin", scratch.path());
+    let tmux = server.tmux_environment();
+
+    let installed = Command::new(&mux)
+        .env("TMUX", &tmux)
+        .args([
+            "--codex",
+            path(&codex),
+            "tmux",
+            "install",
+            "--smart-left",
+            "--config",
+            path(&config),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&installed, "install Smart Left from escaped mux path");
+    let binding = server.checked(&["list-keys", "-T", "root", "Left"]);
+    assert!(binding.contains("owner="), "{binding}");
+
+    let uninstalled = Command::new(&mux)
+        .env("TMUX", &tmux)
+        .args(["tmux", "uninstall", "--config", path(&config)])
+        .output()
+        .unwrap();
+    assert_success(&uninstalled, "uninstall Smart Left from escaped mux path");
+    assert!(
+        !server
+            .run(&["list-keys", "-T", "root", "Left"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn physical_left_moves_inside_composer_and_opens_mux_only_at_its_boundary() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
+        return;
+    }
+
+    let fixture = RuntimeFixture::new("smart-left");
+    let installed = binary()
+        .env("TMUX", fixture.server.tmux_environment())
+        .args([
+            "--codex",
+            path(&fixture.codex),
+            "tmux",
+            "install",
+            "--smart-left",
+            "--config",
+            path(&fixture.config),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&installed, "install Smart Left binding");
+    let respawned = fixture
+        .server
+        .command()
+        .args(["respawn-pane", "-k", "-t", &fixture.origin_pane, "--"])
+        .arg(&fixture.codex)
+        .arg("smart-left")
+        .output()
+        .unwrap();
+    assert_success(&respawned, "start deterministic composer fixture");
+    fixture.server.wait_until("composer fixture cursor", || {
+        fixture
+            .server
+            .checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                &fixture.origin_pane,
+                "#{pane_current_command} #{cursor_x} #{cursor_y}",
+            ])
+            .trim()
+            == "codex-e2e 5 0"
+    });
+
+    let capture = fixture.scratch.join("smart-left-screen.log");
+    let mut client = PtyProcess::attach_captured(&fixture.server, "origin", 100, 32, &capture);
+    let _client_tty = wait_for_client(&fixture.server, "origin");
+
+    client.send(b"\x1b[D");
+    fixture
+        .server
+        .wait_until("ordinary Left cursor movement", || {
+            pane_cursor_x(&fixture.server, &fixture.origin_pane) == 4
+        });
+    thread::sleep(Duration::from_millis(100));
+    fixture
+        .server
+        .wait_until("ordinary Left probe cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+        });
+    assert!(
+        !fs::read_to_string(&capture)
+            .unwrap_or_default()
+            .contains("codex-mux"),
+        "Smart Left opened before reaching the composer boundary"
+    );
+
+    for expected_x in [3, 2] {
+        client.send(b"\x1b[D");
+        fixture.server.wait_until("composer cursor movement", || {
+            pane_cursor_x(&fixture.server, &fixture.origin_pane) == expected_x
+        });
+        fixture.server.wait_until("movement probe cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+        });
+    }
+    client.send(b"\x1b[D");
+    fixture.server.wait_until("Smart Left popup render", || {
+        fs::read_to_string(&capture).is_ok_and(|screen| screen.contains("sessions"))
+    });
+    assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 2);
+    client.send(b"q");
+    fixture
+        .server
+        .wait_until("Smart Left debounce cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+        });
+
+    let popup_count = popup_command_count(&fixture.server);
+    client.send(b"\x1b[D\x1b[D\x1b[D");
+    fixture.server.wait_until("rapid Smart Left probe", || {
+        !smart_left_inactive(&fixture.server, &fixture.origin_pane)
+    });
+    fixture.server.wait_until("rapid Smart Left popup", || {
+        popup_command_count(&fixture.server) > popup_count
+    });
+    client.send(b"q");
+    fixture.server.wait_until("rapid Smart Left cleanup", || {
+        smart_left_inactive(&fixture.server, &fixture.origin_pane)
+    });
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        popup_command_count(&fixture.server),
+        popup_count + 1,
+        "rapid Left created more than one popup probe"
+    );
+    let messages = fixture.server.checked(&["show-messages"]);
+    assert!(!messages.contains("No such pane: #{pane_id}"), "{messages}");
+    assert!(
+        !messages.contains("Can't find pane: #{pane_id}"),
+        "{messages}"
+    );
+
+    client.send(b"\x02d");
+    let uninstalled = binary()
+        .env("TMUX", fixture.server.tmux_environment())
+        .args(["tmux", "uninstall", "--config", path(&fixture.config)])
+        .output()
+        .unwrap();
+    assert_success(&uninstalled, "uninstall owned Smart Left binding");
+    assert!(
+        !fixture
+            .server
+            .run(&["list-keys", "-T", "root", "Left"])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn interactive_cli_selects_full_screen_for_only_the_named_client() {
     let _serial = serial_tmux_test();
     if !tools_available() {
@@ -384,6 +625,7 @@ fn interactive_errors_are_explicit_and_leave_tmux_untouched() {
 
 struct RuntimeFixture {
     scratch: Scratch,
+    config: PathBuf,
     codex: PathBuf,
     log: PathBuf,
     server: TmuxServer,
@@ -410,6 +652,7 @@ impl RuntimeFixture {
             .to_owned();
         Self {
             scratch,
+            config,
             codex,
             log,
             server,
@@ -517,7 +760,31 @@ fn fake_codex(scratch: &Scratch) -> PathBuf {
     fs::write(
         &source,
         r#"
-use std::{env, fs::OpenOptions, io::Write, thread, time::Duration};
+use std::{env, fs::OpenOptions, io::{Read, Write}, process::Command, thread, time::Duration};
+
+fn run_smart_left_fixture() {
+    let status = Command::new("stty").args(["raw", "-echo"]).status().unwrap();
+    assert!(status.success());
+    let mut output = std::io::stdout().lock();
+    let mut input = std::io::stdin().lock();
+    let mut cursor = 3usize;
+    write!(output, "\x1b[2J\x1b[H› abc\x1b[1;{}H", cursor + 3).unwrap();
+    output.flush().unwrap();
+    let mut byte = [0_u8; 1];
+    loop {
+        input.read_exact(&mut byte).unwrap();
+        if byte[0] != 0x1b {
+            continue;
+        }
+        let mut tail = [0_u8; 2];
+        input.read_exact(&mut tail).unwrap();
+        if tail == *b"[D" {
+            cursor = cursor.saturating_sub(1);
+            write!(output, "\x1b[1;{}H", cursor + 3).unwrap();
+            output.flush().unwrap();
+        }
+    }
+}
 
 fn main() {
     let log = env::var_os("CODEX_MUX_E2E_LOG").expect("test log path");
@@ -527,6 +794,10 @@ fn main() {
         writeln!(output, "arg{index}={argument}").unwrap();
     }
     writeln!(output, "---").unwrap();
+    if env::args().nth(1).as_deref() == Some("smart-left") {
+        drop(output);
+        run_smart_left_fixture();
+    }
     thread::sleep(Duration::from_secs(300));
 }
 "#,
@@ -581,6 +852,35 @@ fn pane_exists(server: &TmuxServer, pane: &str) -> bool {
         .checked(&["list-panes", "-a", "-F", "#{pane_id}"])
         .lines()
         .any(|candidate| candidate == pane)
+}
+
+fn pane_cursor_x(server: &TmuxServer, pane: &str) -> u16 {
+    server
+        .checked(&["display-message", "-p", "-t", pane, "#{cursor_x}"])
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn smart_left_inactive(server: &TmuxServer, pane: &str) -> bool {
+    server
+        .run(&[
+            "show-options",
+            "-pqv",
+            "-t",
+            pane,
+            "@codex_mux_smart_left_active",
+        ])
+        .stdout
+        .is_empty()
+}
+
+fn popup_command_count(server: &TmuxServer) -> usize {
+    server
+        .checked(&["show-messages"])
+        .lines()
+        .filter(|line| line.contains(" command: display-popup "))
+        .count()
 }
 
 fn client_session(server: &TmuxServer, client: &str) -> String {

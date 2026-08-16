@@ -20,10 +20,15 @@ use crate::{
     },
     install::{
         DiscoveryContext, ExecutablePaths, InstallError, ServerEvidence, TmuxReloader,
-        discover_config, install, status, uninstall,
+        discover_config, install_with_options, smart_left_owner, status, uninstall,
     },
     linux_process::LinuxProcessInspector,
-    tmux::{actions::TmuxActions, inventory::PaneInventory, runner::SystemTmuxRunner},
+    tmux::{
+        actions::TmuxActions,
+        inventory::PaneInventory,
+        runner::SystemTmuxRunner,
+        smart_left::{SmartLeftProbe, SystemSleeper},
+    },
     ui::{self, Action, App, ColorPolicy},
 };
 
@@ -32,10 +37,26 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Runs the parsed command and writes management results to standard output.
 pub fn run(cli: Cli) -> Result<()> {
     let codex_argument = cli.codex.clone();
-    match cli.command {
+    match cli.command.clone() {
         Some(Command::Tmux(tmux)) => run_tmux_command(tmux.command, codex_argument),
+        Some(Command::SmartLeft) => run_smart_left(&cli, codex_argument),
         None => run_interactive(cli, codex_argument),
     }
+}
+
+fn run_smart_left(cli: &Cli, codex_argument: Option<PathBuf>) -> Result<()> {
+    let context = invocation_context(cli)?;
+    let codex = resolve_codex(codex_argument)?;
+    let mux = env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|source| MuxError::Filesystem {
+            path: PathBuf::from("current executable"),
+            source,
+        })?;
+    let runner = SystemTmuxRunner::default();
+    let inspector = LinuxProcessInspector::new(codex.clone());
+    SmartLeftProbe::new(&runner, &inspector, &SystemSleeper, &mux, &codex).run(&context)?;
+    Ok(())
 }
 
 fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
@@ -154,8 +175,14 @@ fn install_binding(arguments: InstallArgs, codex_argument: Option<PathBuf>) -> R
     let path = resolve_config(arguments.config)?;
     let executables = executable_paths(codex_argument)?;
     let mut reloader = SystemTmuxReloader::for_path(&path)?;
-    let outcome =
-        install(&path, &arguments.key, &executables, &mut reloader).map_err(install_error)?;
+    let outcome = install_with_options(
+        &path,
+        &arguments.key,
+        arguments.smart_left,
+        &executables,
+        &mut reloader,
+    )
+    .map_err(install_error)?;
     if outcome.changed {
         println!("installed codex-mux binding in {}", outcome.path.display());
         if let Some(backup) = outcome.backup {
@@ -192,6 +219,14 @@ fn show_status(arguments: ConfigPathArgs, codex_argument: Option<PathBuf>) -> Re
             .codex
             .as_deref()
             .map_or("<missing>".to_owned(), |path| path.display().to_string())
+    );
+    println!(
+        "smart-left: {}",
+        if report.smart_left {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     if report.drift.is_empty() {
         println!("drift: none");
@@ -341,6 +376,49 @@ impl TmuxReloader for SystemTmuxReloader {
         let output = self
             .runner
             .run(&os_strings(["unbind-key", "-T", "prefix", key]))
+            .map_err(|error| error.to_string())?;
+        if output.status == Some(0) {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    }
+
+    fn root_left_bound(&mut self) -> std::result::Result<bool, String> {
+        let output = self
+            .runner
+            .run(&os_strings(["list-keys", "-T", "root", "Left"]))
+            .map_err(|error| error.to_string())?;
+        if output.status == Some(0) {
+            return Ok(true);
+        }
+        let error = String::from_utf8_lossy(&output.stderr);
+        if error.contains("unknown key") || error.contains("no key binding") {
+            Ok(false)
+        } else {
+            Err(error.trim().to_owned())
+        }
+    }
+
+    fn unbind_root_left(&mut self, expected_mux: &Path) -> std::result::Result<(), String> {
+        let current = self
+            .runner
+            .run(&os_strings(["list-keys", "-T", "root", "Left"]))
+            .map_err(|error| error.to_string())?;
+        if current.status != Some(0) {
+            return Err(String::from_utf8_lossy(&current.stderr).trim().to_owned());
+        }
+        let binding = String::from_utf8_lossy(&current.stdout);
+        let signature = format!("owner={}; if [ -x ", smart_left_owner(expected_mux));
+        if !binding.contains(&signature)
+            || !binding.contains(" smart-left; else ")
+            || !binding.contains("@codex_mux_smart_left_active")
+        {
+            return Err("root-table Left no longer matches the codex-mux-owned binding".to_owned());
+        }
+        let output = self
+            .runner
+            .run(&os_strings(["unbind-key", "-T", "root", "Left"]))
             .map_err(|error| error.to_string())?;
         if output.status == Some(0) {
             Ok(())

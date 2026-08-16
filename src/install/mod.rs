@@ -2,8 +2,10 @@
 
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -19,6 +21,7 @@ pub const END_MARKER: &str = "# <<< codex-mux <<<";
 const KEY_FIELD: &str = "# codex-mux-key: ";
 const BINARY_FIELD: &str = "# codex-mux-binary: ";
 const CODEX_FIELD: &str = "# codex-executable: ";
+const SMART_LEFT_FIELD: &str = "# codex-mux-smart-left: ";
 const LEADING_NEWLINE_FIELD: &str = "# codex-mux-owned-leading-newline: ";
 
 /// Installer-specific failures. Every error is fail-closed unless documented otherwise.
@@ -227,6 +230,14 @@ pub trait TmuxReloader {
     fn is_running(&self) -> bool;
     /// Removes an old owned prefix binding before the updated host file is sourced.
     fn unbind(&mut self, key: &str) -> std::result::Result<(), String>;
+    /// Returns whether the live root table already owns Left.
+    fn root_left_bound(&mut self) -> std::result::Result<bool, String> {
+        Ok(false)
+    }
+    /// Removes the codex-mux-owned live root-table Left binding.
+    fn unbind_root_left(&mut self, _expected_mux: &Path) -> std::result::Result<(), String> {
+        Ok(())
+    }
     /// Sources the exact updated entrypoint in the running server.
     fn reload(&mut self, path: &Path) -> std::result::Result<(), String>;
 }
@@ -269,16 +280,56 @@ pub fn install(
     executables: &ExecutablePaths,
     reloader: &mut dyn TmuxReloader,
 ) -> InstallResult<InstallOutcome> {
+    install_with_options(path, key, false, executables, reloader)
+}
+
+/// Installs or updates the owned block with optional Smart Left activation.
+pub fn install_with_options(
+    path: &Path,
+    key: &str,
+    smart_left: bool,
+    executables: &ExecutablePaths,
+    reloader: &mut dyn TmuxReloader,
+) -> InstallResult<InstallOutcome> {
     validate_key(key)?;
+    if smart_left {
+        validate_smart_left_executable(executables)?;
+    }
     let metadata = validate_regular_writable(path)?;
     let original = read(path)?;
     let markers = locate_markers(&original)?;
     let previous_key = markers.and_then(|region| block_field(&original, region, KEY_FIELD));
+    let previous_mux = markers.and_then(|region| block_field(&original, region, BINARY_FIELD));
+    let previous_smart_left = markers
+        .map(|region| block_smart_left(&original, region))
+        .transpose()?
+        .unwrap_or(false);
+    if smart_left && !previous_smart_left {
+        if has_root_left_binding_outside_owned_block(&original, markers)? {
+            return Err(InstallError::InvalidValue {
+                field: "Smart Left binding",
+                reason: "the selected tmux configuration already binds root-table Left".to_owned(),
+            });
+        }
+        if reloader.is_running()
+            && reloader
+                .root_left_bound()
+                .map_err(|message| InstallError::ReloadFailed {
+                    path: path.to_owned(),
+                    message,
+                })?
+        {
+            return Err(InstallError::InvalidValue {
+                field: "Smart Left binding",
+                reason: "the running tmux server already binds root-table Left".to_owned(),
+            });
+        }
+    }
     let owned_leading_newline = markers.map_or(
         !original.is_empty() && !original.ends_with(b"\n"),
         |region| owned_leading_newline(&original, region),
     );
-    let block = render_block(key, executables, owned_leading_newline);
+    let block = render_block(key, smart_left, executables, owned_leading_newline);
     let replacement =
         replace_or_append(&original, markers, owned_leading_newline, block.as_bytes());
 
@@ -308,18 +359,37 @@ pub fn install(
         None
     };
     let changed_key = previous_key.as_deref().filter(|previous| *previous != key);
+    let removed_smart_left = previous_smart_left && !smart_left;
+    let previous_mux = if removed_smart_left {
+        Some(previous_mux.as_deref().ok_or_else(|| {
+            InstallError::Markers("owned block is missing its codex-mux path".to_owned())
+        })?)
+    } else {
+        None
+    };
     if running {
-        if let Some(previous) = changed_key {
-            reloader
-                .unbind(previous)
-                .map_err(|message| InstallError::ReloadFailed {
+        if removed_smart_left {
+            if let Err(message) = reloader.unbind_root_left(Path::new(previous_mux.unwrap())) {
+                return Err(InstallError::ReloadFailed {
                     path: path.to_owned(),
                     message,
-                })?;
+                });
+            }
+        }
+        if let Some(previous) = changed_key {
+            if let Err(message) = reloader.unbind(previous) {
+                if removed_smart_left {
+                    let _ = reloader.reload(path);
+                }
+                return Err(InstallError::ReloadFailed {
+                    path: path.to_owned(),
+                    message,
+                });
+            }
         }
     }
     if let Err(error) = atomic_replace(path, &replacement, metadata.mode()) {
-        if running && changed_key.is_some() {
+        if running && (changed_key.is_some() || removed_smart_left) {
             let _ = reloader.reload(path);
         }
         return Err(error);
@@ -356,6 +426,8 @@ pub struct InstallStatus {
     pub mux: Option<PathBuf>,
     /// Recorded Codex executable path.
     pub codex: Option<PathBuf>,
+    /// Whether the owned root-table Smart Left binding is enabled.
+    pub smart_left: bool,
     /// Human-readable path mismatches.
     pub drift: Vec<String>,
 }
@@ -371,6 +443,7 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
             key: None,
             mux: None,
             codex: None,
+            smart_left: false,
             drift: Vec::new(),
         });
     };
@@ -379,6 +452,7 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
     let key = field(block, KEY_FIELD).map(ToOwned::to_owned);
     let mux = field(block, BINARY_FIELD).map(PathBuf::from);
     let codex = field(block, CODEX_FIELD).map(PathBuf::from);
+    let smart_left = parse_smart_left(field(block, SMART_LEFT_FIELD))?;
     let mut drift = Vec::new();
     if mux.as_deref() != Some(expected.mux.as_path()) {
         drift.push(format!(
@@ -403,6 +477,7 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
         key,
         mux,
         codex,
+        smart_left,
         drift,
     })
 }
@@ -425,6 +500,10 @@ pub fn uninstall(path: &Path, reloader: &mut dyn TmuxReloader) -> InstallResult<
     let key = block_field(&original, region, KEY_FIELD).ok_or_else(|| {
         InstallError::Markers("owned block is missing its binding key".to_owned())
     })?;
+    let smart_left = block_smart_left(&original, region)?;
+    let mux = block_field(&original, region, BINARY_FIELD).ok_or_else(|| {
+        InstallError::Markers("owned block is missing its codex-mux path".to_owned())
+    })?;
     let start = if owned_leading_newline(&original, region) && region.start > 0 {
         region.start - 1
     } else {
@@ -434,12 +513,23 @@ pub fn uninstall(path: &Path, reloader: &mut dyn TmuxReloader) -> InstallResult<
     replacement.drain(start..region.end);
     let running = reloader.is_running();
     if running {
-        reloader
-            .unbind(&key)
-            .map_err(|message| InstallError::ReloadFailed {
+        if smart_left {
+            if let Err(message) = reloader.unbind_root_left(Path::new(&mux)) {
+                return Err(InstallError::ReloadFailed {
+                    path: path.to_owned(),
+                    message,
+                });
+            }
+        }
+        if let Err(message) = reloader.unbind(&key) {
+            if smart_left {
+                let _ = reloader.reload(path);
+            }
+            return Err(InstallError::ReloadFailed {
                 path: path.to_owned(),
                 message,
-            })?;
+            });
+        }
     }
     if let Err(error) = atomic_replace(path, &replacement, metadata.mode()) {
         if running {
@@ -524,7 +614,12 @@ fn replace_or_append(
     }
 }
 
-fn render_block(key: &str, executables: &ExecutablePaths, owned_leading_newline: bool) -> String {
+fn render_block(
+    key: &str,
+    smart_left: bool,
+    executables: &ExecutablePaths,
+    owned_leading_newline: bool,
+) -> String {
     let command = [
         shell_word(&executables.mux),
         "--codex".to_owned(),
@@ -546,11 +641,64 @@ fn render_block(key: &str, executables: &ExecutablePaths, owned_leading_newline:
     let popup = tmux_word(&format!(
         "display-popup -E -w '{width}' -h '{height}' {command}"
     ));
+    let smart_binding = if smart_left {
+        render_smart_left_binding(executables)
+    } else {
+        String::new()
+    };
     format!(
-        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\nbind-key {key} run-shell -C {popup}\n{END_MARKER}\n",
+        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{SMART_LEFT_FIELD}{smart_left}\nbind-key {key} run-shell -C {popup}\n{smart_binding}{END_MARKER}\n",
         executables.mux.display(),
         executables.codex.display(),
     )
+}
+
+fn render_smart_left_binding(executables: &ExecutablePaths) -> String {
+    let command_name = executables
+        .codex
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("validated Smart Left executable name");
+    let probe = [
+        shell_word(&executables.mux),
+        "--codex".to_owned(),
+        shell_word(&executables.codex),
+        "--client".to_owned(),
+        shell_format("client_tty"),
+        "--invoking-pane".to_owned(),
+        shell_format("pane_id"),
+        "--invoking-session".to_owned(),
+        shell_format("session_id"),
+        "--invoking-path".to_owned(),
+        shell_format("pane_current_path"),
+        "smart-left".to_owned(),
+    ]
+    .join(" ");
+    let fallback = format!("tmux send-keys -t {} Left", shell_format("pane_id"));
+    let cleanup = format!(
+        "tmux set-option -pu -t {} @codex_mux_smart_left_active",
+        shell_format("pane_id")
+    );
+    let owner = smart_left_owner(&executables.mux);
+    let shell = format!(
+        "owner={owner}; if [ -x {} ]; then {probe}; else {fallback}; fi; {cleanup}",
+        shell_word(&executables.mux)
+    );
+    let condition = format!(
+        "#{{&&:#{{==:#{{pane_current_command}},{command_name}}},#{{!=:#{{@codex_mux_smart_left_active}},1}}}}"
+    );
+    format!(
+        "bind-key -T root Left if-shell -F '{condition}' {{\n  set-option -p @codex_mux_smart_left_active 1\n  run-shell -b {}\n}} {{\n  send-keys Left\n}}\n",
+        tmux_word(&shell)
+    )
+}
+
+pub(crate) fn smart_left_owner(path: &Path) -> String {
+    let mut token = String::with_capacity(path.as_os_str().as_bytes().len() * 2);
+    for byte in path.as_os_str().as_bytes() {
+        write!(&mut token, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    token
 }
 
 fn owned_leading_newline(bytes: &[u8], region: MarkerRegion) -> bool {
@@ -562,6 +710,143 @@ fn block_field(bytes: &[u8], region: MarkerRegion, prefix: &str) -> Option<Strin
         .ok()
         .and_then(|block| field(block, prefix))
         .map(ToOwned::to_owned)
+}
+
+fn block_smart_left(bytes: &[u8], region: MarkerRegion) -> InstallResult<bool> {
+    parse_smart_left(block_field(bytes, region, SMART_LEFT_FIELD).as_deref())
+}
+
+fn parse_smart_left(value: Option<&str>) -> InstallResult<bool> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(value) => Err(InstallError::Markers(format!(
+            "invalid Smart Left metadata {value:?}"
+        ))),
+    }
+}
+
+fn validate_smart_left_executable(executables: &ExecutablePaths) -> InstallResult<()> {
+    let Some(name) = executables.codex.file_name().and_then(|name| name.to_str()) else {
+        return Err(InstallError::InvalidValue {
+            field: "Smart Left Codex executable",
+            reason: "must have a UTF-8 file name".to_owned(),
+        });
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
+    {
+        return Err(InstallError::InvalidValue {
+            field: "Smart Left Codex executable",
+            reason: "file name must contain only ASCII letters, digits, dot, underscore, plus, or hyphen"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn has_root_left_binding_outside_owned_block(
+    bytes: &[u8],
+    region: Option<MarkerRegion>,
+) -> InstallResult<bool> {
+    let mut outside = bytes.to_vec();
+    if let Some(region) = region {
+        outside.drain(region.start..region.end);
+    }
+    let text = std::str::from_utf8(&outside)
+        .map_err(|_| InstallError::Markers("configuration is not valid UTF-8".to_owned()))?;
+    Ok(text.lines().any(line_binds_root_left))
+}
+
+fn line_binds_root_left(line: &str) -> bool {
+    let starts_with_bind = line
+        .trim_start()
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|command| matches!(command, "bind" | "bind-key"));
+    let Some(commands) = tmux_commands(line) else {
+        return starts_with_bind;
+    };
+    commands.into_iter().any(command_binds_root_left)
+}
+
+fn command_binds_root_left(words: Vec<String>) -> bool {
+    let mut words = words.into_iter();
+    if !words
+        .next()
+        .is_some_and(|command| matches!(command.as_str(), "bind" | "bind-key"))
+    {
+        return false;
+    }
+    let mut table = "prefix".to_owned();
+    let mut key = None;
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "-n" => table = "root".to_owned(),
+            "-T" => table = words.next().unwrap_or_default(),
+            "-N" => {
+                let _ = words.next();
+            }
+            "-r" => {}
+            value if value.starts_with('-') => return true,
+            value => {
+                key = Some(value.to_owned());
+                break;
+            }
+        }
+    }
+    table == "root" && key.as_deref() == Some("Left")
+}
+
+fn tmux_commands(line: &str) -> Option<Vec<Vec<String>>> {
+    let mut commands = vec![Vec::new()];
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else {
+                word.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            ';' => {
+                if !word.is_empty() {
+                    commands.last_mut()?.push(std::mem::take(&mut word));
+                }
+                commands.push(Vec::new());
+            }
+            '#' if word.is_empty() && commands.last()?.is_empty() => break,
+            character if character.is_ascii_whitespace() => {
+                if !word.is_empty() {
+                    commands.last_mut()?.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(character),
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        commands.last_mut()?.push(word);
+    }
+    Some(commands)
 }
 
 fn validate_key(key: &str) -> InstallResult<()> {

@@ -11,7 +11,7 @@ use std::{
 
 use codex_mux::install::{
     BEGIN_MARKER, DiscoveryContext, END_MARKER, ExecutablePaths, NoRunningServer, ServerEvidence,
-    TmuxReloader, discover_config, install, status, uninstall,
+    TmuxReloader, discover_config, install, install_with_options, status, uninstall,
 };
 
 fn scratch(name: &str) -> PathBuf {
@@ -37,7 +37,12 @@ struct Reloader {
     running: bool,
     calls: Vec<PathBuf>,
     unbound: Vec<String>,
+    root_bound: bool,
+    root_unbound: usize,
+    root_expected: Vec<PathBuf>,
     failure: Option<String>,
+    root_failure: Option<String>,
+    unbind_failure: Option<String>,
 }
 
 impl TmuxReloader for Reloader {
@@ -47,6 +52,20 @@ impl TmuxReloader for Reloader {
 
     fn unbind(&mut self, key: &str) -> Result<(), String> {
         self.unbound.push(key.to_owned());
+        self.unbind_failure.clone().map_or(Ok(()), Err)
+    }
+
+    fn root_left_bound(&mut self) -> Result<bool, String> {
+        Ok(self.root_bound)
+    }
+
+    fn unbind_root_left(&mut self, expected_mux: &Path) -> Result<(), String> {
+        self.root_unbound += 1;
+        self.root_expected.push(expected_mux.to_owned());
+        if let Some(error) = &self.root_failure {
+            return Err(error.clone());
+        }
+        self.root_bound = false;
         Ok(())
     }
 
@@ -116,7 +135,178 @@ fn paths_are_quoted_and_status_reports_drift_without_writing() {
     assert!(report.installed);
     assert_eq!(report.key.as_deref(), Some("C-a"));
     assert_eq!(report.drift.len(), 2);
+    assert!(!report.smart_left);
     assert_eq!(fs::read(&config).unwrap(), before);
+}
+
+#[test]
+fn smart_left_is_opt_in_rendered_and_reported() {
+    let root = scratch("smart-left-render");
+    let config = root.join("tmux.conf");
+    fs::write(&config, b"set -g status off\n").unwrap();
+    let mut no_server = NoRunningServer;
+
+    install_with_options(&config, "a", true, &executables(), &mut no_server).unwrap();
+    let rendered = String::from_utf8(fs::read(&config).unwrap()).unwrap();
+    assert!(rendered.contains("# codex-mux-smart-left: true"));
+    assert!(rendered.contains("bind-key -T root Left"));
+    assert!(rendered.contains("smart-left"));
+    assert!(rendered.contains("@codex_mux_smart_left_active"));
+    assert!(status(&config, &executables()).unwrap().smart_left);
+}
+
+#[test]
+fn smart_left_refuses_file_and_live_root_binding_conflicts_before_mutation() {
+    for host_binding in [
+        "bind-key -n Left select-pane -L\n",
+        "bind -T root Left resize-pane -L\n",
+        "bind-key -N \"host left\" -T root Left select-pane -L\n",
+    ] {
+        let root = scratch("smart-left-file-conflict");
+        let config = root.join("tmux.conf");
+        fs::write(&config, host_binding.as_bytes()).unwrap();
+        let before = fs::read(&config).unwrap();
+        let mut no_server = NoRunningServer;
+        assert!(install_with_options(&config, "a", true, &executables(), &mut no_server).is_err());
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    let root = scratch("smart-left-live-conflict");
+    let config = root.join("tmux.conf");
+    fs::write(&config, b"host\n").unwrap();
+    let mut reloader = Reloader {
+        running: true,
+        root_bound: true,
+        ..Reloader::default()
+    };
+    assert!(install_with_options(&config, "a", true, &executables(), &mut reloader).is_err());
+    assert_eq!(fs::read(&config).unwrap(), b"host\n");
+    assert!(reloader.calls.is_empty());
+}
+
+#[test]
+fn live_unbind_failures_do_not_leave_a_partially_removed_binding_pair() {
+    for operation in ["update", "uninstall"] {
+        let root = scratch(&format!("smart-left-root-unbind-failure-{operation}"));
+        let config = root.join("tmux.conf");
+        fs::write(&config, b"host\n").unwrap();
+        let mut reloader = Reloader {
+            running: true,
+            ..Reloader::default()
+        };
+        install_with_options(&config, "a", true, &executables(), &mut reloader).unwrap();
+        let installed = fs::read(&config).unwrap();
+        reloader.calls.clear();
+        reloader.unbound.clear();
+        reloader.root_failure = Some("root unbind exploded".to_owned());
+
+        let result = if operation == "update" {
+            install_with_options(&config, "g", false, &executables(), &mut reloader).map(|_| ())
+        } else {
+            uninstall(&config, &mut reloader).map(|_| ())
+        };
+        assert!(result.is_err());
+        assert_eq!(fs::read(&config).unwrap(), installed);
+        assert!(reloader.unbound.is_empty());
+        assert!(reloader.calls.is_empty());
+    }
+
+    for operation in ["update", "uninstall"] {
+        let root = scratch(&format!("smart-left-prefix-unbind-failure-{operation}"));
+        let config = root.join("tmux.conf");
+        fs::write(&config, b"host\n").unwrap();
+        let mut reloader = Reloader {
+            running: true,
+            ..Reloader::default()
+        };
+        install_with_options(&config, "a", true, &executables(), &mut reloader).unwrap();
+        let installed = fs::read(&config).unwrap();
+        reloader.calls.clear();
+        reloader.unbound.clear();
+        reloader.unbind_failure = Some("prefix unbind exploded".to_owned());
+
+        let result = if operation == "update" {
+            install_with_options(&config, "g", false, &executables(), &mut reloader).map(|_| ())
+        } else {
+            uninstall(&config, &mut reloader).map(|_| ())
+        };
+        assert!(result.is_err());
+        assert_eq!(fs::read(&config).unwrap(), installed);
+        assert_eq!(reloader.unbound, vec!["a"]);
+        assert_eq!(reloader.calls, vec![config]);
+    }
+}
+
+#[test]
+fn disabling_and_uninstalling_smart_left_remove_only_owned_live_root_binding() {
+    let root = scratch("smart-left-disable");
+    let config = root.join("tmux.conf");
+    fs::write(&config, b"host\n").unwrap();
+    let mut reloader = Reloader {
+        running: true,
+        ..Reloader::default()
+    };
+    install_with_options(&config, "a", true, &executables(), &mut reloader).unwrap();
+    reloader.root_bound = true;
+    install_with_options(&config, "a", false, &executables(), &mut reloader).unwrap();
+    assert_eq!(reloader.root_unbound, 1);
+    assert!(!status(&config, &executables()).unwrap().smart_left);
+
+    install_with_options(&config, "a", true, &executables(), &mut reloader).unwrap();
+    reloader.root_bound = true;
+    assert!(uninstall(&config, &mut reloader).unwrap());
+    assert_eq!(reloader.root_unbound, 2);
+}
+
+#[test]
+fn disabling_after_a_binary_move_authenticates_the_recorded_old_binding() {
+    let root = scratch("smart-left-moved-binary");
+    let config = root.join("tmux.conf");
+    fs::write(&config, b"host\n").unwrap();
+    let old = ExecutablePaths::new(
+        PathBuf::from("/old/codex-mux"),
+        PathBuf::from("/custom/codex"),
+    )
+    .unwrap();
+    let new = ExecutablePaths::new(
+        PathBuf::from("/new/codex-mux"),
+        PathBuf::from("/custom/codex"),
+    )
+    .unwrap();
+    let mut reloader = Reloader {
+        running: true,
+        ..Reloader::default()
+    };
+
+    install_with_options(&config, "a", true, &old, &mut reloader).unwrap();
+    install_with_options(&config, "a", false, &new, &mut reloader).unwrap();
+
+    assert_eq!(
+        reloader.root_expected,
+        vec![PathBuf::from("/old/codex-mux")]
+    );
+    let report = status(&config, &new).unwrap();
+    assert!(!report.smart_left);
+    assert!(report.drift.is_empty());
+}
+
+#[test]
+fn legacy_block_without_smart_left_metadata_migrates_as_disabled() {
+    let root = scratch("smart-left-legacy");
+    let config = root.join("tmux.conf");
+    let legacy = format!(
+        "{BEGIN_MARKER}\n# codex-mux-owned-leading-newline: false\n# codex-mux-key: a\n# codex-mux-binary: /opt/codex mux/bin/codex-mux\n# codex-executable: /custom/codex's/bin/codex\nbind-key a display-message legacy\n{END_MARKER}\n"
+    );
+    fs::write(&config, legacy).unwrap();
+    assert!(!status(&config, &executables()).unwrap().smart_left);
+    let mut no_server = NoRunningServer;
+    install(&config, "a", &executables(), &mut no_server).unwrap();
+    assert!(
+        String::from_utf8(fs::read(&config).unwrap())
+            .unwrap()
+            .contains("# codex-mux-smart-left: false")
+    );
 }
 
 #[test]
@@ -296,7 +486,7 @@ fn rendered_binding_loads_in_a_disposable_tmux_server() {
     let config = root.join("tmux.conf");
     fs::write(&config, b"set -g status off\n").unwrap();
     let mut no_server = NoRunningServer;
-    install(&config, "a", &executables(), &mut no_server).unwrap();
+    install_with_options(&config, "a", true, &executables(), &mut no_server).unwrap();
 
     let socket = format!(
         "codex-mux-installer-{}",
@@ -320,15 +510,23 @@ fn rendered_binding_loads_in_a_disposable_tmux_server() {
         .args(["-L", &socket, "list-keys", "-T", "prefix", "a"])
         .output()
         .unwrap();
+    let root_left = Command::new("tmux")
+        .args(["-L", &socket, "list-keys", "-T", "root", "Left"])
+        .output()
+        .unwrap();
     let _ = Command::new("tmux")
         .args(["-L", &socket, "kill-server"])
         .status();
     assert!(listed.status.success());
+    assert!(root_left.status.success());
     let binding = String::from_utf8(listed.stdout).unwrap();
     assert!(binding.contains("display-popup"));
     assert!(binding.contains("codex-mux"));
     assert!(binding.contains("client_width"));
     assert!(binding.contains("q:pane_current_path"));
+    let smart_binding = String::from_utf8(root_left.stdout).unwrap();
+    assert!(smart_binding.contains("smart-left"));
+    assert!(smart_binding.contains("send-keys"));
 }
 
 #[test]

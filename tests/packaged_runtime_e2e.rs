@@ -284,6 +284,58 @@ fn installed_prefix_key_opens_the_extracted_binary_popup() {
 }
 
 #[test]
+fn installed_smart_left_moves_then_opens_the_extracted_binary_at_the_boundary() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("smart-left");
+    fixture.install_smart_left(&binary);
+    let output = fixture
+        .server
+        .command()
+        .args(["respawn-pane", "-k", "-t", &fixture.origin_pane, "--"])
+        .arg(&fixture.codex)
+        .arg("smart-left")
+        .output()
+        .unwrap();
+    assert_success(&output, "start packaged Smart Left composer fixture");
+    fixture.server.wait("Smart Left composer cursor", || {
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 5
+    });
+
+    let capture = fixture.scratch.join("smart-left-client.log");
+    let (mut client, _tty) = fixture.client("origin", (100, 32), "smart-left-client");
+    client.send(b"\x1b[D");
+    fixture.server.wait("ordinary packaged Left", || {
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 4
+    });
+    fixture.server.wait("ordinary packaged probe cleanup", || {
+        smart_left_inactive(&fixture.server, &fixture.origin_pane)
+    });
+    assert!(!fs::read_to_string(&capture).unwrap().contains("sessions"));
+
+    for expected_x in [3, 2] {
+        client.send(b"\x1b[D");
+        fixture
+            .server
+            .wait("packaged composer cursor movement", || {
+                pane_cursor_x(&fixture.server, &fixture.origin_pane) == expected_x
+            });
+        fixture.server.wait("packaged movement probe cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+        });
+    }
+    client.send(b"\x1b[D");
+    client.wait_text("sessions");
+    assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 2);
+    client.send(b"q");
+    fixture.server.wait("packaged Smart Left cleanup", || {
+        smart_left_inactive(&fixture.server, &fixture.origin_pane)
+    });
+    client.send(b"\x02d");
+}
+
+#[test]
 fn packaged_new_resume_fallback_and_confirmed_close_cross_process_boundaries() {
     let Some(binary) = require_prerequisites() else {
         return;
@@ -487,6 +539,23 @@ impl Fixture {
         assert_success(&output, "install extracted binary prefix binding");
     }
 
+    fn install_smart_left(&self, binary: &Path) {
+        let output = Command::new(binary)
+            .env("TMUX", self.server.environment())
+            .args([
+                "--codex",
+                text(&self.codex),
+                "tmux",
+                "install",
+                "--smart-left",
+                "--config",
+            ])
+            .arg(&self.config)
+            .output()
+            .unwrap();
+        assert_success(&output, "install extracted binary Smart Left binding");
+    }
+
     fn client(&self, session: &str, size: (u16, u16), label: &str) -> (Pty, String) {
         let before = self
             .server
@@ -562,7 +631,29 @@ fn fake_codex(scratch: &Scratch) -> PathBuf {
     fs::write(
         &source,
         r#"
-use std::{env, fs::OpenOptions, io::Write, thread, time::Duration};
+use std::{env, fs::OpenOptions, io::{Read, Write}, process::Command, thread, time::Duration};
+
+fn run_smart_left_fixture() {
+    assert!(Command::new("stty").args(["raw", "-echo"]).status().unwrap().success());
+    let mut output = std::io::stdout().lock();
+    let mut input = std::io::stdin().lock();
+    let mut cursor = 3usize;
+    write!(output, "\x1b[2J\x1b[H› abc\x1b[1;{}H", cursor + 3).unwrap();
+    output.flush().unwrap();
+    let mut byte = [0_u8; 1];
+    loop {
+        input.read_exact(&mut byte).unwrap();
+        if byte[0] != 0x1b { continue; }
+        let mut tail = [0_u8; 2];
+        input.read_exact(&mut tail).unwrap();
+        if tail == *b"[D" {
+            cursor = cursor.saturating_sub(1);
+            write!(output, "\x1b[1;{}H", cursor + 3).unwrap();
+            output.flush().unwrap();
+        }
+    }
+}
+
 fn main() {
     let mut log = OpenOptions::new().create(true).append(true)
         .open(env::var_os("CODEX_MUX_E2E_LOG").unwrap()).unwrap();
@@ -571,6 +662,10 @@ fn main() {
         writeln!(log, "arg{index}={argument}").unwrap();
     }
     writeln!(log, "---").unwrap();
+    if env::args().nth(1).as_deref() == Some("smart-left") {
+        drop(log);
+        run_smart_left_fixture();
+    }
     thread::sleep(Duration::from_secs(300));
 }
 "#,
@@ -611,6 +706,27 @@ fn pane_exists(server: &Server, pane: &str) -> bool {
         && String::from_utf8_lossy(&output.stdout)
             .lines()
             .any(|candidate| candidate == pane)
+}
+
+fn pane_cursor_x(server: &Server, pane: &str) -> u16 {
+    server
+        .checked(&["display-message", "-p", "-t", pane, "#{cursor_x}"])
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn smart_left_inactive(server: &Server, pane: &str) -> bool {
+    server
+        .run(&[
+            "show-options",
+            "-pqv",
+            "-t",
+            pane,
+            "@codex_mux_smart_left_active",
+        ])
+        .stdout
+        .is_empty()
 }
 
 fn process_count(executable: &Path) -> usize {

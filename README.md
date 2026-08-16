@@ -59,6 +59,19 @@ If Codex is installed at a custom path, always use the same absolute path when i
 
 Re-run `tmux install` after moving either executable so the managed block records the new paths.
 
+### Optional Smart Left activation
+
+Add `--smart-left` to the install command to make plain `Left` open the popup when the cursor is already at the absolute beginning of the focused Codex composer:
+
+```sh
+codex-mux --codex "$(command -v codex)" \
+  tmux install --smart-left --key a --config "$HOME/.tmux.conf"
+```
+
+Smart Left first sends the requested `Left` to Codex, then observes the rendered cursor over a 60 ms sampling window. It opens only when the cursor did not move and the cursor is on the Codex composer prompt; otherwise the key behaves as ordinary `Left`. The fast path runs only for a directly verified Codex executable, so wrapper-launched sessions deliberately use ordinary `Left` and retain `prefix + a` as the fallback.
+
+This option owns the root-table `Left` binding inside the same marker block. Installation refuses to enable it if the selected config or running tmux server already binds root-table `Left`. Reinstall without `--smart-left` to disable it. The normal prefix binding remains installed either way.
+
 ## Use the popup
 
 Press your normal tmux prefix, then the configured key. For example, with tmux's default prefix and the default `codex-mux` key, press `Ctrl-b`, release it, then press `a`.
@@ -100,7 +113,7 @@ codex-mux --codex "$(command -v codex)" tmux status --config "$HOME/.tmux.conf"
 codex-mux tmux uninstall --config "$HOME/.tmux.conf"
 ```
 
-`status` is read-only and reports the configured key, both executable paths, and drift. `uninstall` removes only the marked block and unbinds the recorded key from a running server; it does not delete the host tmux file or theme preference.
+`status` is read-only and reports the configured key, Smart Left state, both executable paths, and drift. `uninstall` removes only the marked block and unbinds the recorded prefix key and owned Smart Left key from a running server; it does not delete the host tmux file or theme preference.
 
 ## Troubleshooting
 
@@ -108,6 +121,7 @@ codex-mux tmux uninstall --config "$HOME/.tmux.conf"
 - **Configuration discovery is ambiguous:** pass `--config` with the exact host-owned tmux entrypoint. `codex-mux` intentionally does not guess among multiple files.
 - **Status reports drift:** re-run `tmux install` with the intended `--codex`, binary location, key, and config path.
 - **The key does nothing:** run `tmux list-keys -T prefix KEY`, inspect `tmux status`, and verify the configured binary still exists and is executable.
+- **Smart Left stays an ordinary Left:** run `tmux list-keys -T root Left`, confirm `tmux status` reports `smart-left: enabled`, and use the directly configured Codex executable rather than a wrapper. The feature intentionally fails through when process or cursor identity is uncertain.
 - **A phone shows a large layout:** make sure the binding was invoked by that phone's tmux client; the popup uses `client_width` and `client_height` from the invoking client.
 - **Colors are unreadable:** set `NO_COLOR=1` or select the monochrome theme.
 - **Another client saw the selected window change:** clients sharing one tmux session also share that session's active window and window zoom state. Attach the clients to separate sessions when independent views are required.

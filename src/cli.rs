@@ -43,6 +43,9 @@ pub struct Cli {
 pub enum Command {
     /// Manage the tmux prefix binding owned by codex-mux.
     Tmux(TmuxArgs),
+    /// Internal entrypoint used by the marker-managed Smart Left binding.
+    #[command(hide = true)]
+    SmartLeft,
 }
 
 /// Arguments for the `tmux` command group.
@@ -70,6 +73,10 @@ pub struct InstallArgs {
     /// Key pressed after the tmux prefix.
     #[arg(long, default_value = "a", value_name = "KEY")]
     pub key: String,
+
+    /// Open codex-mux when Left cannot move the focused Codex composer cursor.
+    #[arg(long)]
+    pub smart_left: bool,
 
     /// Explicit host-owned tmux entrypoint.
     #[arg(long, value_name = "PATH")]
@@ -115,7 +122,20 @@ mod tests {
             panic!("expected install command");
         };
         assert_eq!(install.key, "g");
+        assert!(!install.smart_left);
         assert_eq!(install.config, Some(PathBuf::from("/home/me/.tmux.conf")));
+    }
+
+    #[test]
+    fn parses_opt_in_smart_left_installation() {
+        let cli = Cli::try_parse_from(["codex-mux", "tmux", "install", "--smart-left"]).unwrap();
+        let Some(Command::Tmux(tmux)) = cli.command else {
+            panic!("expected tmux command");
+        };
+        let TmuxCommand::Install(install) = tmux.command else {
+            panic!("expected install command");
+        };
+        assert!(install.smart_left);
     }
 
     #[test]
