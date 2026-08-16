@@ -41,11 +41,51 @@ pub struct Cli {
 /// Top-level management commands.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum Command {
+    /// Configure tmux plus prompt-aware Bash and Zsh Smart Left.
+    Setup(SetupArgs),
+    /// Remove owned tmux, Bash, and Zsh configuration blocks.
+    Remove(RemoveArgs),
     /// Manage the tmux prefix binding owned by codex-mux.
     Tmux(TmuxArgs),
     /// Internal entrypoint used by the marker-managed Smart Left binding.
     #[command(hide = true)]
     SmartLeft,
+}
+
+/// Standard and explicitly overridden configuration paths for setup.
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct SetupArgs {
+    /// Key pressed after the tmux prefix.
+    #[arg(long, default_value = "a", value_name = "KEY")]
+    pub key: String,
+
+    /// Explicit host-owned tmux entrypoint.
+    #[arg(long, value_name = "PATH")]
+    pub tmux_config: Option<PathBuf>,
+
+    /// Bash startup file; defaults to HOME/.bashrc.
+    #[arg(long, value_name = "PATH")]
+    pub bash_config: Option<PathBuf>,
+
+    /// Zsh startup file; defaults to ZDOTDIR/.zshrc or HOME/.zshrc.
+    #[arg(long, value_name = "PATH")]
+    pub zsh_config: Option<PathBuf>,
+}
+
+/// Standard and explicitly overridden configuration paths for removal.
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct RemoveArgs {
+    /// Explicit host-owned tmux entrypoint.
+    #[arg(long, value_name = "PATH")]
+    pub tmux_config: Option<PathBuf>,
+
+    /// Bash startup file; defaults to HOME/.bashrc.
+    #[arg(long, value_name = "PATH")]
+    pub bash_config: Option<PathBuf>,
+
+    /// Zsh startup file; defaults to ZDOTDIR/.zshrc or HOME/.zshrc.
+    #[arg(long, value_name = "PATH")]
+    pub zsh_config: Option<PathBuf>,
 }
 
 /// Arguments for the `tmux` command group.
@@ -136,6 +176,26 @@ mod tests {
             panic!("expected install command");
         };
         assert!(install.smart_left);
+    }
+
+    #[test]
+    fn parses_zero_argument_setup_and_remove() {
+        let setup = Cli::try_parse_from(["codex-mux", "setup"]).unwrap();
+        let Some(Command::Setup(setup)) = setup.command else {
+            panic!("expected setup command");
+        };
+        assert_eq!(setup.key, "a");
+        assert_eq!(setup.tmux_config, None);
+        assert_eq!(setup.bash_config, None);
+        assert_eq!(setup.zsh_config, None);
+
+        let remove = Cli::try_parse_from(["codex-mux", "remove"]).unwrap();
+        let Some(Command::Remove(remove)) = remove.command else {
+            panic!("expected remove command");
+        };
+        assert_eq!(remove.tmux_config, None);
+        assert_eq!(remove.bash_config, None);
+        assert_eq!(remove.zsh_config, None);
     }
 
     #[test]

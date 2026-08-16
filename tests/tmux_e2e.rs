@@ -393,6 +393,357 @@ fn physical_left_moves_inside_composer_and_opens_mux_only_at_its_boundary() {
 }
 
 #[test]
+fn prompt_aware_smart_left_works_in_real_bash_and_zsh() {
+    let _serial = serial_tmux_test();
+    if !tools_available()
+        || !["bash", "zsh"]
+            .into_iter()
+            .all(|shell| Command::new(shell).arg("--version").output().is_ok())
+    {
+        eprintln!("tmux, script, Bash, or Zsh is unavailable; skipping shell Smart Left E2E");
+        return;
+    }
+
+    for shell in ["bash", "zsh"] {
+        let fixture = RuntimeFixture::new(&format!("smart-left-{shell}"));
+        let bashrc = fixture.scratch.join(".bashrc");
+        let zshrc = fixture.scratch.join(".zshrc");
+        fs::write(&bashrc, "PS1='PROMPT> '\n").unwrap();
+        fs::write(&zshrc, "PROMPT='PROMPT> '\n").unwrap();
+        let setup = binary()
+            .env("TMUX", fixture.server.tmux_environment())
+            .env("HOME", fixture.scratch.path())
+            .args(["--codex", path(&fixture.codex), "setup"])
+            .arg("--tmux-config")
+            .arg(&fixture.config)
+            .arg("--bash-config")
+            .arg(&bashrc)
+            .arg("--zsh-config")
+            .arg(&zshrc)
+            .output()
+            .unwrap();
+        assert_success(&setup, "install aggregate shell Smart Left setup");
+
+        let respawn_shell = || {
+            let mut respawn = fixture.server.command();
+            respawn.args([
+                "respawn-pane",
+                "-k",
+                "-t",
+                &fixture.origin_pane,
+                "--",
+                "env",
+            ]);
+            respawn.arg(format!("HOME={}", fixture.scratch.path().display()));
+            if shell == "bash" {
+                respawn.args(["bash", "--noprofile", "--rcfile"]);
+                respawn.arg(&bashrc);
+                respawn.arg("-i");
+            } else {
+                respawn.arg(format!("ZDOTDIR={}", fixture.scratch.path().display()));
+                respawn.args(["zsh", "-d", "-o", "interactive"]);
+            }
+            assert_success(
+                &respawn.output().unwrap(),
+                "start configured interactive shell",
+            );
+        };
+        respawn_shell();
+        fixture
+            .server
+            .wait_until("shell prompt lifecycle marker", || {
+                fixture
+                    .server
+                    .checked(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .trim()
+                    == "1"
+            });
+
+        let capture = fixture.scratch.join(format!("{shell}-screen.log"));
+        let mut client = PtyProcess::attach_captured(&fixture.server, "origin", 100, 32, &capture);
+        let _tty = wait_for_client(&fixture.server, "origin");
+        let secondary_popup_count = popup_command_count(&fixture.server);
+        fixture
+            .server
+            .checked(&["send-keys", "-t", &fixture.origin_pane, "echo '", "Enter"]);
+        fixture
+            .server
+            .wait_until("secondary prompt clears marker", || {
+                fixture
+                    .server
+                    .run(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .stdout
+                    .is_empty()
+            });
+        client.send(b"\x1b[D");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            popup_command_count(&fixture.server),
+            secondary_popup_count,
+            "{shell} opened the mux at a secondary prompt"
+        );
+        respawn_shell();
+        fixture
+            .server
+            .wait_until("primary prompt returns after secondary prompt", || {
+                fixture
+                    .server
+                    .checked(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .trim()
+                    == "1"
+            });
+        if shell == "zsh" {
+            let sentinel = fixture.scratch.join("later-precmd-ran");
+            fixture.server.checked(&[
+                "send-keys",
+                "-t",
+                &fixture.origin_pane,
+                &format!(
+                    "__codex_mux_test_later() {{ print -r -- hit >> {}; }}; add-zsh-hook precmd __codex_mux_test_later; false",
+                    sentinel.display()
+                ),
+                "Enter",
+            ]);
+            fixture
+                .server
+                .wait_until("later Zsh precmd hook after false", || sentinel.is_file());
+        }
+        let boundary = pane_cursor_x(&fixture.server, &fixture.origin_pane);
+        client.send(b"abc");
+        fixture.server.wait_until("shell input rendered", || {
+            pane_cursor_x(&fixture.server, &fixture.origin_pane) == boundary + 3
+        });
+        client.send(b"\x1b[D");
+        fixture
+            .server
+            .wait_until("Left moves within shell input", || {
+                pane_cursor_x(&fixture.server, &fixture.origin_pane) == boundary + 2
+            });
+        assert!(
+            !fs::read_to_string(&capture)
+                .unwrap_or_default()
+                .contains("sessions"),
+            "{shell} opened the mux while Left could still move"
+        );
+
+        client.send(b"\x01\x0b");
+        fixture.server.wait_until("shell input cleared", || {
+            pane_cursor_x(&fixture.server, &fixture.origin_pane) == boundary
+        });
+        fixture
+            .server
+            .checked(&["send-keys", "-t", &fixture.origin_pane, "read -r", "Enter"]);
+        fixture
+            .server
+            .wait_until("shell read builtin clears prompt marker", || {
+                fixture
+                    .server
+                    .run(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .stdout
+                    .is_empty()
+            });
+        let read_popup_count = popup_command_count(&fixture.server);
+        client.send(b"\x1b[D");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            popup_command_count(&fixture.server),
+            read_popup_count,
+            "{shell} opened the mux while read was consuming input"
+        );
+        respawn_shell();
+        fixture
+            .server
+            .wait_until("fresh shell prompt after read safety check", || {
+                fixture
+                    .server
+                    .checked(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .trim()
+                    == "1"
+            });
+        let lifecycle_count = shell_prompt_unset_count(&fixture.server);
+        fixture
+            .server
+            .checked(&["send-keys", "-t", &fixture.origin_pane, "true", "Enter"]);
+        fixture.server.wait_until(
+            "shell command lifecycle clears and restores prompt marker",
+            || {
+                shell_prompt_unset_count(&fixture.server) > lifecycle_count
+                    && fixture
+                        .server
+                        .checked(&[
+                            "show-options",
+                            "-pqv",
+                            "-t",
+                            &fixture.origin_pane,
+                            "@codex_mux_shell_prompt",
+                        ])
+                        .trim()
+                        == "1"
+            },
+        );
+        let before = popup_command_count(&fixture.server);
+        client.send(b"\x1b[D");
+        fixture.server.wait_until("shell boundary opens mux", || {
+            fs::read_to_string(&capture).is_ok_and(|screen| screen.contains("sessions"))
+        });
+        assert_eq!(popup_command_count(&fixture.server), before + 1);
+        client.send(b"q");
+        fixture.server.wait_until("shell probe cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+        });
+        if shell == "bash" {
+            let disabled = fixture.scratch.join("promptvars-disabled");
+            fixture.server.checked(&[
+                "send-keys",
+                "-t",
+                &fixture.origin_pane,
+                &format!(
+                    "shopt -u promptvars; printf disabled > {}",
+                    disabled.display()
+                ),
+                "Enter",
+            ]);
+            fixture
+                .server
+                .wait_until("Bash promptvars-disabled command completes", || {
+                    disabled.is_file()
+                        && fixture
+                            .server
+                            .run(&[
+                                "show-options",
+                                "-pqv",
+                                "-t",
+                                &fixture.origin_pane,
+                                "@codex_mux_shell_prompt",
+                            ])
+                            .stdout
+                            .is_empty()
+                });
+            let disabled_count = popup_command_count(&fixture.server);
+            client.send(b"\x1b[D");
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(popup_command_count(&fixture.server), disabled_count);
+
+            let reading = fixture.scratch.join("promptvars-read");
+            fixture.server.checked(&[
+                "send-keys",
+                "-t",
+                &fixture.origin_pane,
+                &format!("printf reading > {}; read -r", reading.display()),
+                "Enter",
+            ]);
+            fixture
+                .server
+                .wait_until("Bash promptvars-disabled read starts", || reading.is_file());
+            client.send(b"\x1b[D");
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(popup_command_count(&fixture.server), disabled_count);
+
+            respawn_shell();
+            fixture
+                .server
+                .wait_until("fresh Bash prompt before promptvars PS2 check", || {
+                    fixture
+                        .server
+                        .checked(&[
+                            "show-options",
+                            "-pqv",
+                            "-t",
+                            &fixture.origin_pane,
+                            "@codex_mux_shell_prompt",
+                        ])
+                        .trim()
+                        == "1"
+                });
+            fixture.server.checked(&[
+                "send-keys",
+                "-t",
+                &fixture.origin_pane,
+                "shopt -u promptvars",
+                "Enter",
+            ]);
+            fixture.server.wait_until(
+                "Bash promptvars-disabled primary prompt fails closed",
+                || {
+                    fixture
+                        .server
+                        .run(&[
+                            "show-options",
+                            "-pqv",
+                            "-t",
+                            &fixture.origin_pane,
+                            "@codex_mux_shell_prompt",
+                        ])
+                        .stdout
+                        .is_empty()
+                },
+            );
+            fixture
+                .server
+                .checked(&["send-keys", "-t", &fixture.origin_pane, "echo '", "Enter"]);
+            thread::sleep(Duration::from_millis(100));
+            client.send(b"\x1b[D");
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(popup_command_count(&fixture.server), disabled_count);
+        }
+        client.send(b"\x02d");
+
+        let removed = binary()
+            .env("TMUX", fixture.server.tmux_environment())
+            .env("HOME", fixture.scratch.path())
+            .args(["remove"])
+            .arg("--tmux-config")
+            .arg(&fixture.config)
+            .arg("--bash-config")
+            .arg(&bashrc)
+            .arg("--zsh-config")
+            .arg(&zshrc)
+            .output()
+            .unwrap();
+        assert_success(&removed, "remove aggregate shell Smart Left setup");
+        assert_eq!(fs::read_to_string(&bashrc).unwrap(), "PS1='PROMPT> '\n");
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), "PROMPT='PROMPT> '\n");
+        assert!(
+            !fixture
+                .server
+                .run(&["list-keys", "-T", "root", "Left"])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
 fn interactive_cli_selects_full_screen_for_only_the_named_client() {
     let _serial = serial_tmux_test();
     if !tools_available() {
@@ -880,6 +1231,16 @@ fn popup_command_count(server: &TmuxServer) -> usize {
         .checked(&["show-messages"])
         .lines()
         .filter(|line| line.contains(" command: display-popup "))
+        .count()
+}
+
+fn shell_prompt_unset_count(server: &TmuxServer) -> usize {
+    server
+        .checked(&["show-messages"])
+        .lines()
+        .filter(|line| {
+            line.contains("command: set-option -pu") && line.contains("@codex_mux_shell_prompt")
+        })
         .count()
 }
 

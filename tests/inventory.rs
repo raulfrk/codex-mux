@@ -238,6 +238,104 @@ fn proc_group_wrapper_requires_absolute_configured_path_evidence() {
 }
 
 #[test]
+fn direct_foreground_interactive_bash_and_zsh_are_shell_targets() {
+    for (pid, shell, arguments) in [
+        (
+            41,
+            "/bin/bash",
+            vec!["/bin/bash", "--rcfile", "/tmp/bashrc", "-i"],
+        ),
+        (42, "/bin/zsh", vec!["/bin/zsh", "-o", "interactive"]),
+    ] {
+        let root = TemporaryDirectory::new("proc-interactive-shell");
+        write_process(
+            root.path(),
+            pid,
+            pid as i64,
+            34816,
+            pid as i64,
+            shell,
+            &arguments,
+        );
+        let inspector = LinuxProcessInspector::with_proc_root(
+            CodexExecutable::new("/opt/bin/codex").unwrap(),
+            root.path(),
+        );
+
+        assert!(
+            inspector
+                .foreground_process_is_shell(
+                    pid,
+                    Path::new(shell).file_name().unwrap().to_str().unwrap()
+                )
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn unrelated_executable_named_bash_is_not_a_shell_target() {
+    let root = TemporaryDirectory::new("proc-fake-bash");
+    let fake = root.path().join("bin/bash");
+    fs::create_dir_all(fake.parent().unwrap()).unwrap();
+    fs::write(&fake, b"not bash").unwrap();
+    write_process(
+        root.path(),
+        61,
+        61,
+        34816,
+        61,
+        fake.to_str().unwrap(),
+        &[fake.to_str().unwrap()],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new("/opt/bin/codex").unwrap(),
+        root.path(),
+    );
+
+    assert!(!inspector.foreground_process_is_shell(61, "bash").unwrap());
+}
+
+#[test]
+fn shell_target_rejects_jobs_wrappers_command_mode_and_identity_mismatch() {
+    let cases = [
+        (51, 50, 34816, 50, "/bin/bash", vec!["/bin/bash"], "bash"),
+        (
+            52,
+            52,
+            34816,
+            52,
+            "/usr/bin/env",
+            vec!["env", "/bin/bash"],
+            "bash",
+        ),
+        (
+            53,
+            53,
+            34816,
+            53,
+            "/bin/bash",
+            vec!["bash", "-c", "echo"],
+            "bash",
+        ),
+        (54, 54, 34816, 54, "/bin/bash", vec!["bash"], "zsh"),
+        (55, 55, 0, 55, "/bin/bash", vec!["bash"], "bash"),
+    ];
+    for (pid, pgrp, tty, tpgid, executable, arguments, command) in cases {
+        let root = TemporaryDirectory::new("proc-rejected-shell");
+        write_process(root.path(), pid, pgrp, tty, tpgid, executable, &arguments);
+        let inspector = LinuxProcessInspector::with_proc_root(
+            CodexExecutable::new("/opt/bin/codex").unwrap(),
+            root.path(),
+        );
+        assert!(
+            !inspector.foreground_process_is_shell(pid, command).unwrap(),
+            "unexpectedly accepted {executable} {arguments:?}"
+        );
+    }
+}
+
+#[test]
 fn exact_codex_in_a_shell_foreground_group_is_direct() {
     let root = TemporaryDirectory::new("proc-direct-foreground");
     let configured = root.path().join("bin/codex-custom");

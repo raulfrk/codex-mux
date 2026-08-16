@@ -565,6 +565,10 @@ fn rendered_binding_loads_in_a_disposable_tmux_server() {
     let smart_binding = String::from_utf8(root_left.stdout).unwrap();
     assert!(smart_binding.contains("smart-left"));
     assert!(smart_binding.contains("send-keys"));
+    assert!(smart_binding.contains("pane_current_command"));
+    assert!(smart_binding.contains("@codex_mux_shell_prompt"));
+    assert!(smart_binding.contains("bash"));
+    assert!(smart_binding.contains("zsh"));
 }
 
 #[test]

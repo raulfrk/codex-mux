@@ -3,7 +3,8 @@
 use std::{
     env,
     ffi::OsString,
-    io,
+    fs, io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,7 +13,7 @@ use crossterm::event::{self, Event};
 
 use crate::{
     MuxError, Result,
-    cli::{Cli, Command, ConfigPathArgs, InstallArgs, TmuxCommand},
+    cli::{Cli, Command, ConfigPathArgs, InstallArgs, RemoveArgs, SetupArgs, TmuxCommand},
     config::{XdgThemeStore, no_color_requested},
     domain::{
         ClientId, CodexExecutable, InvocationContext, PaneId, SessionId, ThemeStore,
@@ -20,9 +21,11 @@ use crate::{
     },
     install::{
         DiscoveryContext, ExecutablePaths, InstallError, ServerEvidence, TmuxReloader,
-        discover_config, install_with_options, smart_left_owner, status, uninstall,
+        atomic_replace, discover_config, install_with_options, read, smart_left_owner, status,
+        uninstall, validate_regular_writable,
     },
     linux_process::LinuxProcessInspector,
+    shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
     tmux::{
         actions::TmuxActions,
         inventory::PaneInventory,
@@ -38,9 +41,264 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub fn run(cli: Cli) -> Result<()> {
     let codex_argument = cli.codex.clone();
     match cli.command.clone() {
+        Some(Command::Setup(arguments)) => run_setup(arguments, codex_argument),
+        Some(Command::Remove(arguments)) => run_remove(arguments),
         Some(Command::Tmux(tmux)) => run_tmux_command(tmux.command, codex_argument),
         Some(Command::SmartLeft) => run_smart_left(&cli, codex_argument),
         None => run_interactive(cli, codex_argument),
+    }
+}
+
+fn run_setup(arguments: SetupArgs, codex_argument: Option<PathBuf>) -> Result<()> {
+    let home = home_directory()?;
+    let tmux_path = resolve_config(arguments.tmux_config)?;
+    let shell_paths = shell_paths(&home, arguments.bash_config, arguments.zsh_config)?;
+    validate_distinct_config_targets(&tmux_path, &shell_paths)?;
+    let executables = executable_paths(codex_argument)?;
+    let mut reloader = SystemTmuxReloader::for_path(&tmux_path)?;
+    let tmux_snapshot = ConfigSnapshot::read(&tmux_path)?;
+    let mut shells =
+        ShellTransaction::prepare_install(shell_paths.clone()).map_err(install_error)?;
+    let shell_outcomes = shells.apply().map_err(install_error)?;
+    let tmux_outcome = match install_with_options(
+        &tmux_path,
+        &arguments.key,
+        true,
+        &executables,
+        &mut reloader,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            rollback_aggregate(&mut shells, &tmux_snapshot, &mut reloader, &error)?;
+            return Err(install_error(error));
+        }
+    };
+    print_shell_outcomes(&shell_outcomes, "installed");
+    if tmux_outcome.changed {
+        println!("installed codex-mux binding in {}", tmux_path.display());
+    } else {
+        println!(
+            "codex-mux binding is already current in {}",
+            tmux_path.display()
+        );
+    }
+    if let Some(backup) = tmux_outcome.backup {
+        println!("backup: {}", backup.display());
+    }
+    if tmux_outcome.reloaded {
+        println!("reloaded running tmux server");
+    }
+    println!("open a new Bash/Zsh shell or source its startup file to activate shell Smart Left");
+    Ok(())
+}
+
+fn run_remove(arguments: RemoveArgs) -> Result<()> {
+    let home = home_directory()?;
+    let tmux_path = resolve_config(arguments.tmux_config)?;
+    let shell_paths = shell_paths(&home, arguments.bash_config, arguments.zsh_config)?;
+    validate_distinct_config_targets(&tmux_path, &shell_paths)?;
+    let mut reloader = SystemTmuxReloader::for_path(&tmux_path)?;
+    let tmux_snapshot = ConfigSnapshot::read(&tmux_path)?;
+    let mut shells = ShellTransaction::prepare_remove(shell_paths).map_err(install_error)?;
+    let shell_outcomes = shells.apply().map_err(install_error)?;
+    let removed = match uninstall(&tmux_path, &mut reloader) {
+        Ok(removed) => removed,
+        Err(error) => {
+            rollback_aggregate(&mut shells, &tmux_snapshot, &mut reloader, &error)?;
+            return Err(install_error(error));
+        }
+    };
+    print_shell_outcomes(&shell_outcomes, "removed");
+    if removed {
+        println!("removed codex-mux binding from {}", tmux_path.display());
+    } else {
+        println!(
+            "codex-mux binding was not installed in {}",
+            tmux_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn shell_paths(
+    home: &Path,
+    bash: Option<PathBuf>,
+    zsh: Option<PathBuf>,
+) -> Result<Vec<(ShellKind, PathBuf)>> {
+    let bash = absolute_target(bash.unwrap_or_else(|| home.join(".bashrc")))?;
+    let zsh_root = env::var_os("ZDOTDIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.to_owned());
+    let zsh = absolute_target(zsh.unwrap_or_else(|| zsh_root.join(".zshrc")))?;
+    Ok(vec![(ShellKind::Bash, bash), (ShellKind::Zsh, zsh)])
+}
+
+fn absolute_target(path: PathBuf) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .map_err(|source| MuxError::Filesystem {
+                path: PathBuf::from("current directory"),
+                source,
+            })?
+            .join(path)
+    };
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| MuxError::InvalidValue {
+            field: "shell configuration path",
+            message: "must have a parent directory".to_owned(),
+        })?
+        .canonicalize()
+        .map_err(|source| MuxError::Filesystem {
+            path: absolute.clone(),
+            source,
+        })?;
+    let name = absolute.file_name().ok_or_else(|| MuxError::InvalidValue {
+        field: "shell configuration path",
+        message: "must have a file name".to_owned(),
+    })?;
+    Ok(parent.join(name))
+}
+
+fn validate_distinct_config_targets(tmux: &Path, shells: &[(ShellKind, PathBuf)]) -> Result<()> {
+    let mut targets = vec![("tmux", tmux.to_owned())];
+    targets.extend(shells.iter().map(|(kind, path)| {
+        (
+            match kind {
+                ShellKind::Bash => "Bash",
+                ShellKind::Zsh => "Zsh",
+            },
+            path.clone(),
+        )
+    }));
+    for left in 0..targets.len() {
+        for right in left + 1..targets.len() {
+            if targets[left].1 == targets[right].1
+                || same_existing_file(&targets[left].1, &targets[right].1)?
+            {
+                return Err(MuxError::InvalidValue {
+                    field: "configuration paths",
+                    message: format!(
+                        "{} and {} targets must be distinct files",
+                        targets[left].0, targets[right].0
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn same_existing_file(left: &Path, right: &Path) -> Result<bool> {
+    let metadata = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(MuxError::Filesystem {
+            path: path.to_owned(),
+            source,
+        }),
+    };
+    match (metadata(left)?, metadata(right)?) {
+        (Some(left), Some(right)) => Ok(left.dev() == right.dev() && left.ino() == right.ino()),
+        _ => Ok(false),
+    }
+}
+
+fn home_directory() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| MuxError::InvalidValue {
+            field: "HOME",
+            message: "must be set for zero-argument setup and removal".to_owned(),
+        })
+}
+
+struct ConfigSnapshot {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
+impl ConfigSnapshot {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = validate_regular_writable(path).map_err(install_error)?;
+        Ok(Self {
+            path: path.to_owned(),
+            bytes: read(path).map_err(install_error)?,
+            mode: metadata.mode(),
+        })
+    }
+}
+
+fn rollback_aggregate(
+    shells: &mut ShellTransaction,
+    tmux: &ConfigSnapshot,
+    reloader: &mut dyn TmuxReloader,
+    cause: &InstallError,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    match read(&tmux.path) {
+        Ok(current) if current == tmux.bytes => {}
+        Ok(_) => {
+            if let Err(error) = atomic_replace(&tmux.path, &tmux.bytes, tmux.mode) {
+                failures.push(format!("restoring tmux configuration failed: {error}"));
+            }
+        }
+        Err(error) => failures.push(format!(
+            "reading tmux configuration for rollback failed: {error}"
+        )),
+    }
+    if reloader.is_running() {
+        if let Err(error) = reloader.reload(&tmux.path) {
+            failures.push(format!("restoring live tmux configuration failed: {error}"));
+        }
+    }
+    if let Err(error) = shells.rollback() {
+        failures.push(format!("restoring shell configuration failed: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(MuxError::Command(format!(
+            "{cause}; aggregate rollback also failed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+fn print_shell_outcomes(outcomes: &[ShellOutcome], operation: &str) {
+    for outcome in outcomes {
+        if outcome.changed {
+            println!(
+                "{operation} codex-mux {} integration in {}",
+                match outcome.kind {
+                    ShellKind::Bash => "Bash",
+                    ShellKind::Zsh => "Zsh",
+                },
+                outcome.path.display()
+            );
+            if let Some(backup) = &outcome.backup {
+                println!("backup: {}", backup.display());
+            }
+        } else {
+            println!(
+                "codex-mux {} integration {} in {}",
+                match outcome.kind {
+                    ShellKind::Bash => "Bash",
+                    ShellKind::Zsh => "Zsh",
+                },
+                if operation == "removed" {
+                    "was not installed"
+                } else {
+                    "is already current"
+                },
+                outcome.path.display()
+            );
+        }
     }
 }
 

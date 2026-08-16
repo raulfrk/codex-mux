@@ -31,7 +31,7 @@ pub enum InstallError {
     #[error("configuration discovery failed: {0}")]
     Discovery(String),
     /// The selected path is not a safe writable regular file.
-    #[error("unsafe tmux configuration {path}: {reason}")]
+    #[error("unsafe configuration {path}: {reason}")]
     UnsafePath {
         /// Rejected path.
         path: PathBuf,
@@ -150,7 +150,7 @@ fn exactly_one(mut candidates: Vec<PathBuf>, message: &str) -> InstallResult<Pat
     }))
 }
 
-fn validate_regular_writable(path: &Path) -> InstallResult<fs::Metadata> {
+pub(crate) fn validate_regular_writable(path: &Path) -> InstallResult<fs::Metadata> {
     let metadata = fs::symlink_metadata(path).map_err(|source| InstallError::UnsafePath {
         path: path.to_owned(),
         reason: source.to_string(),
@@ -684,9 +684,13 @@ fn render_smart_left_binding(executables: &ExecutablePaths) -> String {
         "owner={owner}; if [ -x {} ]; then {probe}; else {fallback}; fi; {cleanup}",
         shell_word(&executables.mux)
     );
-    let condition = format!(
-        "#{{&&:#{{==:#{{pane_current_command}},{command_name}}},#{{!=:#{{@codex_mux_smart_left_active}},1}}}}"
-    );
+    let command_is_shell =
+        "#{||:#{==:#{pane_current_command},bash},#{==:#{pane_current_command},zsh}}";
+    let shell_is_at_prompt =
+        format!("#{{&&:{command_is_shell},#{{==:#{{@codex_mux_shell_prompt}},1}}}}");
+    let eligible =
+        format!("#{{||:#{{==:#{{pane_current_command}},{command_name}}},{shell_is_at_prompt}}}");
+    let condition = format!("#{{&&:{eligible},#{{!=:#{{@codex_mux_smart_left_active}},1}}}}");
     format!(
         "bind-key -T root Left if-shell -F '{condition}' {{\n  set-option -p @codex_mux_smart_left_active 1\n  run-shell -b {}\n}} {{\n  send-keys Left\n}}\n",
         tmux_word(&shell)
@@ -918,14 +922,14 @@ fn field<'a>(block: &'a str, prefix: &str) -> Option<&'a str> {
     block.lines().find_map(|line| line.strip_prefix(prefix))
 }
 
-fn read(path: &Path) -> InstallResult<Vec<u8>> {
+pub(crate) fn read(path: &Path) -> InstallResult<Vec<u8>> {
     fs::read(path).map_err(|source| InstallError::Filesystem {
         path: path.to_owned(),
         source,
     })
 }
 
-fn create_backup(path: &Path, bytes: &[u8], mode: u32) -> InstallResult<PathBuf> {
+pub(crate) fn create_backup(path: &Path, bytes: &[u8], mode: u32) -> InstallResult<PathBuf> {
     for suffix in 0..1000 {
         let extension = if suffix == 0 {
             "codex-mux.bak".to_owned()
@@ -966,16 +970,56 @@ fn create_backup(path: &Path, bytes: &[u8], mode: u32) -> InstallResult<PathBuf>
     ))
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8], mode: u32) -> InstallResult<()> {
-    atomic_replace_with(path, bytes, mode, |_| Ok(()))
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8], mode: u32) -> InstallResult<()> {
+    atomic_replace_tracked(path, bytes, mode).map_err(AtomicReplaceFailure::into_error)
 }
 
-fn atomic_replace_with(
+#[derive(Debug)]
+pub(crate) struct AtomicReplaceFailure {
+    error: InstallError,
+    committed: bool,
+}
+
+impl AtomicReplaceFailure {
+    pub(crate) const fn committed(&self) -> bool {
+        self.committed
+    }
+
+    pub(crate) fn into_error(self) -> InstallError {
+        self.error
+    }
+}
+
+impl From<InstallError> for AtomicReplaceFailure {
+    fn from(error: InstallError) -> Self {
+        Self {
+            error,
+            committed: false,
+        }
+    }
+}
+
+pub(crate) fn atomic_replace_tracked(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), AtomicReplaceFailure> {
+    atomic_replace_with(
+        path,
+        bytes,
+        mode,
+        |_| Ok(()),
+        |parent| File::open(parent)?.sync_all(),
+    )
+}
+
+pub(crate) fn atomic_replace_with(
     path: &Path,
     bytes: &[u8],
     mode: u32,
     before_rename: impl FnOnce(&Path) -> io::Result<()>,
-) -> InstallResult<()> {
+    after_rename: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), AtomicReplaceFailure> {
     let parent = path.parent().ok_or_else(|| InstallError::UnsafePath {
         path: path.to_owned(),
         reason: "path has no parent directory".to_owned(),
@@ -989,6 +1033,7 @@ fn atomic_replace_with(
         .unwrap_or_default()
         .as_nanos();
     let temporary = parent.join(format!(".{}.codex-mux.{nonce}.tmp", name.to_string_lossy()));
+    let mut committed = false;
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -999,14 +1044,18 @@ fn atomic_replace_with(
         file.sync_all()?;
         before_rename(&temporary)?;
         fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        committed = true;
+        after_rename(parent)?;
         Ok::<(), io::Error>(())
     })();
     if let Err(source) = result {
         let _ = fs::remove_file(&temporary);
-        return Err(InstallError::Filesystem {
-            path: path.to_owned(),
-            source,
+        return Err(AtomicReplaceFailure {
+            error: InstallError::Filesystem {
+                path: path.to_owned(),
+                source,
+            },
+            committed,
         });
     }
     Ok(())
@@ -1033,15 +1082,27 @@ mod tests {
         let target = root.join("tmux.conf");
         fs::write(&target, b"original bytes\n").unwrap();
 
-        let error = atomic_replace_with(&target, b"replacement\n", 0o600, |_| {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "injected rename failure",
-            ))
-        })
+        let error = atomic_replace_with(
+            &target,
+            b"replacement\n",
+            0o600,
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected rename failure",
+                ))
+            },
+            |_| Ok(()),
+        )
         .unwrap_err();
 
-        assert!(error.to_string().contains("injected rename failure"));
+        assert!(!error.committed());
+        assert!(
+            error
+                .into_error()
+                .to_string()
+                .contains("injected rename failure")
+        );
         assert_eq!(fs::read(&target).unwrap(), b"original bytes\n");
         let remaining = fs::read_dir(&root)
             .unwrap()

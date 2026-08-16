@@ -1,6 +1,7 @@
 //! Linux `/proc` foreground-process inspection.
 
 use std::{
+    env,
     ffi::OsString,
     fs,
     io::ErrorKind,
@@ -48,6 +49,43 @@ impl LinuxProcessInspector {
                 path: self.proc_root.clone(),
                 source,
             })
+    }
+
+    /// Returns whether the pane process itself is an exact foreground Bash or
+    /// Zsh process with an interactive-compatible invocation shape.
+    pub fn foreground_process_is_shell(&self, pane_pid: u32, command: &str) -> Result<bool> {
+        self.foreground_is_shell(pane_pid, command)
+            .map_err(|source| MuxError::Filesystem {
+                path: self.proc_root.clone(),
+                source,
+            })
+    }
+
+    fn foreground_is_shell(&self, pane_pid: u32, command: &str) -> std::io::Result<bool> {
+        if !matches!(command, "bash" | "zsh") {
+            return Ok(false);
+        }
+        let Some(pane) = self.read_process(pane_pid)? else {
+            return Ok(false);
+        };
+        if pane.tty_nr == 0
+            || pane.tpgid <= 0
+            || i64::from(pane.pid) != pane.pgrp
+            || pane.pgrp != pane.tpgid
+            || !pane
+                .executable
+                .as_deref()
+                .is_some_and(|path| shell_executable_matches(path, command))
+            || !interactive_shell_arguments(&pane.arguments, command)
+        {
+            return Ok(false);
+        }
+        let Some(current) = self.read_process(pane_pid)? else {
+            return Ok(false);
+        };
+        Ok(same_foreground_snapshot(&pane, &current)
+            && current.executable == pane.executable
+            && current.arguments == pane.arguments)
     }
 
     fn foreground_contains_exact(&self, pane_pid: u32) -> std::io::Result<bool> {
@@ -246,6 +284,59 @@ fn same_foreground_snapshot(initial: &ProcessEvidence, current: &ProcessEvidence
         && initial.tpgid == current.tpgid
         && current.tty_nr != 0
         && current.tpgid > 0
+}
+
+fn interactive_shell_arguments(arguments: &[OsString], command: &str) -> bool {
+    let Some(argv_zero) = arguments.first().and_then(|argument| argument.to_str()) else {
+        return false;
+    };
+    if Path::new(argv_zero)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| name.trim_start_matches('-') != command)
+    {
+        return false;
+    }
+    let mut index = 1;
+    while index < arguments.len() {
+        let Some(argument) = arguments[index].to_str() else {
+            return false;
+        };
+        if argument == "--" {
+            return index + 1 == arguments.len();
+        }
+        if argument == "--command"
+            || (argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument[1..].contains('c'))
+        {
+            return false;
+        }
+        let takes_value = match command {
+            "bash" => matches!(argument, "--rcfile" | "--init-file" | "-O" | "+O"),
+            "zsh" => matches!(argument, "-o" | "+o"),
+            _ => false,
+        };
+        if takes_value {
+            index += 1;
+            if index >= arguments.len() || arguments[index].is_empty() {
+                return false;
+            }
+        } else if !(argument.starts_with('-') || argument.starts_with('+')) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn shell_executable_matches(executable: &Path, command: &str) -> bool {
+    executable.file_name() == Some(std::ffi::OsStr::new(command))
+        && env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join(command))
+            .any(|candidate| candidate.is_file() && same_file(&candidate, executable))
 }
 
 fn parse_stat(stat: &[u8]) -> Option<(i64, i64, i64, u64)> {

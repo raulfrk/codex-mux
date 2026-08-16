@@ -4,6 +4,22 @@
 
 It talks to public tmux commands and Linux `/proc`. It does not use the Codex app server, read Codex private session files, or require a shell framework. Setforge may install a released binary in the future, but `codex-mux` has no Setforge runtime dependency and Setforge does not own its tmux or theme configuration.
 
+## Quick start
+
+With `codex` and `codex-mux` on `PATH`, configure the default `prefix + a` binding and prompt-aware Smart Left for tmux, Bash, and Zsh:
+
+```sh
+codex-mux setup
+```
+
+Open a new Bash/Zsh shell (or source its startup file) after setup. To remove every codex-mux-owned tmux and shell block without deleting any host configuration file:
+
+```sh
+codex-mux remove
+```
+
+The zero-argument commands discover one safe tmux entrypoint and use `$HOME/.bashrc` plus `${ZDOTDIR:-$HOME}/.zshrc`. Use `--tmux-config`, `--bash-config`, or `--zsh-config` when those locations differ, and global `--codex /absolute/path` when Codex is not discoverable on `PATH`.
+
 ## Requirements
 
 - Linux on `x86_64` or `aarch64`
@@ -59,7 +75,7 @@ If Codex is installed at a custom path, always use the same absolute path when i
 
 Re-run `tmux install` after moving either executable so the managed block records the new paths.
 
-### Optional Smart Left activation
+### Smart Left activation
 
 Add `--smart-left` to the install command to make plain `Left` open the popup when the cursor is already at the absolute beginning of the focused Codex composer:
 
@@ -68,7 +84,11 @@ codex-mux --codex "$(command -v codex)" \
   tmux install --smart-left --key a --config "$HOME/.tmux.conf"
 ```
 
-Smart Left first sends the requested `Left` to Codex, then observes the rendered cursor over a 60 ms sampling window. It opens only when the cursor did not move and the cursor is on the Codex composer prompt; otherwise the key behaves as ordinary `Left`. The fast path runs only for a directly verified Codex executable, so wrapper-launched sessions deliberately use ordinary `Left` and retain `prefix + a` as the fallback.
+Smart Left first sends the requested `Left`, then observes the rendered cursor over a 60 ms sampling window. In Codex it opens only when the cursor did not move and is on the composer prompt. In Bash or Zsh it opens only when the shell's prompt lifecycle hook marks the pane as waiting at its primary prompt and Left cannot move the cursor. During command execution, nested interactive programs, shell editing away from the boundary, and every uncertain state, the key remains ordinary `Left`.
+
+`codex-mux setup` installs Smart Left and marker-managed prompt hooks by default. Bash prepends one `PROMPT_COMMAND` entry and wraps `PS0` and `PS2`; when Bash's `promptvars` option is disabled, shell Smart Left fails closed and ordinary `Left` remains active. Zsh installs `precmd`/`preexec` plus `line-init`, `line-pre-redraw`, and `line-finish` ZLE hook widgets. No shell framework is required, and existing hook chains are preserved.
+
+The process check additionally requires the foreground Bash or Zsh executable to be the same file as `bash` or `zsh` resolved on the tmux server's `PATH`. Wrapper-launched shells and custom shell binaries unavailable on that `PATH` deliberately retain ordinary `Left` and `prefix + a` as the fallback. Setup is transactional for managed configuration bytes and live tmux state; collision-safe safety backups created before a later failure may remain for manual inspection.
 
 This option owns the root-table `Left` binding inside the same marker block. Installation refuses to enable it if the selected config or running tmux server already binds root-table `Left`. Reinstall without `--smart-left` to disable it. The normal prefix binding remains installed either way.
 
@@ -104,7 +124,17 @@ When the invoking client is narrower than 90 columns or shorter than 28 rows, th
 
 The built-in themes are adaptive cyan, blue command palette, amber operator, ember orange, and monochrome. A saved selection lives at `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml` with user-only file permissions. Setting a non-empty `NO_COLOR` uses monochrome for that invocation without overwriting the saved preference.
 
-## Inspect or remove the binding
+## Inspect or remove configuration
+
+The preferred removal command removes the owned tmux, Bash, and Zsh blocks together:
+
+```sh
+codex-mux remove
+```
+
+It preserves all bytes outside the marker blocks and never deletes the host files. Existing shells may retain their already-loaded hook functions until restarted, but removing the tmux root binding disables interception immediately.
+
+The lower-level tmux-only commands remain available:
 
 Use the same executable paths and tmux entrypoint used during installation:
 

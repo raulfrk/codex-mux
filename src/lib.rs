@@ -15,6 +15,7 @@ pub mod error;
 pub mod install;
 pub mod launch;
 pub mod linux_process;
+mod shell_integration;
 pub mod theme;
 pub mod tmux;
 pub mod ui;

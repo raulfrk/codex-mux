@@ -23,6 +23,8 @@ pub fn require_prerequisites() -> Option<PathBuf> {
         ("script", "--version"),
         ("rustc", "--version"),
         ("bwrap", "--version"),
+        ("bash", "--version"),
+        ("zsh", "--version"),
     ] {
         let status = Command::new(tool)
             .arg(version_flag)

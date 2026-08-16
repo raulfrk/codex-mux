@@ -1,4 +1,10 @@
-use std::process::Command;
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_codex-mux"))
@@ -14,6 +20,244 @@ fn root_help_exposes_interactive_context_and_tmux_group() {
     assert!(stdout.contains("--codex <PATH>"));
     assert!(stdout.contains("--client <CLIENT>"));
     assert!(stdout.contains("tmux"));
+    assert!(stdout.contains("setup"));
+    assert!(stdout.contains("remove"));
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("codex-mux-cli-{name}-{nonce}"));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+#[test]
+fn setup_and_remove_manage_all_three_marker_blocks() {
+    let root = scratch("setup-remove");
+    let tmux_tmp = root.join("tmux-tmp");
+    fs::create_dir(&tmux_tmp).unwrap();
+    let tmux = root.join("tmux.conf");
+    let bash = root.join("bashrc");
+    let zsh = root.join("zshrc");
+    let codex = root.join("codex");
+    fs::write(&tmux, b"set -g status off\n").unwrap();
+    fs::write(&bash, b"host bash\n").unwrap();
+    fs::write(&zsh, b"host zsh\n").unwrap();
+    fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+
+    let setup = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .arg("--codex")
+        .arg(&codex)
+        .arg("setup")
+        .arg("--tmux-config")
+        .arg(&tmux)
+        .arg("--bash-config")
+        .arg(&bash)
+        .arg("--zsh-config")
+        .arg(&zsh)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "setup failed: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    assert!(
+        fs::read_to_string(&tmux)
+            .unwrap()
+            .contains("codex-mux-smart-left: true")
+    );
+    assert!(
+        fs::read_to_string(&bash)
+            .unwrap()
+            .contains("codex-mux bash")
+    );
+    assert!(fs::read_to_string(&zsh).unwrap().contains("codex-mux zsh"));
+
+    let remove = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .arg("remove")
+        .arg("--tmux-config")
+        .arg(&tmux)
+        .arg("--bash-config")
+        .arg(&bash)
+        .arg("--zsh-config")
+        .arg(&zsh)
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(fs::read(&tmux).unwrap(), b"set -g status off\n");
+    assert_eq!(fs::read(&bash).unwrap(), b"host bash\n");
+    assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn zero_argument_setup_and_remove_use_safe_standard_defaults() {
+    let root = scratch("zero-argument");
+    let tmux_tmp = root.join("tmux-tmp");
+    fs::create_dir(&tmux_tmp).unwrap();
+    let tmux = root.join(".tmux.conf");
+    let bash = root.join(".bashrc");
+    let zsh = root.join(".zshrc");
+    let codex = root.join("codex");
+    fs::write(&tmux, b"set -g status off\n").unwrap();
+    fs::write(&bash, b"host bash\n").unwrap();
+    fs::write(&zsh, b"host zsh\n").unwrap();
+    fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+    let tool_path = format!("{}:/usr/bin:/bin", root.display());
+
+    let setup = binary()
+        .env("HOME", &root)
+        .env("PATH", &tool_path)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .env_remove("ZDOTDIR")
+        .arg("setup")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "zero-argument setup failed: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    assert!(fs::read_to_string(&tmux).unwrap().contains("codex-mux >>>"));
+    assert!(
+        fs::read_to_string(&bash)
+            .unwrap()
+            .contains("codex-mux bash")
+    );
+    assert!(fs::read_to_string(&zsh).unwrap().contains("codex-mux zsh"));
+
+    let remove = binary()
+        .env("HOME", &root)
+        .env("PATH", &tool_path)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .env_remove("ZDOTDIR")
+        .arg("remove")
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "zero-argument remove failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(fs::read(&tmux).unwrap(), b"set -g status off\n");
+    assert_eq!(fs::read(&bash).unwrap(), b"host bash\n");
+    assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn setup_conflict_leaves_all_host_configuration_bytes_unchanged() {
+    let root = scratch("setup-conflict");
+    let tmux_tmp = root.join("tmux-tmp");
+    fs::create_dir(&tmux_tmp).unwrap();
+    let tmux = root.join("tmux.conf");
+    let bash = root.join("bashrc");
+    let zsh = root.join("zshrc");
+    let codex = root.join("codex");
+    let tmux_bytes = b"bind-key -T root Left select-pane -L\n";
+    fs::write(&tmux, tmux_bytes).unwrap();
+    fs::write(&bash, b"host bash\n").unwrap();
+    fs::write(&zsh, b"host zsh\n").unwrap();
+    fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+
+    let setup = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .arg("--codex")
+        .arg(&codex)
+        .arg("setup")
+        .arg("--tmux-config")
+        .arg(&tmux)
+        .arg("--bash-config")
+        .arg(&bash)
+        .arg("--zsh-config")
+        .arg(&zsh)
+        .output()
+        .unwrap();
+    assert!(!setup.status.success());
+    assert_eq!(fs::read(&tmux).unwrap(), tmux_bytes);
+    assert_eq!(fs::read(&bash).unwrap(), b"host bash\n");
+    assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn setup_rejects_cross_role_exact_and_hard_link_aliases() {
+    for hard_link in [false, true] {
+        let root = scratch(if hard_link {
+            "hard-link-alias"
+        } else {
+            "exact-alias"
+        });
+        let tmux_tmp = root.join("tmux-tmp");
+        fs::create_dir(&tmux_tmp).unwrap();
+        let tmux = root.join("tmux.conf");
+        let bash = if hard_link {
+            let bash = root.join("bashrc");
+            fs::write(&tmux, b"set -g status off\n").unwrap();
+            fs::hard_link(&tmux, &bash).unwrap();
+            bash
+        } else {
+            fs::write(&tmux, b"set -g status off\n").unwrap();
+            tmux.clone()
+        };
+        let zsh = root.join("zshrc");
+        let codex = root.join("codex");
+        fs::write(&zsh, b"host zsh\n").unwrap();
+        fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&codex).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&codex, permissions).unwrap();
+        let before = fs::read(&tmux).unwrap();
+
+        let setup = binary()
+            .env("HOME", &root)
+            .env("TMUX_TMPDIR", &tmux_tmp)
+            .env_remove("TMUX")
+            .arg("--codex")
+            .arg(&codex)
+            .arg("setup")
+            .arg("--tmux-config")
+            .arg(&tmux)
+            .arg("--bash-config")
+            .arg(&bash)
+            .arg("--zsh-config")
+            .arg(&zsh)
+            .output()
+            .unwrap();
+        assert!(!setup.status.success());
+        assert!(String::from_utf8_lossy(&setup.stderr).contains("must be distinct files"));
+        assert_eq!(fs::read(&tmux).unwrap(), before);
+        assert_eq!(fs::read(&bash).unwrap(), before);
+        assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

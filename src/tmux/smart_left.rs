@@ -27,12 +27,26 @@ pub trait DirectCodexInspector {
     /// Returns true only when the pane foreground includes the configured Codex
     /// executable itself, never merely an allowlisted wrapper.
     fn is_direct_codex(&self, pid: u32) -> Result<bool>;
+
+    /// Returns true only for an interactive Bash or Zsh process that is the
+    /// pane's exact foreground process.
+    fn is_direct_shell(&self, pid: u32, command: &str) -> Result<bool>;
 }
 
 impl DirectCodexInspector for LinuxProcessInspector {
     fn is_direct_codex(&self, pid: u32) -> Result<bool> {
         self.foreground_process_is_exact(pid)
     }
+
+    fn is_direct_shell(&self, pid: u32, command: &str) -> Result<bool> {
+        self.foreground_process_is_shell(pid, command)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmartLeftTarget {
+    Codex,
+    Shell,
 }
 
 /// Injectable delay boundary for deterministic probe tests.
@@ -87,25 +101,34 @@ where
     /// Forwards Left exactly once and opens only after an unchanged guarded probe.
     pub fn run(&self, context: &InvocationContext) -> Result<SmartLeftOutcome> {
         let initial = match self.read_state(context) {
-            Ok(state)
-                if state.cursor_visible
-                    && !state.pane_in_mode
+            Ok(state) if state.cursor_visible && !state.pane_in_mode => {
+                let target = if self
+                    .inspector
+                    .is_direct_codex(state.pane_pid)
+                    .unwrap_or(false)
+                {
+                    Some(SmartLeftTarget::Codex)
+                } else if state.shell_prompt
                     && self
                         .inspector
-                        .is_direct_codex(state.pane_pid)
-                        .unwrap_or(false) =>
-            {
-                Some(state)
+                        .is_direct_shell(state.pane_pid, &state.pane_command)
+                        .unwrap_or(false)
+                {
+                    Some(SmartLeftTarget::Shell)
+                } else {
+                    None
+                };
+                target.map(|target| (state, target))
             }
             Ok(_) | Err(_) => None,
         };
 
         self.send_left(context)?;
-        let Some(initial) = initial else {
+        let Some((initial, target)) = initial else {
             return Ok(SmartLeftOutcome::Forwarded);
         };
 
-        let mut current = initial;
+        let mut current = initial.clone();
         for _ in 0..POLL_ATTEMPTS {
             self.sleeper.sleep(POLL_INTERVAL);
             let Ok(observed) = self.read_state(context) else {
@@ -116,13 +139,28 @@ where
                 || observed.cursor_y != initial.cursor_y
                 || !observed.cursor_visible
                 || observed.pane_in_mode
+                || observed.pane_command != initial.pane_command
+                || observed.shell_prompt != initial.shell_prompt
             {
                 return Ok(SmartLeftOutcome::Forwarded);
             }
             current = observed;
         }
 
-        if current.cursor_x != 2 || !self.cursor_is_on_composer_prompt(context, current.cursor_y) {
+        let still_exact = match target {
+            SmartLeftTarget::Codex => self.inspector.is_direct_codex(current.pane_pid),
+            SmartLeftTarget::Shell => self
+                .inspector
+                .is_direct_shell(current.pane_pid, &current.pane_command),
+        }
+        .unwrap_or(false);
+        if !still_exact {
+            return Ok(SmartLeftOutcome::Forwarded);
+        }
+        if target == SmartLeftTarget::Codex
+            && (current.cursor_x != 2
+                || !self.cursor_is_on_composer_prompt(context, current.cursor_y))
+        {
             return Ok(SmartLeftOutcome::Forwarded);
         }
 
@@ -132,7 +170,7 @@ where
 
     fn read_state(&self, context: &InvocationContext) -> Result<PaneState> {
         let format = format!(
-            "#{{pane_pid}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}"
+            "#{{pane_pid}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}{FIELD_SEPARATOR}#{{pane_current_command}}{FIELD_SEPARATOR}#{{@codex_mux_shell_prompt}}"
         );
         let output = self.run_checked(vec![
             OsString::from("display-message"),
@@ -245,19 +283,21 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneState {
     pane_pid: u32,
     cursor_x: u16,
     cursor_y: u16,
     cursor_visible: bool,
     pane_in_mode: bool,
+    pane_command: String,
+    shell_prompt: bool,
 }
 
 impl PaneState {
     fn parse(output: &[u8]) -> Result<Self> {
         let fields = split_fields(output)?;
-        if fields.len() != 5 {
+        if fields.len() != 7 {
             return Err(MuxError::Command(
                 "tmux returned malformed Smart Left pane state".to_owned(),
             ));
@@ -268,6 +308,17 @@ impl PaneState {
             cursor_y: parse_u16(fields[2], "cursor y")?,
             cursor_visible: parse_flag(fields[3], "cursor flag")?,
             pane_in_mode: parse_flag(fields[4], "pane mode")?,
+            pane_command: fields[5].to_owned(),
+            shell_prompt: match fields[6] {
+                "" | "0" => false,
+                "1" => true,
+                value => {
+                    return Err(MuxError::InvalidValue {
+                        field: "shell prompt marker",
+                        message: format!("tmux returned {value:?}"),
+                    });
+                }
+            },
         })
     }
 }
@@ -361,11 +412,18 @@ mod tests {
         }
     }
 
-    struct Inspector(bool);
+    struct Inspector {
+        codex: bool,
+        shell: bool,
+    }
 
     impl DirectCodexInspector for Inspector {
         fn is_direct_codex(&self, _pid: u32) -> Result<bool> {
-            Ok(self.0)
+            Ok(self.codex)
+        }
+
+        fn is_direct_shell(&self, _pid: u32, _command: &str) -> Result<bool> {
+            Ok(self.shell)
         }
     }
 
@@ -389,9 +447,19 @@ mod tests {
     fn state(x: u16, y: u16, cursor: bool, mode: bool) -> CommandOutput {
         output(
             format!(
-                "42\x1f{x}\x1f{y}\x1f{}\x1f{}\n",
+                "42\x1f{x}\x1f{y}\x1f{}\x1f{}\x1fcodex\x1f0\n",
                 u8::from(cursor),
                 u8::from(mode)
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn shell_state(x: u16, y: u16, prompt: bool) -> CommandOutput {
+        output(
+            format!(
+                "42\x1f{x}\x1f{y}\x1f1\x1f0\x1fbash\x1f{}\n",
+                u8::from(prompt)
             )
             .into_bytes(),
         )
@@ -423,8 +491,8 @@ mod tests {
 
     #[test]
     fn parses_raw_and_tmux_34_escaped_state() {
-        let raw = b"42\x1f2\x1f10\x1f1\x1f0\n";
-        let escaped = b"42\\0372\\03710\\0371\\0370\n";
+        let raw = b"42\x1f2\x1f10\x1f1\x1f0\x1fcodex\x1f0\n";
+        let escaped = b"42\\0372\\03710\\0371\\0370\\037codex\\0370\n";
         assert_eq!(
             PaneState::parse(raw).unwrap(),
             PaneState::parse(escaped).unwrap()
@@ -452,9 +520,17 @@ mod tests {
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
 
-        let result = probe(&runner, &Inspector(true), &sleeper, &codex)
-            .run(&context())
-            .unwrap();
+        let result = probe(
+            &runner,
+            &Inspector {
+                codex: true,
+                shell: false,
+            },
+            &sleeper,
+            &codex,
+        )
+        .run(&context())
+        .unwrap();
 
         assert_eq!(result, SmartLeftOutcome::Forwarded);
         assert_eq!(sleeper.0.get(), 1);
@@ -481,9 +557,17 @@ mod tests {
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
 
-        let result = probe(&runner, &Inspector(true), &sleeper, &codex)
-            .run(&context())
-            .unwrap();
+        let result = probe(
+            &runner,
+            &Inspector {
+                codex: true,
+                shell: false,
+            },
+            &sleeper,
+            &codex,
+        )
+        .run(&context())
+        .unwrap();
 
         assert_eq!(result, SmartLeftOutcome::Opened);
         assert_eq!(sleeper.0.get(), 12);
@@ -504,6 +588,61 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_marked_shell_boundary_opens_without_composer_glyph() {
+        let mut outputs = vec![shell_state(0, 4, true), output([])];
+        outputs.extend((0..12).map(|_| shell_state(0, 4, true)));
+        outputs.push(output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()));
+        outputs.push(output([]));
+        let runner = Runner::with(outputs);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: false,
+                    shell: true,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Opened
+        );
+        assert!(
+            !runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call[0] == "capture-pane")
+        );
+    }
+
+    #[test]
+    fn unmarked_shell_always_forwards() {
+        let runner = Runner::with([shell_state(0, 4, false), output([])]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: false,
+                    shell: true,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Forwarded
+        );
+    }
+
+    #[test]
     fn unchanged_cursor_outside_composer_fails_through() {
         let mut outputs = vec![state(2, 3, true, false), output([])];
         outputs.extend((0..12).map(|_| state(2, 3, true, false)));
@@ -513,9 +652,17 @@ mod tests {
         let codex = CodexExecutable::new("/opt/codex").unwrap();
 
         assert_eq!(
-            probe(&runner, &Inspector(true), &sleeper, &codex)
-                .run(&context())
-                .unwrap(),
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
             SmartLeftOutcome::Forwarded
         );
         assert!(
@@ -538,9 +685,17 @@ mod tests {
             let sleeper = Sleeper::default();
             let codex = CodexExecutable::new("/opt/codex").unwrap();
             assert_eq!(
-                probe(&runner, &Inspector(direct), &sleeper, &codex)
-                    .run(&context())
-                    .unwrap(),
+                probe(
+                    &runner,
+                    &Inspector {
+                        codex: direct,
+                        shell: false,
+                    },
+                    &sleeper,
+                    &codex,
+                )
+                .run(&context())
+                .unwrap(),
                 SmartLeftOutcome::Forwarded
             );
             assert_eq!(runner.calls.borrow().len(), 2);
@@ -554,9 +709,17 @@ mod tests {
         let codex = CodexExecutable::new("/opt/codex").unwrap();
 
         assert_eq!(
-            probe(&runner, &Inspector(true), &sleeper, &codex)
-                .run(&context())
-                .unwrap(),
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
             SmartLeftOutcome::Forwarded
         );
         assert_eq!(

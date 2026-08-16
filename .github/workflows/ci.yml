@@ -22,7 +22,7 @@ jobs:
       - name: Install packaged E2E tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap tmux util-linux
+          sudo apt-get install --yes --no-install-recommends bubblewrap tmux util-linux zsh
       - name: Check formatting
         run: cargo +1.85.0 fmt --all -- --check
       - name: Lint

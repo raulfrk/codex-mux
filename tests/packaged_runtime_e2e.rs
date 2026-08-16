@@ -336,6 +336,182 @@ fn installed_smart_left_moves_then_opens_the_extracted_binary_at_the_boundary() 
 }
 
 #[test]
+fn packaged_setup_drives_prompt_aware_bash_and_zsh_then_remove_restores_files() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    for shell in ["bash", "zsh"] {
+        let fixture = Fixture::new(&format!("shell-{shell}"));
+        let bashrc = fixture.scratch.join(".bashrc");
+        let zshrc = fixture.scratch.join(".zshrc");
+        fs::write(&bashrc, "PS1='PROMPT> '\n").unwrap();
+        fs::write(&zshrc, "PROMPT='PROMPT> '\n").unwrap();
+        let setup = Command::new(&binary)
+            .env("TMUX", fixture.server.environment())
+            .env("HOME", fixture.scratch.path())
+            .args(["--codex", text(&fixture.codex), "setup"])
+            .arg("--tmux-config")
+            .arg(&fixture.config)
+            .arg("--bash-config")
+            .arg(&bashrc)
+            .arg("--zsh-config")
+            .arg(&zshrc)
+            .output()
+            .unwrap();
+        assert_success(&setup, "packaged aggregate setup");
+
+        let respawn_shell = || {
+            let mut respawn = fixture.server.command();
+            respawn.args([
+                "respawn-pane",
+                "-k",
+                "-t",
+                &fixture.origin_pane,
+                "--",
+                "env",
+            ]);
+            respawn.arg(format!("HOME={}", fixture.scratch.path().display()));
+            if shell == "bash" {
+                respawn.args(["bash", "--noprofile", "--rcfile"]);
+                respawn.arg(&bashrc);
+                respawn.arg("-i");
+            } else {
+                respawn.arg(format!("ZDOTDIR={}", fixture.scratch.path().display()));
+                respawn.args(["zsh", "-d", "-o", "interactive"]);
+            }
+            assert_success(
+                &respawn.output().unwrap(),
+                "start packaged configured shell",
+            );
+        };
+        respawn_shell();
+        fixture.server.wait("packaged shell prompt marker", || {
+            fixture
+                .server
+                .checked(&[
+                    "show-options",
+                    "-pqv",
+                    "-t",
+                    &fixture.origin_pane,
+                    "@codex_mux_shell_prompt",
+                ])
+                .trim()
+                == "1"
+        });
+        let (mut client, _tty) = fixture.client("origin", (100, 32), "shell-client");
+        fixture
+            .server
+            .checked(&["send-keys", "-t", &fixture.origin_pane, "echo '", "Enter"]);
+        fixture
+            .server
+            .wait("packaged secondary prompt clears marker", || {
+                fixture
+                    .server
+                    .run(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .stdout
+                    .is_empty()
+            });
+        client.send(b"\x1b[D");
+        thread::sleep(Duration::from_millis(100));
+        assert!(!client.wait_text("PROMPT>").contains("sessions"));
+        respawn_shell();
+        fixture.server.wait("packaged primary prompt returns", || {
+            fixture
+                .server
+                .checked(&[
+                    "show-options",
+                    "-pqv",
+                    "-t",
+                    &fixture.origin_pane,
+                    "@codex_mux_shell_prompt",
+                ])
+                .trim()
+                == "1"
+        });
+        let boundary = pane_cursor_x(&fixture.server, &fixture.origin_pane);
+        client.send(b"abc");
+        fixture.server.wait("packaged shell input", || {
+            pane_cursor_x(&fixture.server, &fixture.origin_pane) == boundary + 3
+        });
+        client.send(b"\x1b[D");
+        fixture.server.wait("packaged shell ordinary Left", || {
+            pane_cursor_x(&fixture.server, &fixture.origin_pane) == boundary + 2
+        });
+        client.send(b"\x01\x0b");
+        fixture.server.wait("packaged shell cleared input", || {
+            pane_cursor_x(&fixture.server, &fixture.origin_pane) == boundary
+        });
+        fixture
+            .server
+            .checked(&["send-keys", "-t", &fixture.origin_pane, "read -r", "Enter"]);
+        fixture
+            .server
+            .wait("packaged shell read clears marker", || {
+                fixture
+                    .server
+                    .run(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .stdout
+                    .is_empty()
+            });
+        client.send(b"\x1b[D");
+        thread::sleep(Duration::from_millis(100));
+        assert!(!client.wait_text("PROMPT>").contains("sessions"));
+        respawn_shell();
+        fixture.server.wait(
+            "fresh packaged shell prompt after read safety check",
+            || {
+                fixture
+                    .server
+                    .checked(&[
+                        "show-options",
+                        "-pqv",
+                        "-t",
+                        &fixture.origin_pane,
+                        "@codex_mux_shell_prompt",
+                    ])
+                    .trim()
+                    == "1"
+            },
+        );
+        client.send(b"\x1b[D");
+        client.wait_text("sessions");
+        client.send(b"q");
+        fixture.server.wait("packaged shell probe cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+        });
+        client.send(b"\x02d");
+
+        let removed = Command::new(&binary)
+            .env("TMUX", fixture.server.environment())
+            .env("HOME", fixture.scratch.path())
+            .arg("remove")
+            .arg("--tmux-config")
+            .arg(&fixture.config)
+            .arg("--bash-config")
+            .arg(&bashrc)
+            .arg("--zsh-config")
+            .arg(&zshrc)
+            .output()
+            .unwrap();
+        assert_success(&removed, "packaged aggregate remove");
+        assert_eq!(fs::read_to_string(&bashrc).unwrap(), "PS1='PROMPT> '\n");
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), "PROMPT='PROMPT> '\n");
+    }
+}
+
+#[test]
 fn packaged_new_resume_fallback_and_confirmed_close_cross_process_boundaries() {
     let Some(binary) = require_prerequisites() else {
         return;

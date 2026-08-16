@@ -29,7 +29,7 @@ if [[ $sandbox_mode == direct && $network_mode != host ]]; then
   exit 1
 fi
 
-for tool in cargo gzip rustc script sha256sum tar tmux; do
+for tool in bash cargo gzip rustc script sha256sum tar tmux zsh; do
   command -v "$tool" >/dev/null || {
     echo "required packaged E2E tool is unavailable: $tool" >&2
     exit 1
