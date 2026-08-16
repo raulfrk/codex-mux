@@ -248,7 +248,20 @@ fn packaged_detach_mutate_reconnect_rebuilds_and_switches_exact_new_client() {
     );
     assert!(!screen.contains("before-disconnect"));
     new_client.send(b"\r");
-    thread::sleep(Duration::from_millis(200));
+    wait(
+        "reconnected client to switch to the rebuilt target",
+        || client_fields(&fixture.server, &new_tty).1 == new_pane,
+        || {
+            format!(
+                "expected pane {new_pane}; clients={}",
+                fixture.server.checked(&[
+                    "list-clients",
+                    "-F",
+                    "#{client_tty} #{client_session} #{pane_id}",
+                ])
+            )
+        },
+    );
     assert_eq!(client_fields(&fixture.server, &new_tty).1, new_pane);
     new_client.send(b"\x02d");
 }

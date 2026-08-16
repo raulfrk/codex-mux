@@ -4,9 +4,13 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-16
+
 ### Added
 
 - Optional marker-managed Smart Left activation opens the mux from the absolute beginning of a directly verified Codex composer while preserving ordinary Left behavior everywhere else.
+- Prompt-aware Smart Left support for plain interactive Bash and Zsh primary prompts, with fail-closed handling for commands, reads, secondary prompts, wrappers, and uncertain process state.
+- Zero-argument `codex-mux setup` and `codex-mux remove` commands transactionally manage owned tmux, Bash, and Zsh configuration blocks using safe standard defaults.
 
 ## [0.1.1] - 2026-08-16
 
