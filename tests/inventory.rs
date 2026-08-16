@@ -7,7 +7,8 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use codex_mux::{
@@ -330,7 +331,14 @@ fn disposable_tmux_server_smoke_discovers_a_foreground_process() {
         CodexExecutable::new(&executable).unwrap(),
     );
 
-    let panes = inventory.discover().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let panes = loop {
+        let panes = inventory.discover().unwrap();
+        if !panes.is_empty() || Instant::now() >= deadline {
+            break panes;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
 
     assert_eq!(panes.len(), 1);
     assert_eq!(panes[0].session_id.as_str(), "$0");
@@ -365,7 +373,7 @@ impl TmuxServer {
                 "-d",
                 "-s",
                 "inventory-smoke",
-                "sleep 30",
+                "exec /usr/bin/sleep 30",
             ])
             .output()
             .unwrap();
