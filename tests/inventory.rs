@@ -234,6 +234,60 @@ fn proc_group_wrapper_requires_absolute_configured_path_evidence() {
         inspector.foreground_executable(10).unwrap(),
         Some(configured)
     );
+    assert!(!inspector.foreground_process_is_exact(10).unwrap());
+}
+
+#[test]
+fn exact_codex_in_a_shell_foreground_group_is_direct() {
+    let root = TemporaryDirectory::new("proc-direct-foreground");
+    let configured = root.path().join("bin/codex-custom");
+    fs::create_dir_all(configured.parent().unwrap()).unwrap();
+    fs::write(&configured, b"fixture").unwrap();
+    write_process(root.path(), 10, 10, 34816, 20, "/bin/sh", &["/bin/sh"]);
+    write_process(
+        root.path(),
+        20,
+        20,
+        34816,
+        20,
+        configured.to_str().unwrap(),
+        &[configured.to_str().unwrap()],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new(&configured).unwrap(),
+        root.path(),
+    );
+
+    assert!(inspector.foreground_process_is_exact(10).unwrap());
+}
+
+#[test]
+fn exact_codex_outside_the_pane_foreground_group_is_not_direct() {
+    for (name, codex_pgrp, codex_tty) in [
+        ("background-group", 20, 34816),
+        ("different-tty", 30, 34817),
+    ] {
+        let root = TemporaryDirectory::new(name);
+        let configured = root.path().join("bin/codex-custom");
+        fs::create_dir_all(configured.parent().unwrap()).unwrap();
+        fs::write(&configured, b"fixture").unwrap();
+        write_process(root.path(), 10, 10, 34816, 30, "/bin/sh", &["/bin/sh"]);
+        write_process(
+            root.path(),
+            20,
+            codex_pgrp,
+            codex_tty,
+            codex_pgrp,
+            configured.to_str().unwrap(),
+            &[configured.to_str().unwrap()],
+        );
+        let inspector = LinuxProcessInspector::with_proc_root(
+            CodexExecutable::new(&configured).unwrap(),
+            root.path(),
+        );
+
+        assert!(!inspector.foreground_process_is_exact(10).unwrap());
+    }
 }
 
 #[test]
@@ -526,7 +580,11 @@ fn write_process(
     fs::create_dir(&directory).unwrap();
     fs::write(
         directory.join("stat"),
-        format!("{pid} (fixture process) S 1 {pgrp} 1 {tty_nr} {tpgid} 0 0 0"),
+        format!(
+            "{pid} (fixture process) S 1 {pgrp} 1 {tty_nr} {tpgid} \
+             0 0 0 0 0 0 0 0 0 0 0 0 0 {}",
+            u64::from(pid) * 1_000
+        ),
     )
     .unwrap();
     symlink(executable, directory.join("exe")).unwrap();

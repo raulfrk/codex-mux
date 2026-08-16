@@ -757,7 +757,35 @@ fn has_root_left_binding_outside_owned_block(
     }
     let text = std::str::from_utf8(&outside)
         .map_err(|_| InstallError::Markers("configuration is not valid UTF-8".to_owned()))?;
-    Ok(text.lines().any(line_binds_root_left))
+    Ok(text_binds_root_left(text))
+}
+
+fn text_binds_root_left(text: &str) -> bool {
+    let mut logical = String::new();
+    for physical in text.split_inclusive('\n') {
+        let has_newline = physical.ends_with('\n');
+        let line = physical.strip_suffix('\n').unwrap_or(physical);
+        logical.push_str(line);
+        if has_newline && has_unescaped_trailing_backslash(&logical) {
+            logical.pop();
+            continue;
+        }
+        if line_binds_root_left(&logical) {
+            return true;
+        }
+        logical.clear();
+    }
+    !logical.is_empty() && line_binds_root_left(&logical)
+}
+
+fn has_unescaped_trailing_backslash(line: &str) -> bool {
+    line.as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn line_binds_root_left(line: &str) -> bool {
@@ -790,14 +818,14 @@ fn command_binds_root_left(words: Vec<String>) -> bool {
                 let _ = words.next();
             }
             "-r" => {}
-            value if value.starts_with('-') => return true,
+            value if value.starts_with('-') && value != "-" => return true,
             value => {
                 key = Some(value.to_owned());
                 break;
             }
         }
     }
-    table == "root" && key.as_deref() == Some("Left")
+    key.is_none() || (table == "root" && key.as_deref() == Some("Left"))
 }
 
 fn tmux_commands(line: &str) -> Option<Vec<Vec<String>>> {

@@ -36,21 +36,58 @@ impl LinuxProcessInspector {
         }
     }
 
-    /// Returns whether `pid` itself is the exact configured Codex executable.
+    /// Returns whether the pane's foreground process group contains the exact
+    /// configured Codex executable.
     ///
-    /// Unlike foreground-group discovery, this deliberately excludes wrappers.
-    /// Smart Left uses it to keep its prefixless interception fail-closed.
-    pub fn process_is_exact(&self, pid: u32) -> Result<bool> {
-        self.read_process(pid)
-            .map(|process| {
-                process
-                    .as_ref()
-                    .is_some_and(|process| self.is_exact_configured_executable(process))
-            })
+    /// Unlike inventory discovery, this deliberately excludes wrappers. Smart
+    /// Left uses it to keep its prefixless interception fail-closed while still
+    /// supporting the normal case where tmux's pane PID is the parent shell.
+    pub fn foreground_process_is_exact(&self, pane_pid: u32) -> Result<bool> {
+        self.foreground_contains_exact(pane_pid)
             .map_err(|source| MuxError::Filesystem {
                 path: self.proc_root.clone(),
                 source,
             })
+    }
+
+    fn foreground_contains_exact(&self, pane_pid: u32) -> std::io::Result<bool> {
+        let Some(pane) = self.read_process(pane_pid)? else {
+            return Ok(false);
+        };
+        if self.is_exact_configured_executable(&pane) {
+            return Ok(true);
+        }
+        if pane.tty_nr == 0 || pane.tpgid <= 0 {
+            return Ok(false);
+        }
+
+        for entry in fs::read_dir(&self.proc_root)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            let process = match self.read_process(pid) {
+                Ok(Some(process)) => process,
+                Ok(None) | Err(_) => continue,
+            };
+            if process.pgrp == pane.tpgid
+                && process.tty_nr == pane.tty_nr
+                && self.is_exact_configured_executable(&process)
+            {
+                let Some(current_pane) = self.read_process(pane_pid)? else {
+                    return Ok(false);
+                };
+                return Ok(same_foreground_snapshot(&pane, &current_pane));
+            }
+        }
+        Ok(false)
     }
 
     fn inspect(&self, pane_pid: u32) -> std::io::Result<Option<PathBuf>> {
@@ -138,7 +175,7 @@ impl LinuxProcessInspector {
             }
             Err(error) => return Err(error),
         };
-        let Some((pgrp, tty_nr, tpgid)) = parse_stat(&stat) else {
+        let Some((pgrp, tty_nr, tpgid, start_time)) = parse_stat(&stat) else {
             return Ok(None);
         };
         let executable = fs::read_link(directory.join("exe")).ok();
@@ -151,12 +188,31 @@ impl LinuxProcessInspector {
                     .collect()
             })
             .unwrap_or_default();
+        let Some((current_pgrp, current_tty_nr, current_tpgid, current_start_time)) =
+            fs::read(directory.join("stat"))
+                .ok()
+                .as_deref()
+                .and_then(parse_stat)
+        else {
+            return Ok(None);
+        };
+        if (pgrp, tty_nr, tpgid, start_time)
+            != (
+                current_pgrp,
+                current_tty_nr,
+                current_tpgid,
+                current_start_time,
+            )
+        {
+            return Ok(None);
+        }
 
         Ok(Some(ProcessEvidence {
             pid,
             pgrp,
             tty_nr,
             tpgid,
+            start_time,
             executable,
             arguments,
         }))
@@ -178,23 +234,34 @@ struct ProcessEvidence {
     pgrp: i64,
     tty_nr: i64,
     tpgid: i64,
+    start_time: u64,
     executable: Option<PathBuf>,
     arguments: Vec<OsString>,
 }
 
-fn parse_stat(stat: &[u8]) -> Option<(i64, i64, i64)> {
+fn same_foreground_snapshot(initial: &ProcessEvidence, current: &ProcessEvidence) -> bool {
+    initial.pid == current.pid
+        && initial.start_time == current.start_time
+        && initial.tty_nr == current.tty_nr
+        && initial.tpgid == current.tpgid
+        && current.tty_nr != 0
+        && current.tpgid > 0
+}
+
+fn parse_stat(stat: &[u8]) -> Option<(i64, i64, i64, u64)> {
     // comm is parenthesized and may itself contain spaces or right parentheses;
     // the last `)` precedes the fixed-position numeric fields.
     let close = stat.iter().rposition(|byte| *byte == b')')?;
     let remainder = std::str::from_utf8(stat.get(close + 1..)?).ok()?;
     let fields = remainder.split_ascii_whitespace().collect::<Vec<_>>();
-    if fields.len() < 6 {
+    if fields.len() < 20 {
         return None;
     }
     Some((
         fields[2].parse().ok()?,
         fields[4].parse().ok()?,
         fields[5].parse().ok()?,
+        fields[19].parse().ok()?,
     ))
 }
 
@@ -218,16 +285,34 @@ fn is_wrapper(executable: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stat;
+    use std::{ffi::OsString, path::PathBuf};
+
+    use super::{ProcessEvidence, parse_stat, same_foreground_snapshot};
 
     #[test]
     fn parses_stat_with_spaces_and_parentheses_in_comm() {
-        let stat = b"42 (odd ) process) S 1 42 42 34816 42 0 0 0";
-        assert_eq!(parse_stat(stat), Some((42, 34816, 42)));
+        let stat = b"42 (odd ) process) S 1 42 42 34816 42 0 0 0 0 0 0 0 0 0 0 0 0 0 1234";
+        assert_eq!(parse_stat(stat), Some((42, 34816, 42, 1234)));
     }
 
     #[test]
     fn malformed_stat_is_ignored() {
         assert_eq!(parse_stat(b"42 incomplete"), None);
+    }
+
+    #[test]
+    fn foreground_snapshot_rejects_pid_reuse() {
+        let evidence = |start_time| ProcessEvidence {
+            pid: 42,
+            pgrp: 42,
+            tty_nr: 34816,
+            tpgid: 42,
+            start_time,
+            executable: Some(PathBuf::from("/opt/codex")),
+            arguments: vec![OsString::from("/opt/codex")],
+        };
+
+        assert!(same_foreground_snapshot(&evidence(100), &evidence(100)));
+        assert!(!same_foreground_snapshot(&evidence(100), &evidence(101)));
     }
 }

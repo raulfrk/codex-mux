@@ -186,6 +186,44 @@ fn smart_left_refuses_file_and_live_root_binding_conflicts_before_mutation() {
 }
 
 #[test]
+fn smart_left_allows_unambiguous_non_left_bindings() {
+    let root = scratch("smart-left-literal-dash");
+    let config = root.join("tmux.conf");
+    fs::write(
+        &config,
+        b"bind - split-window -v\nbind W run-shell 'capture-pane' \\\ndisplay 'captured'\n",
+    )
+    .unwrap();
+    let mut no_server = NoRunningServer;
+
+    install_with_options(&config, "a", true, &executables(), &mut no_server).unwrap();
+
+    let rendered = String::from_utf8(fs::read(&config).unwrap()).unwrap();
+    assert!(rendered.starts_with("bind - split-window -v\nbind W run-shell"));
+    assert!(status(&config, &executables()).unwrap().smart_left);
+}
+
+#[test]
+fn smart_left_rejects_an_incomplete_continued_binding() {
+    for (name, contents) in [
+        (
+            "before-key",
+            b"bind \\\n-T root Left select-pane -L\n".as_slice(),
+        ),
+        ("at-eof", b"bind W run-shell 'capture-pane' \\".as_slice()),
+    ] {
+        let root = scratch(&format!("smart-left-incomplete-continuation-{name}"));
+        let config = root.join("tmux.conf");
+        fs::write(&config, contents).unwrap();
+        let before = fs::read(&config).unwrap();
+        let mut no_server = NoRunningServer;
+
+        assert!(install_with_options(&config, "a", true, &executables(), &mut no_server).is_err());
+        assert_eq!(fs::read(&config).unwrap(), before);
+    }
+}
+
+#[test]
 fn live_unbind_failures_do_not_leave_a_partially_removed_binding_pair() {
     for operation in ["update", "uninstall"] {
         let root = scratch(&format!("smart-left-root-unbind-failure-{operation}"));

@@ -22,15 +22,16 @@ pub enum SmartLeftOutcome {
     Opened,
 }
 
-/// Exact-process identity required before prefixless interception is attempted.
+/// Exact foreground-process identity required before prefixless interception.
 pub trait DirectCodexInspector {
-    /// Returns true only when `pid` itself is the configured Codex executable.
+    /// Returns true only when the pane foreground includes the configured Codex
+    /// executable itself, never merely an allowlisted wrapper.
     fn is_direct_codex(&self, pid: u32) -> Result<bool>;
 }
 
 impl DirectCodexInspector for LinuxProcessInspector {
     fn is_direct_codex(&self, pid: u32) -> Result<bool> {
-        self.process_is_exact(pid)
+        self.foreground_process_is_exact(pid)
     }
 }
 
