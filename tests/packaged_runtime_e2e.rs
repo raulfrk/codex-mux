@@ -593,6 +593,7 @@ fn client_fields(server: &Server, target: &str) -> (String, String) {
             "-F",
             "#{client_tty}\u{1f}#{client_session}\u{1f}#{pane_id}",
         ])
+        .replace("\\037", "\u{1f}")
         .lines()
         .find_map(|line| {
             let mut fields = line.split('\u{1f}');
