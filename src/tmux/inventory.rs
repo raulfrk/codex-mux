@@ -15,6 +15,7 @@ use crate::{
 };
 
 const FIELD_SEPARATOR: u8 = 0x1f;
+const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
 const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
@@ -154,9 +155,7 @@ impl TmuxPaneRecord {
         if line.is_empty() || line.contains(&b'\r') {
             return None;
         }
-        let fields = line
-            .split(|byte| *byte == FIELD_SEPARATOR)
-            .collect::<Vec<_>>();
+        let fields = split_fields(line);
         if fields.len() != 9 {
             return None;
         }
@@ -191,6 +190,27 @@ impl TmuxPaneRecord {
             tty: os_string_from_bytes(fields[8]),
         })
     }
+}
+
+fn split_fields(line: &[u8]) -> Vec<&[u8]> {
+    if line.contains(&FIELD_SEPARATOR) {
+        return line
+            .split(|byte| *byte == FIELD_SEPARATOR)
+            .collect::<Vec<_>>();
+    }
+
+    let mut fields = Vec::new();
+    let mut start = 0;
+    while let Some(offset) = line[start..]
+        .windows(ESCAPED_FIELD_SEPARATOR.len())
+        .position(|window| window == ESCAPED_FIELD_SEPARATOR)
+    {
+        let separator = start + offset;
+        fields.push(&line[start..separator]);
+        start = separator + ESCAPED_FIELD_SEPARATOR.len();
+    }
+    fields.push(&line[start..]);
+    fields
 }
 
 fn utf8_nonempty(bytes: &[u8]) -> Option<String> {
@@ -230,6 +250,20 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn parser_accepts_tmux_34_octal_escaped_separators() {
+        let record = TmuxPaneRecord::parse(
+            b"%1\\037$1\\037@1\\037main\\037thread\\037/work/project\\037codex\\03742\\037/dev/pts/1",
+        )
+        .expect("tmux 3.4 record should parse");
+
+        assert_eq!(record.pane_id, "%1");
+        assert_eq!(record.session_id, "$1");
+        assert_eq!(record.current_path, Path::new("/work/project"));
+        assert_eq!(record.command, OsStr::new("codex"));
+        assert_eq!(record.pane_pid, 42);
     }
 
     #[test]
