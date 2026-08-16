@@ -9,10 +9,11 @@ use std::{
     time::Duration,
 };
 
-use support::{PtyProcess, Scratch, TmuxServer, assert_success, tools_available};
+use support::{PtyProcess, Scratch, TmuxServer, assert_success, serial_tmux_test, tools_available};
 
 #[test]
 fn installer_cli_loads_a_real_prefix_binding_with_responsive_geometry() {
+    let _serial = serial_tmux_test();
     if !tools_available() {
         eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
         return;
@@ -112,6 +113,7 @@ fn installer_cli_loads_a_real_prefix_binding_with_responsive_geometry() {
 
 #[test]
 fn installer_refuses_to_write_when_tmux_config_inspection_fails() {
+    let _serial = serial_tmux_test();
     let scratch = Scratch::new("inspection-error");
     let config = scratch.join("tmux.conf");
     let original = b"set -g status off\n";
@@ -151,6 +153,7 @@ fn installer_refuses_to_write_when_tmux_config_inspection_fails() {
 
 #[test]
 fn interactive_cli_selects_full_screen_for_only_the_named_client() {
+    let _serial = serial_tmux_test();
     if !tools_available() {
         eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
         return;
@@ -240,6 +243,7 @@ fn interactive_cli_selects_full_screen_for_only_the_named_client() {
 
 #[test]
 fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
+    let _serial = serial_tmux_test();
     if !tools_available() {
         eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
         return;
@@ -295,6 +299,7 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
 
 #[test]
 fn interactive_close_requires_confirmation_and_targets_only_the_selected_pane() {
+    let _serial = serial_tmux_test();
     if !tools_available() {
         eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
         return;
@@ -345,6 +350,7 @@ fn interactive_close_requires_confirmation_and_targets_only_the_selected_pane() 
 
 #[test]
 fn interactive_errors_are_explicit_and_leave_tmux_untouched() {
+    let _serial = serial_tmux_test();
     if !tools_available() {
         eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
         return;

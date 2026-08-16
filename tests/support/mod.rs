@@ -3,15 +3,25 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+static TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn serial_tmux_test() -> MutexGuard<'static, ()> {
+    TMUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 pub fn tools_available() -> bool {
     ["tmux", "script"]
