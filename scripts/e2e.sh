@@ -4,15 +4,9 @@ set -euo pipefail
 repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repository"
 
-for tool in bwrap cargo gzip rustc script sha256sum tar tmux; do
-  command -v "$tool" >/dev/null || {
-    echo "required packaged E2E tool is unavailable: $tool" >&2
-    exit 1
-  }
-done
-
 toolchain=${CODEX_MUX_E2E_TOOLCHAIN:-1.85}
 network_mode=${CODEX_MUX_E2E_NETWORK_MODE:-isolated}
+sandbox_mode=${CODEX_MUX_E2E_SANDBOX_MODE:-bwrap}
 version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' Cargo.toml)
 target=x86_64-unknown-linux-gnu
 
@@ -30,6 +24,32 @@ case "$network_mode" in
     ;;
 esac
 
+if [[ $sandbox_mode == direct && $network_mode != host ]]; then
+  echo "direct sandbox mode requires CODEX_MUX_E2E_NETWORK_MODE=host" >&2
+  exit 1
+fi
+
+for tool in cargo gzip rustc script sha256sum tar tmux; do
+  command -v "$tool" >/dev/null || {
+    echo "required packaged E2E tool is unavailable: $tool" >&2
+    exit 1
+  }
+done
+if [[ $sandbox_mode == bwrap ]]; then
+  command -v bwrap >/dev/null || {
+    echo "required packaged E2E tool is unavailable: bwrap" >&2
+    exit 1
+  }
+fi
+
+case "$sandbox_mode" in
+  bwrap | direct) ;;
+  *)
+    echo "invalid CODEX_MUX_E2E_SANDBOX_MODE: $sandbox_mode" >&2
+    exit 1
+    ;;
+esac
+
 if [[ ${CODEX_MUX_E2E_SANDBOXED:-0} != 1 ]]; then
   cargo "+$toolchain" fetch --locked
   mkdir -p target
@@ -39,28 +59,47 @@ if [[ ${CODEX_MUX_E2E_SANDBOXED:-0} != 1 ]]; then
   host_home=$HOME
   cargo_home=${CARGO_HOME:-$host_home/.cargo}
   rustup_home=${RUSTUP_HOME:-$host_home/.rustup}
-  bwrap \
-    "${network_args[@]}" \
-    --unshare-pid \
-    --die-with-parent \
-    --ro-bind / / \
-    --dev-bind /dev /dev \
-    --proc /proc \
-    --bind "$repository/target" "$repository/target" \
-    --bind "$sandbox" "$sandbox" \
-    --chdir "$repository" \
-    --setenv CODEX_MUX_E2E_SANDBOXED 1 \
-    --setenv E2E_SANDBOX "$sandbox" \
-    --setenv HOME "$sandbox/home" \
-    --setenv XDG_CONFIG_HOME "$sandbox/xdg" \
-    --setenv TMPDIR "$sandbox/tmp" \
-    --setenv TMUX_TMPDIR "$sandbox/tmux" \
-    --setenv PATH "$PATH" \
-    --setenv CARGO_HOME "$cargo_home" \
-    --setenv RUSTUP_HOME "$rustup_home" \
-    --setenv CODEX_MUX_E2E_TOOLCHAIN "$toolchain" \
-    --setenv CODEX_MUX_E2E_NETWORK_MODE "$network_mode" \
-    /usr/bin/env bash scripts/e2e.sh
+  if [[ $sandbox_mode == bwrap ]]; then
+    bwrap \
+      "${network_args[@]}" \
+      --unshare-pid \
+      --die-with-parent \
+      --ro-bind / / \
+      --dev-bind /dev /dev \
+      --proc /proc \
+      --bind "$repository/target" "$repository/target" \
+      --bind "$sandbox" "$sandbox" \
+      --chdir "$repository" \
+      --setenv CODEX_MUX_E2E_SANDBOXED 1 \
+      --setenv E2E_SANDBOX "$sandbox" \
+      --setenv HOME "$sandbox/home" \
+      --setenv XDG_CONFIG_HOME "$sandbox/xdg" \
+      --setenv TMPDIR "$sandbox/tmp" \
+      --setenv TMUX_TMPDIR "$sandbox/tmux" \
+      --setenv PATH "$PATH" \
+      --setenv CARGO_HOME "$cargo_home" \
+      --setenv RUSTUP_HOME "$rustup_home" \
+      --setenv CODEX_MUX_E2E_TOOLCHAIN "$toolchain" \
+      --setenv CODEX_MUX_E2E_NETWORK_MODE "$network_mode" \
+      --setenv CODEX_MUX_E2E_SANDBOX_MODE "$sandbox_mode" \
+      /usr/bin/env bash scripts/e2e.sh
+  else
+    echo "packaged E2E has no filesystem or PID namespace isolation; temporary and tmux roots remain scoped" >&2
+    env \
+      CODEX_MUX_E2E_SANDBOXED=1 \
+      E2E_SANDBOX="$sandbox" \
+      HOME="$sandbox/home" \
+      XDG_CONFIG_HOME="$sandbox/xdg" \
+      TMPDIR="$sandbox/tmp" \
+      TMUX_TMPDIR="$sandbox/tmux" \
+      PATH="$PATH" \
+      CARGO_HOME="$cargo_home" \
+      RUSTUP_HOME="$rustup_home" \
+      CODEX_MUX_E2E_TOOLCHAIN="$toolchain" \
+      CODEX_MUX_E2E_NETWORK_MODE="$network_mode" \
+      CODEX_MUX_E2E_SANDBOX_MODE="$sandbox_mode" \
+      /usr/bin/env bash scripts/e2e.sh
+  fi
   exit
 fi
 
@@ -115,4 +154,8 @@ if find "$TMUX_TMPDIR" -mindepth 1 -print -quit | grep -q .; then
   exit 1
 fi
 
-echo "packaged runtime E2E passed inside the read-only-root sandbox"
+if [[ $sandbox_mode == bwrap ]]; then
+  echo "packaged runtime E2E passed inside the read-only-root sandbox"
+else
+  echo "packaged runtime E2E passed without filesystem or PID namespace isolation; cleanup checks passed"
+fi

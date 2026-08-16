@@ -35,3 +35,4 @@ jobs:
         run: scripts/e2e.sh
         env:
           CODEX_MUX_E2E_NETWORK_MODE: host
+          CODEX_MUX_E2E_SANDBOX_MODE: direct
