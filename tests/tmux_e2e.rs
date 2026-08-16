@@ -152,6 +152,7 @@ fn installer_refuses_to_write_when_tmux_config_inspection_fails() {
 }
 
 #[test]
+#[ignore = "covered by the packaged runtime E2E harness"]
 fn interactive_cli_selects_full_screen_for_only_the_named_client() {
     let _serial = serial_tmux_test();
     if !tools_available() {
@@ -242,6 +243,7 @@ fn interactive_cli_selects_full_screen_for_only_the_named_client() {
 }
 
 #[test]
+#[ignore = "covered by the packaged runtime E2E harness"]
 fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
     let _serial = serial_tmux_test();
     if !tools_available() {
@@ -298,6 +300,7 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
 }
 
 #[test]
+#[ignore = "covered by the packaged runtime E2E harness"]
 fn interactive_close_requires_confirmation_and_targets_only_the_selected_pane() {
     let _serial = serial_tmux_test();
     if !tools_available() {
