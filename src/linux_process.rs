@@ -41,6 +41,9 @@ impl LinuxProcessInspector {
             Some(process) => process,
             None => return Ok(None),
         };
+        if self.is_exact_configured_executable(&pane) {
+            return Ok(Some(self.codex.as_path().to_owned()));
+        }
         if pane.tty_nr == 0 || pane.tpgid <= 0 {
             return Ok(None);
         }
@@ -86,11 +89,7 @@ impl LinuxProcessInspector {
     }
 
     fn is_configured(&self, process: &ProcessEvidence) -> bool {
-        if process
-            .executable
-            .as_deref()
-            .is_some_and(|path| same_file(path, self.codex.as_path()))
-        {
+        if self.is_exact_configured_executable(process) {
             return true;
         }
 
@@ -99,6 +98,13 @@ impl LinuxProcessInspector {
                 .arguments
                 .get(1)
                 .is_some_and(|argument| same_file(Path::new(argument), self.codex.as_path()))
+    }
+
+    fn is_exact_configured_executable(&self, process: &ProcessEvidence) -> bool {
+        process
+            .executable
+            .as_deref()
+            .is_some_and(|path| same_file(path, self.codex.as_path()))
     }
 
     fn read_process(&self, pid: u32) -> std::io::Result<Option<ProcessEvidence>> {

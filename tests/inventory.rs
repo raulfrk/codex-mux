@@ -264,6 +264,55 @@ fn unrelated_process_with_codex_as_data_is_not_a_wrapper_match() {
 }
 
 #[test]
+fn exact_configured_pane_matches_without_a_foreground_process_group() {
+    let root = TemporaryDirectory::new("proc-detached-direct");
+    let configured = root.path().join("bin/codex-custom");
+    fs::create_dir_all(configured.parent().unwrap()).unwrap();
+    fs::write(&configured, b"fixture").unwrap();
+    write_process(
+        root.path(),
+        10,
+        10,
+        0,
+        -1,
+        configured.to_str().unwrap(),
+        &[configured.to_str().unwrap()],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new(&configured).unwrap(),
+        root.path(),
+    );
+
+    assert_eq!(
+        inspector.foreground_executable(10).unwrap(),
+        Some(configured)
+    );
+}
+
+#[test]
+fn detached_wrapper_is_not_treated_as_a_foreground_codex_process() {
+    let root = TemporaryDirectory::new("proc-detached-wrapper");
+    let configured = root.path().join("bin/codex-custom");
+    fs::create_dir_all(configured.parent().unwrap()).unwrap();
+    fs::write(&configured, b"fixture").unwrap();
+    write_process(
+        root.path(),
+        10,
+        10,
+        0,
+        -1,
+        "/usr/bin/env",
+        &["env", configured.to_str().unwrap()],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new(&configured).unwrap(),
+        root.path(),
+    );
+
+    assert_eq!(inspector.foreground_executable(10).unwrap(), None);
+}
+
+#[test]
 fn forged_argv_zero_does_not_override_unrelated_executable_identity() {
     let root = TemporaryDirectory::new("proc-forged-argv-zero");
     let configured = root.path().join("bin/codex-custom");
