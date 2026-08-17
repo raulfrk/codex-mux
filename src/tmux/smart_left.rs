@@ -10,9 +10,7 @@ use crate::{
 
 const FIELD_SEPARATOR: char = '\u{1f}';
 const ESCAPED_FIELD_SEPARATOR: &str = "\\037";
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
-// Retain several post-input observations while capping the nominal wait at 30 ms.
-const POLL_ATTEMPTS: usize = 6;
+const SHELL_SETTLE_INTERVAL: Duration = Duration::from_millis(30);
 
 /// Observable result of one Smart Left gesture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,7 +115,7 @@ where
         }
     }
 
-    /// Forwards Left exactly once and opens only after an unchanged guarded probe.
+    /// Forwards Left exactly once and opens immediately at a proven boundary.
     pub fn run(&self, context: &InvocationContext) -> Result<SmartLeftOutcome> {
         let initial = match self.read_state(context) {
             Ok(state) if state.cursor_visible && !state.pane_in_mode => {
@@ -142,27 +140,37 @@ where
             Ok(_) | Err(_) => None,
         };
 
-        self.send_left(context)?;
         let Some((initial, target)) = initial else {
+            self.send_left(context)?;
             return Ok(SmartLeftOutcome::Forwarded);
         };
 
-        self.sleeper.sleep(POLL_INTERVAL);
-        let Ok(first_observation) = self.read_state(context) else {
-            return Ok(SmartLeftOutcome::Forwarded);
+        let boundary_is_exact = match target {
+            SmartLeftTarget::Codex => {
+                initial.cursor_x == 2
+                    && self.cursor_is_on_composer_prompt(context, initial.cursor_y)
+            }
+            // Shell prompts may occupy any number of columns. An unchanged
+            // immediate post-key observation proves the editing boundary.
+            SmartLeftTarget::Shell => true,
         };
-        if !state_is_unchanged(&initial, &first_observation) {
+        self.send_left(context)?;
+        if !boundary_is_exact {
             return Ok(SmartLeftOutcome::Forwarded);
         }
-        let mut current = first_observation;
-        let Ok(observations) = self.poll_states(context, POLL_ATTEMPTS - 1) else {
+
+        // tmux can finish writing to a shell PTY before Readline/ZLE consumes and
+        // redraws the key. Codex renders synchronously enough for the immediate
+        // check, but shells need this bounded settle to avoid opening mid-line.
+        if target == SmartLeftTarget::Shell {
+            self.sleeper.sleep(SHELL_SETTLE_INTERVAL);
+        }
+
+        let Ok(current) = self.read_state(context) else {
             return Ok(SmartLeftOutcome::Forwarded);
         };
-        for observed in observations {
-            if !state_is_unchanged(&initial, &observed) {
-                return Ok(SmartLeftOutcome::Forwarded);
-            }
-            current = observed;
+        if !state_is_unchanged(&initial, &current) {
+            return Ok(SmartLeftOutcome::Forwarded);
         }
 
         let still_exact = match target {
@@ -175,48 +183,8 @@ where
         if !still_exact {
             return Ok(SmartLeftOutcome::Forwarded);
         }
-        if target == SmartLeftTarget::Codex
-            && (current.cursor_x != 2
-                || !self.cursor_is_on_composer_prompt(context, current.cursor_y))
-        {
-            return Ok(SmartLeftOutcome::Forwarded);
-        }
-
         self.open_popup(context)?;
         Ok(SmartLeftOutcome::Opened)
-    }
-
-    fn poll_states(&self, context: &InvocationContext, attempts: usize) -> Result<Vec<PaneState>> {
-        let format = self.state_format();
-        let mut arguments = Vec::with_capacity(attempts * 8);
-        for attempt in 0..attempts {
-            if let Some(delay) = self.sleeper.tmux_sleep_command(POLL_INTERVAL) {
-                arguments.extend([OsString::from("run-shell"), delay, OsString::from(";")]);
-            }
-            arguments.extend([
-                OsString::from("display-message"),
-                OsString::from("-p"),
-                OsString::from("-t"),
-                OsString::from(context.pane_id.as_str()),
-                OsString::from(format.clone()),
-            ]);
-            if attempt + 1 < attempts {
-                arguments.push(OsString::from(";"));
-            }
-        }
-        let output = self.run_checked(arguments)?;
-        let states = output
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(PaneState::parse)
-            .collect::<Result<Vec<_>>>()?;
-        if states.len() != attempts {
-            return Err(MuxError::Command(
-                "tmux returned an incomplete Smart Left observation batch".to_owned(),
-            ));
-        }
-        Ok(states)
     }
 
     fn read_state(&self, context: &InvocationContext) -> Result<PaneState> {
@@ -534,15 +502,6 @@ mod tests {
         )
     }
 
-    fn polled(states: impl IntoIterator<Item = CommandOutput>) -> CommandOutput {
-        output(
-            states
-                .into_iter()
-                .flat_map(|state| state.stdout)
-                .collect::<Vec<_>>(),
-        )
-    }
-
     fn context() -> InvocationContext {
         InvocationContext {
             client_id: ClientId::new("/dev/pts/7").unwrap(),
@@ -589,12 +548,8 @@ mod tests {
     }
 
     #[test]
-    fn moved_cursor_forwards_once_without_waiting_full_window() {
-        let runner = Runner::with([
-            state(5, 10, true, false),
-            output([]),
-            state(4, 10, true, false),
-        ]);
+    fn cursor_outside_exact_boundary_forwards_without_waiting() {
+        let runner = Runner::with([state(5, 10, true, false), output([])]);
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
 
@@ -611,7 +566,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, SmartLeftOutcome::Forwarded);
-        assert_eq!(sleeper.calls.get(), 1);
+        assert_eq!(sleeper.calls.get(), 0);
+        assert_eq!(sleeper.elapsed.get(), Duration::ZERO);
         let calls = runner.calls.borrow();
         assert_eq!(
             calls.iter().filter(|call| call[0] == "send-keys").count(),
@@ -622,19 +578,16 @@ mod tests {
 
     #[test]
     fn unchanged_composer_boundary_opens_exact_client_popup() {
-        let mut outputs = vec![
-            state(2, 10, true, false),
-            output([]),
-            state(2, 10, true, false),
-        ];
-        outputs.push(polled((0..5).map(|_| state(2, 10, true, false))));
         let mut screen = [""; 11];
         screen[10] = "› draft";
-        outputs.push(output(format!("{}\n", screen.join("\n")).into_bytes()));
-        outputs.push(output(
-            b"/dev/pts/8\x1f120\x1f40\n/dev/pts/7\x1f62\x1f35\n".to_vec(),
-        ));
-        outputs.push(output([]));
+        let outputs = vec![
+            state(2, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output([]),
+            state(2, 10, true, false),
+            output(b"/dev/pts/8\x1f120\x1f40\n/dev/pts/7\x1f62\x1f35\n".to_vec()),
+            output([]),
+        ];
         let runner = Runner::with(outputs);
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
@@ -652,10 +605,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, SmartLeftOutcome::Opened);
-        assert_eq!(sleeper.calls.get(), 6);
-        assert_eq!(sleeper.elapsed.get(), Duration::from_millis(30));
+        assert_eq!(sleeper.calls.get(), 0);
+        assert_eq!(sleeper.elapsed.get(), Duration::ZERO);
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 7);
+        assert_eq!(calls.len(), 6);
         assert_eq!(
             calls.iter().filter(|call| call[0] == "send-keys").count(),
             1
@@ -673,10 +626,13 @@ mod tests {
 
     #[test]
     fn unchanged_marked_shell_boundary_opens_without_composer_glyph() {
-        let mut outputs = vec![shell_state(0, 4, true), output([]), shell_state(0, 4, true)];
-        outputs.push(polled((0..5).map(|_| shell_state(0, 4, true))));
-        outputs.push(output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()));
-        outputs.push(output([]));
+        let outputs = vec![
+            shell_state(8, 4, true),
+            output([]),
+            shell_state(8, 4, true),
+            output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+            output([]),
+        ];
         let runner = Runner::with(outputs);
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
@@ -695,6 +651,8 @@ mod tests {
             .unwrap(),
             SmartLeftOutcome::Opened
         );
+        assert_eq!(sleeper.calls.get(), 1);
+        assert_eq!(sleeper.elapsed.get(), Duration::from_millis(30));
         assert!(
             !runner
                 .calls
@@ -728,13 +686,11 @@ mod tests {
 
     #[test]
     fn unchanged_cursor_outside_composer_fails_through() {
-        let mut outputs = vec![
+        let outputs = vec![
             state(2, 3, true, false),
+            output(b"picker\nrow\nselected\nnot a composer\n".to_vec()),
             output([]),
-            state(2, 3, true, false),
         ];
-        outputs.push(polled((0..5).map(|_| state(2, 3, true, false))));
-        outputs.push(output(b"picker\nrow\nselected\nnot a composer\n".to_vec()));
         let runner = Runner::with(outputs);
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
@@ -753,6 +709,43 @@ mod tests {
             .unwrap(),
             SmartLeftOutcome::Forwarded
         );
+        assert!(
+            !runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call[0] == "display-popup")
+        );
+    }
+
+    #[test]
+    fn exact_boundary_that_moves_during_immediate_recheck_fails_through() {
+        let mut screen = [""; 11];
+        screen[10] = "› draft";
+        let runner = Runner::with([
+            state(2, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output([]),
+            state(3, 10, true, false),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Forwarded
+        );
+        assert_eq!(sleeper.calls.get(), 0);
         assert!(
             !runner
                 .calls

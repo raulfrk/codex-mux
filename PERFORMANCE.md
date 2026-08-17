@@ -31,9 +31,9 @@ entries, wrappers, duplicate executable basenames, and PID-reuse snapshots.
   to processes plus panes, never a full process scan per pane.
 - At most one refresh and one naming request per unchanged conversation may be in
   flight. Slow refresh/model work never runs on the terminal input/render thread.
-- Smart Left retains its 30 ms guarded observation, forwards Left exactly once, and
-  reduces tmux client launches from the recorded baseline without removing any
-  fail-through check.
+- Smart Left's Codex composer path has no fixed observation delay, forwards Left
+  exactly once, and immediately revalidates the pane and cursor. Shell prompts keep
+  a bounded settle because Readline/ZLE redraw may lag tmux's key delivery.
 - Switch/zoom/launch/close paths reduce tmux client launches from their recorded
   baselines while retaining exact targets and equivalent partial-failure reporting.
 - Environment-sensitive timing does not fail CI. CI gates the injectable clock,
@@ -47,9 +47,9 @@ Before the optimization wave, the interactive path has these structural baseline
 - Idle refresh calls inventory synchronously after each one-second poll timeout.
 - Inventory asks the process inspector once per pane; a nontrivial Linux lookup scans
   all of `/proc`, producing approximately panes × processes work.
-- A successful Smart Left boundary path launches separate tmux clients for the
-  initial state, Left forwarding, six guarded observations, screen capture, client
-  dimensions, and popup display.
+- Before optimization, a successful Smart Left boundary path launched separate tmux
+  clients for the initial state, Left forwarding, six guarded observations, screen
+  capture, client dimensions, and popup display.
 - Switching an unzoomed pane launches five tmux clients: zoom query, window select,
   pane select/zoom, exact-client switch, and the conditional resize toggle.
 

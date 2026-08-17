@@ -84,7 +84,7 @@ codex-mux --codex "$(command -v codex)" \
   tmux install --smart-left --key a --config "$HOME/.tmux.conf"
 ```
 
-Smart Left first sends the requested `Left`, then observes the rendered cursor over a 30 ms sampling window. In Codex it opens only when the cursor did not move and is on the composer prompt. In Bash or Zsh it opens only when the shell's prompt lifecycle hook marks the pane as waiting at its primary prompt and Left cannot move the cursor. During command execution, nested interactive programs, shell editing away from the boundary, and every uncertain state, the key remains ordinary `Left`.
+Smart Left verifies the exact foreground process and rendered boundary, sends the requested `Left` once, then confirms that the exact pane and cursor did not change. The Codex composer path has no fixed sampling delay. Bash and Zsh retain a short guarded settle because Readline/ZLE can redraw after tmux returns; they open only when `Left` leaves the cursor unchanged while the prompt lifecycle hook marks the pane as waiting at its primary prompt. During command execution, nested interactive programs, shell editing away from the boundary, and every uncertain state, the key remains ordinary `Left`.
 
 `codex-mux setup` installs Smart Left and marker-managed prompt hooks by default. Bash prepends one `PROMPT_COMMAND` entry and wraps `PS0` and `PS2`; when Bash's `promptvars` option is disabled, shell Smart Left fails closed and ordinary `Left` remains active. Zsh installs `precmd`/`preexec` plus `line-init`, `line-pre-redraw`, and `line-finish` ZLE hook widgets. No shell framework is required, and existing hook chains are preserved.
 
