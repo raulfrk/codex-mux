@@ -861,7 +861,10 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
         );
 
         let mut popup = fixture.interactive(&client_tty);
-        thread::sleep(Duration::from_millis(200));
+        // Inventory is intentionally populated off the terminal thread. Give the
+        // debug-build E2E fixture time to publish its first useful snapshot before
+        // asserting selected-pane cwd behavior; release latency has a separate budget.
+        thread::sleep(Duration::from_millis(700));
         popup.send(keys);
         popup.wait_for_exit();
         let log = support::wait_for_file(&fixture.log);

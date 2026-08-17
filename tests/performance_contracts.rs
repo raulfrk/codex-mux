@@ -134,7 +134,7 @@ fn inventory_rejects_a_malformed_batch_cardinality() {
 }
 
 #[test]
-fn unzoomed_switch_baseline_is_five_exact_tmux_requests() {
+fn unzoomed_switch_uses_two_exact_tmux_requests() {
     struct SwitchRunner(Cell<usize>);
     impl TmuxCommandRunner for SwitchRunner {
         fn run(&self, _arguments: &[OsString]) -> Result<CommandOutput> {
@@ -170,5 +170,5 @@ fn unzoomed_switch_baseline_is_five_exact_tmux_requests() {
     };
 
     actions.switch_and_zoom(&context, &pane).unwrap();
-    assert_eq!(runner.0.get(), 5, "record the pre-optimization baseline");
+    assert_eq!(runner.0.get(), 2, "one zoom query and one command queue");
 }

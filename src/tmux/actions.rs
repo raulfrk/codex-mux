@@ -40,11 +40,7 @@ where
         let output = self.run_checked(&zoom_query)?;
         let was_zoomed = parse_zoomed(&output.stdout)?;
 
-        self.switch_client(context, &pane.id)?;
-
-        if !was_zoomed {
-            self.run_checked(&os_strings(["resize-pane", "-Z", "-t", pane.id.as_str()]))?;
-        }
+        self.switch_client(context, &pane.id, !was_zoomed)?;
 
         Ok(())
     }
@@ -75,7 +71,7 @@ where
         );
         let output = self.run_checked(&arguments)?;
         let pane_id = parse_pane_id(&output.stdout)?;
-        self.switch_client(context, &pane_id)?;
+        self.switch_client(context, &pane_id, false)?;
         Ok(pane_id)
     }
 
@@ -103,21 +99,33 @@ where
         let arguments = new_window_arguments(self.executable, context, selected, kind);
         let output = self.run_checked(&arguments)?;
         let pane_id = parse_pane_id(&output.stdout)?;
-        self.switch_client(context, &pane_id)?;
+        self.switch_client(context, &pane_id, false)?;
         Ok(pane_id)
     }
 
-    fn switch_client(&self, context: &InvocationContext, pane_id: &PaneId) -> Result<()> {
-        self.run_checked(&os_strings(["select-window", "-t", pane_id.as_str()]))?;
-        self.run_checked(&os_strings(["select-pane", "-Z", "-t", pane_id.as_str()]))?;
-        self.run_checked(&os_strings([
+    fn switch_client(
+        &self,
+        context: &InvocationContext,
+        pane_id: &PaneId,
+        zoom_if_unzoomed: bool,
+    ) -> Result<()> {
+        let mut arguments = os_strings(["select-window", "-t", pane_id.as_str()]);
+        arguments.push(OsString::from(";"));
+        arguments.extend(os_strings(["select-pane", "-Z", "-t", pane_id.as_str()]));
+        arguments.push(OsString::from(";"));
+        arguments.extend(os_strings([
             "switch-client",
             "-Z",
             "-c",
             context.client_id.as_str(),
             "-t",
             pane_id.as_str(),
-        ]))?;
+        ]));
+        if zoom_if_unzoomed {
+            arguments.push(OsString::from(";"));
+            arguments.extend(os_strings(["resize-pane", "-Z", "-t", pane_id.as_str()]));
+        }
+        self.run_checked(&arguments)?;
         Ok(())
     }
 

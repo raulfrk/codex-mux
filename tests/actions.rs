@@ -94,9 +94,16 @@ fn switch_selects_exact_window_and_pane_then_targets_the_invoking_client() {
                 "%73",
                 "#{window_zoomed_flag}",
             ]),
-            args(&["select-window", "-t", "%73",]),
-            args(&["select-pane", "-Z", "-t", "%73",]),
             args(&[
+                "select-window",
+                "-t",
+                "%73",
+                ";",
+                "select-pane",
+                "-Z",
+                "-t",
+                "%73",
+                ";",
                 "switch-client",
                 "-Z",
                 "-c",
@@ -119,8 +126,29 @@ fn switch_zooms_selected_pane_only_when_needed() {
     actions.switch_and_zoom(&context, &selected).unwrap();
 
     assert_eq!(
-        runner.commands()[4],
-        args(&["resize-pane", "-Z", "-t", "%73"])
+        runner.commands()[1],
+        args(&[
+            "select-window",
+            "-t",
+            "%73",
+            ";",
+            "select-pane",
+            "-Z",
+            "-t",
+            "%73",
+            ";",
+            "switch-client",
+            "-Z",
+            "-c",
+            "/dev/pts/42; display-message hacked",
+            "-t",
+            "%73",
+            ";",
+            "resize-pane",
+            "-Z",
+            "-t",
+            "%73",
+        ])
     );
 }
 
@@ -155,9 +183,16 @@ fn new_session_uses_selected_cwd_and_direct_custom_executable_arguments() {
                 "-c",
                 TERMINAL_TITLE_CONFIG,
             ]),
-            args(&["select-window", "-t", "%91",]),
-            args(&["select-pane", "-Z", "-t", "%91",]),
             args(&[
+                "select-window",
+                "-t",
+                "%91",
+                ";",
+                "select-pane",
+                "-Z",
+                "-t",
+                "%91",
+                ";",
                 "switch-client",
                 "-Z",
                 "-c",
