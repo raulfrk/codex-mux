@@ -293,6 +293,75 @@ fn proc_group_wrapper_recognizes_a_profile_specific_executable() {
 }
 
 #[test]
+fn batched_proc_snapshot_resolves_multiple_foreground_groups() {
+    let root = TemporaryDirectory::new("proc-batch");
+    let configured = root.path().join("bin/codex-custom");
+    fs::create_dir_all(configured.parent().unwrap()).unwrap();
+    fs::write(&configured, b"fixture").unwrap();
+    write_process(root.path(), 10, 10, 34816, 20, "/bin/sh", &["/bin/sh"]);
+    write_process(
+        root.path(),
+        20,
+        20,
+        34816,
+        20,
+        "/usr/bin/env",
+        &["/usr/bin/env", configured.to_str().unwrap()],
+    );
+    write_process(root.path(), 11, 11, 34817, 30, "/bin/sh", &["/bin/sh"]);
+    write_process(
+        root.path(),
+        30,
+        30,
+        34817,
+        30,
+        configured.to_str().unwrap(),
+        &[configured.to_str().unwrap()],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new(&configured).unwrap(),
+        root.path(),
+    );
+
+    let results = inspector.foreground_executables(&[10, 11]);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].as_ref().unwrap(), &Some(configured.clone()));
+    assert_eq!(results[1].as_ref().unwrap(), &Some(configured));
+}
+
+#[test]
+fn batched_proc_snapshot_isolates_pane_errors_and_uses_leader_fallback() {
+    let root = TemporaryDirectory::new("proc-batch-isolation");
+    let configured = root.path().join("bin/codex-custom");
+    fs::create_dir_all(configured.parent().unwrap()).unwrap();
+    fs::write(&configured, b"fixture").unwrap();
+    write_process(root.path(), 10, 10, 34816, 20, "/bin/sh", &["/bin/sh"]);
+    write_process(
+        root.path(),
+        20,
+        20,
+        34816,
+        20,
+        "/tmp/leader",
+        &["/tmp/leader"],
+    );
+    fs::create_dir_all(root.path().join("12/stat")).unwrap();
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new(&configured).unwrap(),
+        root.path(),
+    );
+
+    let results = inspector.foreground_executables(&[10, 99, 12]);
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results[0].as_ref().unwrap(),
+        &Some(PathBuf::from("/tmp/leader"))
+    );
+    assert_eq!(results[1].as_ref().unwrap(), &None);
+    assert!(results[2].is_err());
+}
+
+#[test]
 fn direct_foreground_interactive_bash_and_zsh_are_shell_targets() {
     for (pid, shell, arguments) in [
         (

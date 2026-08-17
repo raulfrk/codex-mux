@@ -1,6 +1,7 @@
 //! Linux `/proc` foreground-process inspection.
 
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -202,6 +203,160 @@ impl LinuxProcessInspector {
             .and_then(|process| process.executable.clone()))
     }
 
+    fn inspect_batch(&self, pane_pids: &[u32]) -> Vec<std::io::Result<Option<PathBuf>>> {
+        let recognized_paths = self
+            .recognized
+            .iter()
+            .map(|executable| {
+                executable
+                    .as_path()
+                    .canonicalize()
+                    .unwrap_or_else(|_| executable.as_path().to_owned())
+            })
+            .collect::<Vec<_>>();
+        let panes = pane_pids
+            .iter()
+            .map(|pane_pid| self.read_process(*pane_pid))
+            .collect::<Vec<_>>();
+        let needs_snapshot = panes.iter().any(|pane| {
+            pane.as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|pane| {
+                    self.exact_recognized_match_cached(pane, &recognized_paths)
+                        .is_none()
+                        && pane.tty_nr != 0
+                        && pane.tpgid > 0
+                })
+        });
+        let snapshot = if needs_snapshot {
+            self.process_snapshot().map(|processes| {
+                let mut groups = HashMap::<(i64, i64), Vec<ProcessEvidence>>::new();
+                for process in processes {
+                    groups
+                        .entry((process.pgrp, process.tty_nr))
+                        .or_default()
+                        .push(process);
+                }
+                groups
+            })
+        } else {
+            Ok(HashMap::new())
+        };
+
+        panes
+            .into_iter()
+            .map(|pane| {
+                let pane = pane?;
+                let Some(pane) = pane else {
+                    return Ok(None);
+                };
+                if let Some(executable) =
+                    self.exact_recognized_match_cached(&pane, &recognized_paths)
+                {
+                    return Ok(Some(executable.as_path().to_owned()));
+                }
+                if pane.tty_nr == 0 || pane.tpgid <= 0 {
+                    return Ok(None);
+                }
+
+                let groups = snapshot.as_ref().map_err(clone_io_error)?;
+                let candidates = groups
+                    .get(&(pane.tpgid, pane.tty_nr))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let matched = candidates
+                    .iter()
+                    .find_map(|process| self.recognized_match_cached(process, &recognized_paths))
+                    .map(|executable| executable.as_path().to_owned())
+                    .or_else(|| {
+                        candidates
+                            .iter()
+                            .filter(|process| i64::from(process.pid) == pane.tpgid)
+                            .find_map(|process| process.executable.clone())
+                    });
+                let Some(matched) = matched else {
+                    return Ok(None);
+                };
+                let Some(current) = self.read_process(pane.pid)? else {
+                    return Ok(None);
+                };
+                Ok(same_foreground_snapshot(&pane, &current).then_some(matched))
+            })
+            .collect()
+    }
+
+    fn recognized_match_cached<'a>(
+        &'a self,
+        process: &ProcessEvidence,
+        recognized_paths: &[PathBuf],
+    ) -> Option<&'a CodexExecutable> {
+        process
+            .executable
+            .as_deref()
+            .and_then(|path| self.configured_match(path, recognized_paths))
+            .or_else(|| {
+                process
+                    .executable
+                    .as_deref()
+                    .filter(|path| is_wrapper(path))
+                    .and_then(|_| process.arguments.get(1))
+                    .map(Path::new)
+                    .and_then(|path| self.configured_match(path, recognized_paths))
+            })
+    }
+
+    fn exact_recognized_match_cached<'a>(
+        &'a self,
+        process: &ProcessEvidence,
+        recognized_paths: &[PathBuf],
+    ) -> Option<&'a CodexExecutable> {
+        process
+            .executable
+            .as_deref()
+            .and_then(|path| self.configured_match(path, recognized_paths))
+    }
+
+    fn configured_match<'a>(
+        &'a self,
+        candidate: &Path,
+        recognized_paths: &[PathBuf],
+    ) -> Option<&'a CodexExecutable> {
+        let canonical = candidate.canonicalize().ok();
+        self.recognized
+            .iter()
+            .zip(recognized_paths)
+            .find(|(executable, configured)| {
+                candidate == executable.as_path()
+                    || canonical
+                        .as_deref()
+                        .is_some_and(|candidate| candidate == configured.as_path())
+            })
+            .map(|(executable, _)| executable)
+    }
+
+    fn process_snapshot(&self) -> std::io::Result<Vec<ProcessEvidence>> {
+        let mut processes = Vec::new();
+        for entry in fs::read_dir(&self.proc_root)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            if let Ok(Some(process)) = self.read_process(pid) {
+                processes.push(process);
+            }
+        }
+        processes.sort_by_key(|process| process.pid);
+        Ok(processes)
+    }
+
     fn recognized_match(&self, process: &ProcessEvidence) -> Option<&CodexExecutable> {
         self.recognized.iter().find(|executable| {
             process
@@ -295,6 +450,22 @@ impl ProcessInspector for LinuxProcessInspector {
                 source,
             })
     }
+
+    fn foreground_executables(&self, pane_pids: &[u32]) -> Vec<Result<Option<PathBuf>>> {
+        self.inspect_batch(pane_pids)
+            .into_iter()
+            .map(|result| {
+                result.map_err(|source| MuxError::Filesystem {
+                    path: self.proc_root.clone(),
+                    source,
+                })
+            })
+            .collect()
+    }
+}
+
+fn clone_io_error(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), error.to_string())
 }
 
 struct ProcessEvidence {
