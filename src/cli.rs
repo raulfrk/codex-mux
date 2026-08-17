@@ -50,6 +50,12 @@ pub enum Command {
     /// Internal entrypoint used by the marker-managed Smart Left binding.
     #[command(hide = true)]
     SmartLeft,
+    /// Internal tmux-server-scoped smart-naming daemon.
+    #[command(hide = true)]
+    SmartNamingWorker,
+    /// Internal launcher for the tmux-owned smart-naming daemon.
+    #[command(hide = true)]
+    SmartNamingStart,
 }
 
 /// Standard and explicitly overridden configuration paths for setup.

@@ -1,13 +1,15 @@
 //! Privacy-bounded conversation extraction and Codex app-server naming contract.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
-        mpsc::{self, Receiver},
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -16,6 +18,7 @@ use std::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::domain::{Pane, PaneId};
 use crate::{MuxError, Result};
 
 /// Codex model used exclusively for background session naming.
@@ -43,11 +46,17 @@ pub struct AppServerProcess {
     stderr_reader: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     next_id: u64,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl AppServerProcess {
     /// Starts app-server with local stdio and the user's existing Codex authentication.
     pub fn spawn(codex: &Path) -> Result<Self> {
+        Self::spawn_with_cancel(codex, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Starts app-server with a cancellation flag owned by its worker.
+    pub fn spawn_with_cancel(codex: &Path, cancelled: Arc<AtomicBool>) -> Result<Self> {
         let mut child = Command::new(codex)
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
@@ -108,6 +117,7 @@ impl AppServerProcess {
             stderr_reader: Some(stderr_reader),
             stderr,
             next_id: 1,
+            cancelled,
         };
         process.initialize()?;
         Ok(process)
@@ -154,22 +164,34 @@ impl AppServerProcess {
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(protocol("app-server request cancelled"));
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let wait = remaining.min(Duration::from_millis(100));
             let message = self
                 .messages
                 .as_ref()
                 .expect("receiver exists")
-                .recv_timeout(remaining)
-                .map_err(|_| {
-                    let detail = String::from_utf8_lossy(&self.stderr.lock().unwrap())
-                        .trim()
-                        .to_owned();
-                    protocol(if detail.is_empty() {
-                        "app-server readiness timed out"
-                    } else {
-                        &detail
-                    })
-                })?;
+                .recv_timeout(wait);
+            let message = match message {
+                Ok(message) => message,
+                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {
+                    continue;
+                }
+                Err(_) => {
+                    return Err({
+                        let detail = String::from_utf8_lossy(&self.stderr.lock().unwrap())
+                            .trim()
+                            .to_owned();
+                        protocol(if detail.is_empty() {
+                            "app-server readiness timed out"
+                        } else {
+                            &detail
+                        })
+                    });
+                }
+            };
             if matches(&message) {
                 return Ok(message);
             }
@@ -259,6 +281,213 @@ pub struct NamingConversation {
     pub thread_id: String,
     /// Bounded plain user/assistant transcript; never persisted by this crate.
     pub transcript: String,
+}
+
+/// Stable pane/thread identity consumed by the background worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamingTarget {
+    /// Exact tmux pane identity.
+    pub pane_id: PaneId,
+    /// Exact Codex thread identifier exposed in the pane title.
+    pub thread_id: String,
+}
+
+impl NamingTarget {
+    /// Extracts a target only from the supported UUID thread-title shape.
+    #[must_use]
+    pub fn from_pane(pane: &Pane) -> Option<Self> {
+        let thread_id = pane.title.as_deref()?.trim();
+        if !looks_like_thread_id(thread_id) {
+            return None;
+        }
+        Some(Self {
+            pane_id: pane.id.clone(),
+            thread_id: thread_id.to_owned(),
+        })
+    }
+}
+
+/// Provider seam used by the asynchronous naming worker.
+pub trait ConversationNamer: Send + 'static {
+    /// Reads bounded completed conversation content.
+    fn read(&mut self, thread_id: &str) -> Result<NamingConversation>;
+    /// Generates one validated title.
+    fn name(&mut self, conversation: &NamingConversation) -> Result<String>;
+}
+
+impl<S: AppServerSession + Send + 'static> ConversationNamer for AppServerNamer<S> {
+    fn read(&mut self, thread_id: &str) -> Result<NamingConversation> {
+        self.read_completed(thread_id)
+    }
+
+    fn name(&mut self, conversation: &NamingConversation) -> Result<String> {
+        self.generate_name(conversation)
+    }
+}
+
+/// A generated title bound to the source thread to prevent pane-ID reuse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedName {
+    /// Source Codex thread identity.
+    pub thread_id: String,
+    /// Validated generated title.
+    pub name: String,
+}
+
+/// In-memory generated names published by the worker; conversation text is never stored here.
+pub type GeneratedNames = Arc<Mutex<HashMap<PaneId, GeneratedName>>>;
+
+/// One bounded serial background naming lane with clean stop/join semantics.
+pub struct NamingWorker {
+    stop: Option<Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    names: GeneratedNames,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl NamingWorker {
+    /// Starts a worker that continuously discovers existing and future targets.
+    pub fn spawn<N, F, D>(start_namer: F, mut discover: D, poll_interval: Duration) -> Self
+    where
+        N: ConversationNamer,
+        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
+    {
+        let (stop, stopped) = mpsc::channel();
+        let names: GeneratedNames = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let published = names.clone();
+        let thread = thread::spawn(move || {
+            let Ok(mut namer) = start_namer(worker_cancelled.clone()) else {
+                return;
+            };
+            let mut cache = HashMap::<String, (u64, String)>::new();
+            loop {
+                if stopped.try_recv().is_ok() {
+                    break;
+                }
+                let Ok(targets) = discover() else {
+                    if stopped.recv_timeout(poll_interval).is_ok() {
+                        break;
+                    }
+                    continue;
+                };
+                published.lock().unwrap().retain(|pane_id, generated| {
+                    targets.iter().any(|target| {
+                        &target.pane_id == pane_id && target.thread_id == generated.thread_id
+                    })
+                });
+                let mut by_thread = HashMap::<String, Vec<PaneId>>::new();
+                for target in targets {
+                    by_thread
+                        .entry(target.thread_id)
+                        .or_default()
+                        .push(target.pane_id);
+                }
+                for (thread_id, pane_ids) in by_thread {
+                    if stopped.try_recv().is_ok() {
+                        return;
+                    }
+                    let Ok(conversation) = namer.read(&thread_id) else {
+                        continue;
+                    };
+                    let fingerprint = transcript_fingerprint(&conversation.transcript);
+                    let name = if let Some((cached, name)) = cache.get(&thread_id) {
+                        if *cached == fingerprint {
+                            name.clone()
+                        } else {
+                            let Ok(name) = namer.name(&conversation) else {
+                                continue;
+                            };
+                            cache.insert(thread_id.clone(), (fingerprint, name.clone()));
+                            name
+                        }
+                    } else {
+                        let Ok(name) = namer.name(&conversation) else {
+                            continue;
+                        };
+                        cache.insert(thread_id.clone(), (fingerprint, name.clone()));
+                        name
+                    };
+                    let current = discover().unwrap_or_default();
+                    let mut published = published.lock().unwrap();
+                    for pane_id in pane_ids {
+                        if current.iter().any(|target| {
+                            target.pane_id == pane_id && target.thread_id == thread_id
+                        }) {
+                            published.insert(
+                                pane_id,
+                                GeneratedName {
+                                    thread_id: thread_id.clone(),
+                                    name: name.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                if stopped.recv_timeout(poll_interval).is_ok() {
+                    break;
+                }
+            }
+        });
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+            names,
+            cancelled,
+        }
+    }
+
+    /// Returns the shared generated-name snapshot.
+    #[must_use]
+    pub fn names(&self) -> GeneratedNames {
+        self.names.clone()
+    }
+
+    /// Reports whether the worker lane ended, including provider startup failure.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Stops and joins the worker before returning.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for NamingWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn transcript_fingerprint(transcript: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    transcript.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn looks_like_thread_id(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(index, character)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                character == '-'
+            } else {
+                character.is_ascii_hexdigit()
+            }
+        })
 }
 
 /// Reads completed turns and asks an ephemeral Luna thread for a short title.

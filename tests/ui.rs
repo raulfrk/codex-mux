@@ -241,6 +241,7 @@ fn configuration_panel_explains_and_toggles_smart_naming() {
         app.handle_key(key(KeyCode::Char('N'))),
         Some(Action::PersistSmartNaming(true))
     );
+    app.smart_naming_saved(true);
     assert!(app.smart_naming_enabled());
 }
 
@@ -278,13 +279,13 @@ fn naming_persistence_failure_rolls_back_and_success_clears_its_warning() {
         app.handle_key(key(KeyCode::Char('n'))),
         Some(Action::PersistSmartNaming(true))
     );
-    app.smart_naming_save_failed(true, "disk full");
+    app.smart_naming_save_failed("disk full");
     assert!(!app.smart_naming_enabled());
     assert_eq!(
         app.handle_key(key(KeyCode::Char('n'))),
         Some(Action::PersistSmartNaming(true))
     );
-    app.smart_naming_saved();
+    app.smart_naming_saved(true);
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(frame, &app)).unwrap();

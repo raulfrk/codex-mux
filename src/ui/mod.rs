@@ -149,6 +149,7 @@ pub struct App {
     profiles: Vec<LaunchProfile>,
     smart_naming: bool,
     naming_save_warning: bool,
+    smart_naming_pending: bool,
 }
 
 impl App {
@@ -212,6 +213,7 @@ impl App {
             profiles,
             smart_naming,
             naming_save_warning: false,
+            smart_naming_pending: false,
         }
     }
 
@@ -222,14 +224,16 @@ impl App {
     }
 
     /// Restores the prior value after persistence fails.
-    pub fn smart_naming_save_failed(&mut self, enabled: bool, error: impl Into<String>) {
-        self.smart_naming = !enabled;
+    pub fn smart_naming_save_failed(&mut self, error: impl Into<String>) {
         self.warning = Some(error.into());
         self.naming_save_warning = true;
+        self.smart_naming_pending = false;
     }
 
     /// Confirms persistence and clears only a prior naming-save warning.
-    pub fn smart_naming_saved(&mut self) {
+    pub fn smart_naming_saved(&mut self, enabled: bool) {
+        self.smart_naming = enabled;
+        self.smart_naming_pending = false;
         if self.naming_save_warning {
             self.warning = None;
             self.naming_save_warning = false;
@@ -239,6 +243,12 @@ impl App {
     /// Reports a non-blocking provider startup failure while retaining opt-in.
     pub fn smart_naming_runtime_failed(&mut self, error: impl Into<String>) {
         self.warning = Some(error.into());
+        self.smart_naming_pending = false;
+    }
+
+    /// Keeps the prior visible state while a daemon shutdown is acknowledged.
+    pub fn smart_naming_stopping(&mut self) {
+        self.smart_naming_pending = true;
     }
 
     /// Returns the active launch profiles.
@@ -364,10 +374,8 @@ impl App {
 
     fn handle_configuration_key(&mut self, code: KeyCode) -> Option<Action> {
         match code {
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.smart_naming = !self.smart_naming;
-                Some(Action::PersistSmartNaming(self.smart_naming))
-            }
+            KeyCode::Char('n') | KeyCode::Char('N') => (!self.smart_naming_pending)
+                .then_some(Action::PersistSmartNaming(!self.smart_naming)),
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = Mode::Browse;
                 None
@@ -863,7 +871,9 @@ fn render_configuration(frame: &mut Frame<'_>, area: Rect, app: &App, palette: T
         if constrained { 8 } else { 12 },
     );
     frame.render_widget(Clear, popup);
-    let state = if app.smart_naming {
+    let state = if app.smart_naming_pending {
+        "STOPPING"
+    } else if app.smart_naming {
         "ON"
     } else {
         "OFF (default)"

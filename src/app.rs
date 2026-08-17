@@ -1,11 +1,17 @@
 //! Runtime composition for the interactive popup and tmux management commands.
 
 use std::{
+    collections::hash_map::DefaultHasher,
     env,
     ffi::OsString,
-    fs, io,
+    fs,
+    fs::OpenOptions,
+    hash::{Hash, Hasher},
+    io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
     time::Duration,
 };
 
@@ -26,7 +32,7 @@ use crate::{
     },
     linux_process::LinuxProcessInspector,
     shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
-    smart_naming::{AppServerProcess, start_if_enabled},
+    smart_naming::{AppServerNamer, AppServerProcess, NamingTarget, NamingWorker},
     tmux::{
         actions::TmuxActions,
         inventory::PaneInventory,
@@ -46,6 +52,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Remove(arguments)) => run_remove(arguments),
         Some(Command::Tmux(tmux)) => run_tmux_command(tmux.command, codex_argument),
         Some(Command::SmartLeft) => run_smart_left(&cli, codex_argument),
+        Some(Command::SmartNamingWorker) => run_smart_naming_worker(codex_argument),
+        Some(Command::SmartNamingStart) => ensure_naming_daemon(&resolve_codex(codex_argument)?),
         None => run_interactive(cli, codex_argument),
     }
 }
@@ -355,18 +363,33 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
     app.select_pane(&context.pane_id);
     let runner = SystemTmuxRunner::default();
     let actions = TmuxActions::new(&runner, &codex);
-    let mut naming_process = match start_if_enabled(preference.smart_naming, || {
-        AppServerProcess::spawn(codex.as_path())
-    }) {
-        Ok(process) => process,
-        Err(error) => {
+    if preference.smart_naming {
+        if let Err(error) = ensure_naming_daemon(&codex) {
             app.smart_naming_runtime_failed(error.to_string());
-            None
         }
-    };
+    }
+    let (shutdown_sender, shutdown_receiver) = mpsc::channel::<Result<()>>();
+    let mut shutdown_pending = false;
 
     ui::terminal::with_terminal(io::stdout(), |terminal| {
         loop {
+            if shutdown_pending {
+                match shutdown_receiver.try_recv() {
+                    Ok(Ok(())) => {
+                        app.smart_naming_saved(false);
+                        shutdown_pending = false;
+                    }
+                    Ok(Err(error)) => {
+                        app.smart_naming_runtime_failed(error.to_string());
+                        shutdown_pending = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        app.smart_naming_runtime_failed("smart-naming shutdown channel closed");
+                        shutdown_pending = false;
+                    }
+                }
+            }
             terminal
                 .draw(|frame| ui::render(frame, &app))
                 .map_err(terminal_error)?;
@@ -414,18 +437,20 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                 },
                 Action::PersistSmartNaming(enabled) => {
                     match theme_store.save_smart_naming(enabled) {
-                        Err(error) => app.smart_naming_save_failed(enabled, error.to_string()),
+                        Err(error) => app.smart_naming_save_failed(error.to_string()),
                         Ok(()) => {
-                            app.smart_naming_saved();
-                            if enabled && naming_process.is_none() {
-                                match AppServerProcess::spawn(codex.as_path()) {
-                                    Ok(process) => naming_process = Some(process),
-                                    Err(error) => {
-                                        app.smart_naming_runtime_failed(error.to_string())
-                                    }
+                            if enabled {
+                                app.smart_naming_saved(true);
+                                if let Err(error) = ensure_naming_daemon(&codex) {
+                                    app.smart_naming_runtime_failed(error.to_string());
                                 }
-                            } else if !enabled {
-                                naming_process = None;
+                            } else {
+                                app.smart_naming_stopping();
+                                shutdown_pending = true;
+                                let sender = shutdown_sender.clone();
+                                thread::spawn(move || {
+                                    let _ = sender.send(wait_for_naming_daemon_stop());
+                                });
                             }
                         }
                     }
@@ -448,6 +473,159 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
             }
         }
     })
+}
+
+fn start_naming_worker(codex: &CodexExecutable, executables: &[CodexExecutable]) -> NamingWorker {
+    let codex_path = codex.as_path().to_owned();
+    let inspector = LinuxProcessInspector::with_executables(codex.clone(), executables.to_vec());
+    let inventory = PaneInventory::with_executables(
+        SystemTmuxRunner::default(),
+        inspector,
+        executables.to_vec(),
+    );
+    NamingWorker::spawn(
+        move |cancelled| {
+            AppServerProcess::spawn_with_cancel(&codex_path, cancelled).map(AppServerNamer::new)
+        },
+        move || {
+            inventory
+                .discover()
+                .map(|panes| panes.iter().filter_map(NamingTarget::from_pane).collect())
+        },
+        Duration::from_secs(2),
+    )
+}
+
+fn run_smart_naming_worker(codex_argument: Option<PathBuf>) -> Result<()> {
+    let Some(_lock) = try_naming_daemon_lock()? else {
+        return Ok(());
+    };
+    let store = XdgThemeStore::discover()?;
+    let preference = store.load_preference();
+    if !preference.smart_naming {
+        return Ok(());
+    }
+    let codex = resolve_codex(codex_argument)?;
+    let mut executables = vec![codex.clone()];
+    for path in preference
+        .profiles
+        .iter()
+        .filter_map(|profile| profile.executable.clone())
+    {
+        let executable = CodexExecutable::new(path)?;
+        if !executables.contains(&executable) {
+            executables.push(executable);
+        }
+    }
+    let mut worker = start_naming_worker(&codex, &executables);
+    let identity = naming_server_identity_from_environment()?;
+    let mut retry = Duration::from_millis(100);
+    while store.load_preference().smart_naming && tmux_server_matches(&identity) {
+        if worker.is_finished() {
+            worker.stop();
+            if !wait_for_naming_retry(&store, &identity, retry) {
+                return Ok(());
+            }
+            retry = (retry * 2).min(Duration::from_secs(5));
+            worker = start_naming_worker(&codex, &executables);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    worker.stop();
+    Ok(())
+}
+
+fn wait_for_naming_retry(
+    store: &XdgThemeStore,
+    identity: &NamingServerIdentity,
+    duration: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        if !store.load_preference().smart_naming || !tmux_server_matches(identity) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+fn ensure_naming_daemon(codex: &CodexExecutable) -> Result<()> {
+    let executable = env::current_exe().map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("current executable"),
+        source,
+    })?;
+    let command = format!(
+        "exec {} --codex {} smart-naming-worker",
+        shell_word(&executable)?,
+        shell_word(codex.as_path())?
+    );
+    let output = SystemTmuxRunner::default().run(&[
+        OsString::from("run-shell"),
+        OsString::from("-b"),
+        OsString::from(command),
+    ])?;
+    if output.status == Some(0) {
+        Ok(())
+    } else {
+        Err(MuxError::Command(format!(
+            "tmux could not start smart-naming worker: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn wait_for_naming_daemon_stop() -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(lock) = try_naming_daemon_lock()? {
+            drop(lock);
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(MuxError::Command(
+                "smart-naming worker did not stop within 3 seconds".to_owned(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn try_naming_daemon_lock() -> Result<Option<fs::File>> {
+    let path = naming_daemon_lock_path()?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|source| MuxError::Filesystem {
+        path: path.clone(),
+        source,
+    })?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+        Err(source) => Err(MuxError::Filesystem {
+            path,
+            source: source.into(),
+        }),
+    }
+}
+
+fn naming_daemon_lock_path() -> Result<PathBuf> {
+    let server = naming_server_identity_from_environment()?;
+    let mut hasher = DefaultHasher::new();
+    server.hash(&mut hasher);
+    let root = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    Ok(root.join(format!("codex-mux-namer-{:016x}.lock", hasher.finish())))
 }
 
 fn selected_pane(app: &App) -> Option<&crate::domain::Pane> {
@@ -663,6 +841,93 @@ fn loaded_configs() -> Result<ServerEvidence> {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct NamingServerIdentity {
+    socket: PathBuf,
+    pid: u32,
+    socket_device: u64,
+    socket_inode: u64,
+    process_start_time: u64,
+}
+
+fn naming_server_identity_from_environment() -> Result<NamingServerIdentity> {
+    let value = env::var_os("TMUX")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| MuxError::InvalidValue {
+            field: "TMUX",
+            message: "is required for the smart-naming worker".to_owned(),
+        })?;
+    let (socket, pid) = parse_naming_server_identity(&value)?;
+    let metadata = fs::metadata(&socket).map_err(|source| MuxError::Filesystem {
+        path: socket.clone(),
+        source,
+    })?;
+    Ok(NamingServerIdentity {
+        socket,
+        pid,
+        socket_device: metadata.dev(),
+        socket_inode: metadata.ino(),
+        process_start_time: process_start_time(pid)?,
+    })
+}
+
+fn parse_naming_server_identity(value: &std::ffi::OsStr) -> Result<(PathBuf, u32)> {
+    let value = value.to_str().ok_or_else(|| MuxError::InvalidValue {
+        field: "TMUX",
+        message: "must be valid UTF-8".to_owned(),
+    })?;
+    let mut fields = value.rsplitn(3, ',');
+    let _client = fields.next();
+    let pid = fields
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| MuxError::InvalidValue {
+            field: "TMUX",
+            message: "must contain a positive server PID".to_owned(),
+        })?;
+    let socket = fields
+        .next()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| MuxError::InvalidValue {
+            field: "TMUX",
+            message: "must contain an absolute server socket".to_owned(),
+        })?;
+    Ok((socket, pid))
+}
+
+fn tmux_server_matches(expected: &NamingServerIdentity) -> bool {
+    fs::metadata(&expected.socket).is_ok_and(|metadata| {
+        metadata.dev() == expected.socket_device && metadata.ino() == expected.socket_inode
+    }) && process_start_time(expected.pid).ok() == Some(expected.process_start_time)
+}
+
+fn process_start_time(pid: u32) -> Result<u64> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = fs::read_to_string(&path).map_err(|source| MuxError::Filesystem {
+        path: path.clone(),
+        source,
+    })?;
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            MuxError::Command(format!(
+                "could not parse process start time from {}",
+                path.display()
+            ))
+        })
+}
+
+fn shell_word(path: &Path) -> Result<String> {
+    let path = path.to_str().ok_or_else(|| MuxError::InvalidValue {
+        field: "smart-naming executable path",
+        message: "must be valid UTF-8 for tmux run-shell".to_owned(),
+    })?;
+    Ok(format!("'{}'", path.replace('\'', "'\\''")))
+}
+
 struct SystemTmuxReloader {
     runner: SystemTmuxRunner,
     selected_is_loaded: bool,
@@ -787,7 +1052,7 @@ fn os_strings<const N: usize>(values: [&str; N]) -> Vec<OsString> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::invocation_context;
+    use super::{invocation_context, parse_naming_server_identity};
     use crate::cli::Cli;
 
     #[test]
@@ -805,5 +1070,18 @@ mod tests {
         assert!(invocation_context(&cli).is_err());
         cli.invoking_path = None;
         assert!(invocation_context(&cli).is_err());
+    }
+
+    #[test]
+    fn naming_identity_ignores_tmux_client_suffix() {
+        let first =
+            parse_naming_server_identity(std::ffi::OsStr::new("/tmp/tmux/socket,4321,0")).unwrap();
+        let second =
+            parse_naming_server_identity(std::ffi::OsStr::new("/tmp/tmux/socket,4321,9")).unwrap();
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            parse_naming_server_identity(std::ffi::OsStr::new("/tmp/tmux/socket,9876,0")).unwrap()
+        );
     }
 }
