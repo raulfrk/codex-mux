@@ -38,7 +38,7 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
         let states = String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| {
-                let fields = line.split(SEPARATOR).collect::<Vec<_>>();
+                let fields = split_state_fields(line);
                 (fields.len() == 8).then(|| (fields[0].to_owned(), fields[1..].join("\x1f")))
             })
             .collect::<HashMap<_, _>>();
@@ -174,6 +174,14 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
                 "tmux smart naming command failed".to_owned(),
             ))
         }
+    }
+}
+
+fn split_state_fields(line: &str) -> Vec<&str> {
+    if line.contains(SEPARATOR) {
+        line.split(SEPARATOR).collect()
+    } else {
+        line.split("\\037").collect()
     }
 }
 
@@ -363,6 +371,15 @@ mod tests {
     #[test]
     fn command_values_are_quoted_for_tmux_parser() {
         assert_eq!(tmux_quote("don't"), "'don'\\''t'");
+    }
+
+    #[test]
+    fn tmux_34_escaped_state_fields_are_supported() {
+        let state =
+            format!("%7\\037{THREAD}\\037default\\0371\\0371\\037\\037\\037/work/project\n");
+        let runner = FakeRunner::with_states(&[&state]);
+        OwnedTmuxNames::new(runner.clone()).reconcile(&names("Escaped fields"));
+        assert_eq!(calls(&runner).len(), 4);
     }
 
     #[test]
