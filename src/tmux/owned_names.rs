@@ -100,26 +100,22 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
             tmux_quote(&generated.name),
         );
         let source_cwd = generated.source_cwd.to_string_lossy();
-        self.run_arguments(
-            [
-                "set-option",
-                "-p",
-                "-t",
-                pane_id.as_str(),
-                SOURCE_TITLE_OPTION,
-                &generated.source_title,
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                pane_id.as_str(),
-                SOURCE_CWD_OPTION,
-                source_cwd.as_ref(),
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect(),
-        )?;
+        self.run([
+            "set-option",
+            "-p",
+            "-t",
+            pane_id.as_str(),
+            SOURCE_TITLE_OPTION,
+            &generated.source_title,
+        ])?;
+        self.run([
+            "set-option",
+            "-p",
+            "-t",
+            pane_id.as_str(),
+            SOURCE_CWD_OPTION,
+            source_cwd.as_ref(),
+        ])?;
         self.run([
             "if-shell",
             "-F",
@@ -280,7 +276,7 @@ mod tests {
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("Fast inventory"));
 
         let calls = calls(&runner);
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         let (_, mutation) = if_shell(&calls);
         assert!(mutation.contains("rename-window -t '%7' 'Fast inventory'"));
         assert!(mutation.contains("automatic-rename off"));
@@ -307,12 +303,12 @@ mod tests {
         OwnedTmuxNames::new(runner.clone()).reconcile(&generated);
 
         let calls = calls(&runner);
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         let (condition, mutation) = if_shell(&calls);
         assert!(condition.contains(SOURCE_TITLE_OPTION));
         assert!(!condition.contains(title));
         assert!(!condition.contains(cwd));
-        assert!(calls[1].iter().any(|argument| argument == cwd));
+        assert!(calls.iter().flatten().any(|argument| argument == cwd));
         assert!(mutation.contains(THREAD));
     }
 
@@ -379,7 +375,7 @@ mod tests {
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("Replacement thread"));
 
         let calls = calls(&runner);
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         let (_, mutation) = if_shell(&calls);
         assert!(mutation.contains("'Replacement thread'"));
         assert!(mutation.contains(THREAD));
@@ -395,7 +391,7 @@ mod tests {
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("Same title"));
 
         let calls = calls(&runner);
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(if_shell(&calls).1.contains(THREAD));
     }
 }
