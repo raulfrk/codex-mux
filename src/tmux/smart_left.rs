@@ -11,7 +11,8 @@ use crate::{
 const FIELD_SEPARATOR: char = '\u{1f}';
 const ESCAPED_FIELD_SEPARATOR: &str = "\\037";
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-const POLL_ATTEMPTS: usize = 12;
+// Retain several post-input observations while capping the nominal wait at 30 ms.
+const POLL_ATTEMPTS: usize = 6;
 
 /// Observable result of one Smart Left gesture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,11 +429,15 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Sleeper(Cell<usize>);
+    struct Sleeper {
+        calls: Cell<usize>,
+        elapsed: Cell<Duration>,
+    }
 
     impl ProbeSleeper for Sleeper {
-        fn sleep(&self, _duration: Duration) {
-            self.0.set(self.0.get() + 1);
+        fn sleep(&self, duration: Duration) {
+            self.calls.set(self.calls.get() + 1);
+            self.elapsed.set(self.elapsed.get() + duration);
         }
     }
 
@@ -533,7 +538,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, SmartLeftOutcome::Forwarded);
-        assert_eq!(sleeper.0.get(), 1);
+        assert_eq!(sleeper.calls.get(), 1);
         let calls = runner.calls.borrow();
         assert_eq!(
             calls.iter().filter(|call| call[0] == "send-keys").count(),
@@ -545,7 +550,7 @@ mod tests {
     #[test]
     fn unchanged_composer_boundary_opens_exact_client_popup() {
         let mut outputs = vec![state(2, 10, true, false), output([])];
-        outputs.extend((0..12).map(|_| state(2, 10, true, false)));
+        outputs.extend((0..6).map(|_| state(2, 10, true, false)));
         let mut screen = [""; 11];
         screen[10] = "› draft";
         outputs.push(output(format!("{}\n", screen.join("\n")).into_bytes()));
@@ -570,7 +575,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, SmartLeftOutcome::Opened);
-        assert_eq!(sleeper.0.get(), 12);
+        assert_eq!(sleeper.calls.get(), 6);
+        assert_eq!(sleeper.elapsed.get(), Duration::from_millis(30));
         let calls = runner.calls.borrow();
         assert_eq!(
             calls.iter().filter(|call| call[0] == "send-keys").count(),
@@ -590,7 +596,7 @@ mod tests {
     #[test]
     fn unchanged_marked_shell_boundary_opens_without_composer_glyph() {
         let mut outputs = vec![shell_state(0, 4, true), output([])];
-        outputs.extend((0..12).map(|_| shell_state(0, 4, true)));
+        outputs.extend((0..6).map(|_| shell_state(0, 4, true)));
         outputs.push(output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()));
         outputs.push(output([]));
         let runner = Runner::with(outputs);
@@ -645,7 +651,7 @@ mod tests {
     #[test]
     fn unchanged_cursor_outside_composer_fails_through() {
         let mut outputs = vec![state(2, 3, true, false), output([])];
-        outputs.extend((0..12).map(|_| state(2, 3, true, false)));
+        outputs.extend((0..6).map(|_| state(2, 3, true, false)));
         outputs.push(output(b"picker\nrow\nselected\nnot a composer\n".to_vec()));
         let runner = Runner::with(outputs);
         let sleeper = Sleeper::default();
