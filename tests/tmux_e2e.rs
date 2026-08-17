@@ -89,6 +89,18 @@ fn smart_naming_targets_a_background_pane_format_context() {
             .trim(),
         "Background naming works"
     );
+    assert_eq!(
+        server
+            .checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                "target",
+                "#{automatic-rename}"
+            ])
+            .trim(),
+        "0"
+    );
     assert_ne!(
         server
             .checked(&[

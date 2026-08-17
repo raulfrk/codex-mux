@@ -88,9 +88,10 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
         };
 
         let mutation = format!(
-            "rename-window -t {} {}; set-option -w -t {} {} {}; set-option -w -t {} {} {}",
+            "rename-window -t {} {}; set-option -w -t {} automatic-rename off; set-option -w -t {} {} {}; set-option -w -t {} {} {}",
             tmux_quote(pane_id.as_str()),
             tmux_quote(&generated.name),
+            tmux_quote(pane_id.as_str()),
             tmux_quote(pane_id.as_str()),
             THREAD_OPTION,
             tmux_quote(&generated.thread_id),
@@ -282,6 +283,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         let (_, mutation) = if_shell(&calls);
         assert!(mutation.contains("rename-window -t '%7' 'Fast inventory'"));
+        assert!(mutation.contains("automatic-rename off"));
         assert!(mutation.contains(THREAD_OPTION));
         assert!(mutation.contains(OWNER_OPTION));
     }
