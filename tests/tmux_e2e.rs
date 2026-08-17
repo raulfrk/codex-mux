@@ -841,8 +841,12 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
         return;
     }
 
-    for (key, expected_tail) in [(b'n', ""), (b'r', "arg2=resume\narg3=--all\n")] {
-        let fixture = RuntimeFixture::new(if key == b'n' { "new" } else { "resume" });
+    for (keys, label, expected_tail) in [
+        (&b"ns"[..], "new", ""),
+        (&b"ny"[..], "yolo", "arg2=--yolo\n"),
+        (&b"r"[..], "resume", "arg2=resume\narg3=--all\n"),
+    ] {
+        let fixture = RuntimeFixture::new(label);
         let selected_dir = fixture.scratch.join("selected-cwd");
         fs::create_dir(&selected_dir).unwrap();
         fixture.new_agent("remote", &selected_dir, "existing");
@@ -858,7 +862,7 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
 
         let mut popup = fixture.interactive(&client_tty);
         thread::sleep(Duration::from_millis(200));
-        popup.send(&[key]);
+        popup.send(keys);
         popup.wait_for_exit();
         let log = support::wait_for_file(&fixture.log);
         assert!(
@@ -873,7 +877,7 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
             log.contains(expected_tail),
             "launch omitted expected direct arguments {expected_tail:?}: {log}"
         );
-        if key == b'n' {
+        if label == "new" {
             assert!(
                 !log.contains("resume"),
                 "new action unexpectedly resumed: {log}"

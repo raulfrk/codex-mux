@@ -19,6 +19,7 @@ use crate::{
 pub struct LinuxProcessInspector {
     proc_root: PathBuf,
     codex: CodexExecutable,
+    recognized: Vec<CodexExecutable>,
 }
 
 impl LinuxProcessInspector {
@@ -33,7 +34,28 @@ impl LinuxProcessInspector {
     pub fn with_proc_root(codex: CodexExecutable, proc_root: impl Into<PathBuf>) -> Self {
         Self {
             proc_root: proc_root.into(),
+            recognized: vec![codex.clone()],
             codex,
+        }
+    }
+
+    /// Creates a host inspector that recognizes the primary and profile binaries.
+    #[must_use]
+    pub fn with_executables(codex: CodexExecutable, recognized: Vec<CodexExecutable>) -> Self {
+        Self::with_proc_root_and_executables(codex, recognized, "/proc")
+    }
+
+    /// Creates a multi-executable inspector with an alternate procfs root for tests.
+    #[must_use]
+    pub fn with_proc_root_and_executables(
+        codex: CodexExecutable,
+        recognized: Vec<CodexExecutable>,
+        proc_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            proc_root: proc_root.into(),
+            codex,
+            recognized,
         }
     }
 
@@ -133,8 +155,8 @@ impl LinuxProcessInspector {
             Some(process) => process,
             None => return Ok(None),
         };
-        if self.is_exact_configured_executable(&pane) {
-            return Ok(Some(self.codex.as_path().to_owned()));
+        if let Some(executable) = self.exact_recognized_match(&pane) {
+            return Ok(Some(executable.as_path().to_owned()));
         }
         if pane.tty_nr == 0 || pane.tpgid <= 0 {
             return Ok(None);
@@ -167,8 +189,8 @@ impl LinuxProcessInspector {
         // This covers an `exec`-style rename and wrappers whose argv retains the
         // configured absolute launcher path.
         for candidate in &candidates {
-            if self.is_configured(candidate) {
-                return Ok(Some(self.codex.as_path().to_owned()));
+            if let Some(executable) = self.recognized_match(candidate) {
+                return Ok(Some(executable.as_path().to_owned()));
             }
         }
 
@@ -180,16 +202,24 @@ impl LinuxProcessInspector {
             .and_then(|process| process.executable.clone()))
     }
 
-    fn is_configured(&self, process: &ProcessEvidence) -> bool {
-        if self.is_exact_configured_executable(process) {
-            return true;
-        }
+    fn recognized_match(&self, process: &ProcessEvidence) -> Option<&CodexExecutable> {
+        self.recognized.iter().find(|executable| {
+            process
+                .executable
+                .as_deref()
+                .is_some_and(|path| same_file(path, executable.as_path()))
+                || (process.executable.as_deref().is_some_and(is_wrapper)
+                    && process.arguments.get(1).is_some_and(|argument| {
+                        same_file(Path::new(argument), executable.as_path())
+                    }))
+        })
+    }
 
-        process.executable.as_deref().is_some_and(is_wrapper)
-            && process
-                .arguments
-                .get(1)
-                .is_some_and(|argument| same_file(Path::new(argument), self.codex.as_path()))
+    fn exact_recognized_match(&self, process: &ProcessEvidence) -> Option<&CodexExecutable> {
+        let actual = process.executable.as_deref()?;
+        self.recognized
+            .iter()
+            .find(|executable| same_file(actual, executable.as_path()))
     }
 
     fn is_exact_configured_executable(&self, process: &ProcessEvidence) -> bool {

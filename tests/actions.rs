@@ -169,6 +169,39 @@ fn new_session_uses_selected_cwd_and_direct_custom_executable_arguments() {
 }
 
 #[test]
+fn yolo_profile_uses_custom_executable_and_exact_direct_arguments() {
+    let runner = RecordingRunner::with_outputs([stdout("%94\n"), ok()]);
+    let configured = CodexExecutable::new("/configured/codex").unwrap();
+    let custom = CodexExecutable::new("/opt/custom codex").unwrap();
+    let actions = TmuxActions::new(&runner, &configured);
+    let context = context("/fallback");
+
+    actions
+        .new_session_with_profile(&context, None, &custom, true)
+        .unwrap();
+
+    assert_eq!(
+        runner.commands()[0],
+        args(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "$7",
+            "-c",
+            "/fallback",
+            "--",
+            "/opt/custom codex",
+            "-c",
+            TERMINAL_TITLE_CONFIG,
+            "--yolo",
+        ])
+    );
+}
+
+#[test]
 fn resume_uses_invoking_cwd_fallback_and_resume_all_exactly() {
     let runner = RecordingRunner::with_outputs([stdout("%92"), ok()]);
     let executable = CodexExecutable::new("/custom/bin/codex").unwrap();

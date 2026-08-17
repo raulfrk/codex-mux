@@ -529,9 +529,9 @@ fn packaged_new_resume_fallback_and_confirmed_close_cross_process_boundaries() {
     let Some(binary) = require_prerequisites() else {
         return;
     };
-    for (label, key, expected) in [
-        ("new", b'n', None),
-        ("resume", b'r', Some("arg2=resume\narg3=--all\n")),
+    for (label, keys, expected) in [
+        ("new", &b"ns"[..], None),
+        ("resume", &b"r"[..], Some("arg2=resume\narg3=--all\n")),
     ] {
         let fixture = Fixture::new(label);
         let fallback = fixture.scratch.join("invoking-fallback");
@@ -542,7 +542,7 @@ fn packaged_new_resume_fallback_and_confirmed_close_cross_process_boundaries() {
         let mut popup =
             fixture.popup_with_path(&binary, &tty, &fallback, (120, 40), &capture, None);
         popup.wait_text("codex-mux");
-        popup.send(&[key]);
+        popup.send(keys);
         assert!(popup.wait_exit().success());
         let log = wait_file(&fixture.log, "cwd=");
         assert!(

@@ -100,7 +100,10 @@ Press your normal tmux prefix, then the configured key. For example, with tmux's
 | --- | --- |
 | `j` / `Down`, `k` / `Up` | Move selection |
 | `Enter` | Open the selected Codex pane and make its window full-screen |
-| `n` | Start a new Codex session in the selected pane's directory, or the invoking directory when nothing is selected |
+| `n` | Open the launch-profile picker for a new Codex session |
+| profile key (default `s` or `y`) | Immediately start that profile; `s` is standard and `y` adds Codex's `--yolo` flag |
+| `j` / `Down`, `k` / `Up`, then `Enter` in profile picker | Choose and start a profile |
+| `a` / `e` in profile picker | Add a profile or edit the selected profile |
 | `r` | Start `codex resume --all` with the same directory rule |
 | `x` | Ask to close the selected pane |
 | second fresh `x` or `Enter` | Confirm close |
@@ -122,7 +125,7 @@ When the invoking client is narrower than 90 columns or shorter than 28 rows, th
 
 ### Themes and color
 
-The built-in themes are adaptive cyan, blue command palette, amber operator, ember orange, and monochrome. A saved selection lives at `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml` with user-only file permissions. Setting a non-empty `NO_COLOR` uses monochrome for that invocation without overwriting the saved preference.
+The built-in themes are adaptive cyan, blue command palette, amber operator, ember orange, and monochrome. The profile picker and editor use the active theme too. The saved theme and launch profiles live at `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml` with user-only file permissions. Existing theme-only files remain valid and receive the default Standard (`s`) and YOLO (`y`) profiles. A profile may override Codex with an absolute executable path; otherwise it uses the configured Codex binary. Setting a non-empty `NO_COLOR` uses monochrome for that invocation without overwriting the saved preference.
 
 ## Inspect or remove configuration
 
@@ -159,7 +162,7 @@ codex-mux tmux uninstall --config "$HOME/.tmux.conf"
 
 ## Security and privacy
 
-See [SECURITY.md](SECURITY.md). In short, configuration values are validated and passed as argument vectors where possible, the installer refuses unsafe config paths, and close/switch actions use exact tmux targets. `codex-mux` stores only a theme name. It does not store prompts, transcripts, Codex session metadata, credentials, or private Codex files.
+See [SECURITY.md](SECURITY.md). In short, configuration values are validated and passed as argument vectors where possible, the installer refuses unsafe config paths, and close/switch actions use exact tmux targets. `codex-mux` stores only its theme and launch-profile settings. It does not store prompts, transcripts, Codex session metadata, credentials, or private Codex files.
 
 ## Verify from source
 

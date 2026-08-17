@@ -14,6 +14,7 @@ use ratatui::{
 };
 
 use crate::{
+    config::{LaunchProfile, PermissionPreset, validate_profiles},
     domain::{Pane, PaneId, TerminalSize, ThemeId},
     theme::{Theme, theme},
 };
@@ -52,6 +53,10 @@ pub enum Action {
     Activate(PaneId),
     /// Start a new Codex session.
     New,
+    /// Start a new session using the selected reusable profile.
+    LaunchProfile(LaunchProfile),
+    /// Persist a complete replacement profile set.
+    PersistProfiles(Vec<LaunchProfile>),
     /// Start Codex with its resume subcommand.
     Resume,
     /// Close the pane after explicit confirmation.
@@ -77,6 +82,56 @@ enum Mode {
     Browse,
     ConfirmClose(PaneId),
     ThemePicker { original: ThemeId },
+    ProfilePicker { selected: usize },
+    ProfileEditor(ProfileEditor),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorField {
+    Name,
+    Key,
+    Executable,
+    Permissions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProfileEditor {
+    original: Option<usize>,
+    name: String,
+    key: String,
+    executable: String,
+    permissions: PermissionPreset,
+    field: EditorField,
+    error: Option<String>,
+}
+
+impl ProfileEditor {
+    fn create() -> Self {
+        Self {
+            original: None,
+            name: String::new(),
+            key: String::new(),
+            executable: String::new(),
+            permissions: PermissionPreset::Standard,
+            field: EditorField::Name,
+            error: None,
+        }
+    }
+
+    fn edit(index: usize, profile: &LaunchProfile) -> Self {
+        Self {
+            original: Some(index),
+            name: profile.name.clone(),
+            key: profile.key.to_string(),
+            executable: profile
+                .executable
+                .as_ref()
+                .map_or_else(String::new, |path| path.display().to_string()),
+            permissions: profile.permissions,
+            field: EditorField::Name,
+            error: None,
+        }
+    }
 }
 
 /// Complete renderer-independent UI state.
@@ -88,6 +143,7 @@ pub struct App {
     color_policy: ColorPolicy,
     mode: Mode,
     warning: Option<String>,
+    profiles: Vec<LaunchProfile>,
 }
 
 impl App {
@@ -105,6 +161,24 @@ impl App {
         warning: Option<String>,
         color_policy: ColorPolicy,
     ) -> Self {
+        Self::with_profiles(
+            panes,
+            theme,
+            warning,
+            color_policy,
+            vec![LaunchProfile::standard(), LaunchProfile::yolo()],
+        )
+    }
+
+    /// Creates application state with an explicit persisted profile set.
+    #[must_use]
+    pub fn with_profiles(
+        panes: Vec<Pane>,
+        theme: ThemeId,
+        warning: Option<String>,
+        color_policy: ColorPolicy,
+        profiles: Vec<LaunchProfile>,
+    ) -> Self {
         let selected = panes.first().map(|pane| pane.id.clone());
         Self {
             panes,
@@ -117,6 +191,32 @@ impl App {
             color_policy,
             mode: Mode::Browse,
             warning,
+            profiles,
+        }
+    }
+
+    /// Returns the active launch profiles.
+    #[must_use]
+    pub fn profiles(&self) -> &[LaunchProfile] {
+        &self.profiles
+    }
+
+    /// Completes a successful profile save and returns to the picker.
+    pub fn profiles_saved(&mut self, profiles: Vec<LaunchProfile>) {
+        let selected = match &self.mode {
+            Mode::ProfileEditor(editor) => {
+                editor.original.unwrap_or(profiles.len().saturating_sub(1))
+            }
+            _ => 0,
+        };
+        self.profiles = profiles;
+        self.mode = Mode::ProfilePicker { selected };
+    }
+
+    /// Keeps the editor open and displays a persistence or validation failure.
+    pub fn profile_save_failed(&mut self, error: impl Into<String>) {
+        if let Mode::ProfileEditor(editor) = &mut self.mode {
+            editor.error = Some(error.into());
         }
     }
 
@@ -171,6 +271,8 @@ impl App {
             Mode::Browse => self.handle_browse_key(key.code),
             Mode::ConfirmClose(id) => self.handle_confirmation_key(key, id),
             Mode::ThemePicker { original } => self.handle_theme_key(key.code, original),
+            Mode::ProfilePicker { selected } => self.handle_profile_key(key.code, selected),
+            Mode::ProfileEditor(editor) => self.handle_editor_key(key.code, editor),
         }
     }
 
@@ -185,7 +287,10 @@ impl App {
                 None
             }
             KeyCode::Enter => self.selected.clone().map(Action::Activate),
-            KeyCode::Char('n') => Some(Action::New),
+            KeyCode::Char('n') => {
+                self.mode = Mode::ProfilePicker { selected: 0 };
+                None
+            }
             KeyCode::Char('r') => Some(Action::Resume),
             KeyCode::Char('x') => {
                 if let Some(id) = self.selected.clone() {
@@ -246,6 +351,116 @@ impl App {
         }
     }
 
+    fn handle_profile_key(&mut self, code: KeyCode, selected: usize) -> Option<Action> {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                let next = selected
+                    .saturating_add(1)
+                    .min(self.profiles.len().saturating_sub(1));
+                self.mode = Mode::ProfilePicker { selected: next };
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.mode = Mode::ProfilePicker {
+                    selected: selected.saturating_sub(1),
+                };
+                None
+            }
+            KeyCode::Enter => self
+                .profiles
+                .get(selected)
+                .cloned()
+                .map(Action::LaunchProfile),
+            KeyCode::Char('a') => {
+                self.mode = Mode::ProfileEditor(ProfileEditor::create());
+                None
+            }
+            KeyCode::Char('e') => {
+                let profile = self.profiles.get(selected)?.clone();
+                self.mode = Mode::ProfileEditor(ProfileEditor::edit(selected, &profile));
+                None
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Browse;
+                None
+            }
+            KeyCode::Char(key) => self
+                .profiles
+                .iter()
+                .find(|profile| profile.key.eq_ignore_ascii_case(&key))
+                .cloned()
+                .map(Action::LaunchProfile),
+            _ => None,
+        }
+    }
+
+    fn handle_editor_key(&mut self, code: KeyCode, mut editor: ProfileEditor) -> Option<Action> {
+        editor.error = None;
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::ProfilePicker {
+                    selected: editor.original.unwrap_or(0),
+                };
+                return None;
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                editor.field = next_editor_field(editor.field, 1);
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                editor.field = next_editor_field(editor.field, -1);
+            }
+            KeyCode::Left | KeyCode::Right if editor.field == EditorField::Permissions => {
+                editor.permissions = match editor.permissions {
+                    PermissionPreset::Standard => PermissionPreset::Yolo,
+                    PermissionPreset::Yolo => PermissionPreset::Standard,
+                };
+            }
+            KeyCode::Backspace => match editor.field {
+                EditorField::Name => {
+                    editor.name.pop();
+                }
+                EditorField::Key => {
+                    editor.key.pop();
+                }
+                EditorField::Executable => {
+                    editor.executable.pop();
+                }
+                EditorField::Permissions => {}
+            },
+            KeyCode::Char(character) => match editor.field {
+                EditorField::Name => editor.name.push(character),
+                EditorField::Key if editor.key.is_empty() => editor.key.push(character),
+                EditorField::Executable => editor.executable.push(character),
+                EditorField::Key | EditorField::Permissions => {}
+            },
+            KeyCode::Enter => {
+                let key = editor.key.chars().next().unwrap_or('\0');
+                let profile = LaunchProfile {
+                    name: editor.name.trim().to_owned(),
+                    key,
+                    executable: (!editor.executable.trim().is_empty())
+                        .then(|| std::path::PathBuf::from(editor.executable.trim())),
+                    permissions: editor.permissions,
+                };
+                let mut profiles = self.profiles.clone();
+                if let Some(index) = editor.original {
+                    profiles[index] = profile;
+                } else {
+                    profiles.push(profile);
+                }
+                if let Err(error) = validate_profiles(&profiles) {
+                    editor.error = Some(error.to_string());
+                } else {
+                    self.mode = Mode::ProfileEditor(editor);
+                    return Some(Action::PersistProfiles(profiles));
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::ProfileEditor(editor);
+        None
+    }
+
     fn selected_index(&self) -> Option<usize> {
         let selected = self.selected.as_ref()?;
         self.panes.iter().position(|pane| &pane.id == selected)
@@ -297,6 +512,27 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     if matches!(app.mode, Mode::ThemePicker { .. }) {
         render_theme_picker(frame, area, app, palette);
     }
+    match &app.mode {
+        Mode::ProfilePicker { selected } => {
+            render_profile_picker(frame, area, app, palette, *selected);
+        }
+        Mode::ProfileEditor(editor) => render_profile_editor(frame, area, editor, palette),
+        _ => {}
+    }
+}
+
+fn next_editor_field(field: EditorField, delta: isize) -> EditorField {
+    let fields = [
+        EditorField::Name,
+        EditorField::Key,
+        EditorField::Executable,
+        EditorField::Permissions,
+    ];
+    let current = fields
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap_or(0);
+    fields[(current as isize + delta).rem_euclid(fields.len() as isize) as usize]
 }
 
 fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
@@ -406,6 +642,125 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, sin
         .highlight_symbol("› ")
         .block(Block::default().title(" sessions "));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_profile_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    palette: Theme,
+    selected: usize,
+) {
+    let height = (app.profiles.len() as u16 + 4).min(area.height).max(5);
+    let popup = centered_rect(area, if area.width <= 62 { 96 } else { 72 }, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" launch profile ")
+        .borders(Borders::ALL)
+        .border_style(palette.accent);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let items = app.profiles.iter().enumerate().map(|(index, profile)| {
+        let executable = profile
+            .executable
+            .as_ref()
+            .map_or("configured codex".to_owned(), |path| {
+                sanitized(&path.display().to_string())
+            });
+        let permissions = match profile.permissions {
+            PermissionPreset::Standard => "standard",
+            PermissionPreset::Yolo => "YOLO",
+        };
+        let style = if index == selected {
+            palette.selected
+        } else {
+            palette.text
+        };
+        ListItem::new(Line::styled(
+            format!(
+                " {}  {:<16}  {} · {}",
+                profile.key,
+                sanitized(&profile.name),
+                executable,
+                permissions
+            ),
+            style,
+        ))
+    });
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(List::new(items), chunks[0], &mut state);
+    frame.render_widget(
+        Paragraph::new("key launch · ↑/↓ · Enter · a add · e edit · Esc").style(palette.muted),
+        chunks[1],
+    );
+}
+
+fn render_profile_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    editor: &ProfileEditor,
+    palette: Theme,
+) {
+    let popup = centered_rect(
+        area,
+        if area.width <= 62 { 96 } else { 72 },
+        11.min(area.height),
+    );
+    frame.render_widget(Clear, popup);
+    let field = |label: &str, value: String, candidate: EditorField| {
+        let style = if editor.field == candidate {
+            palette.selected
+        } else {
+            palette.text
+        };
+        Line::styled(format!(" {label:<12} {value}"), style)
+    };
+    let mut lines = vec![
+        field("Name", sanitized(&editor.name), EditorField::Name),
+        field("Key", editor.key.clone(), EditorField::Key),
+        field(
+            "Binary",
+            if editor.executable.is_empty() {
+                "configured codex".to_owned()
+            } else {
+                sanitized(&editor.executable)
+            },
+            EditorField::Executable,
+        ),
+        field(
+            "Permissions",
+            match editor.permissions {
+                PermissionPreset::Standard => "standard".to_owned(),
+                PermissionPreset::Yolo => "YOLO".to_owned(),
+            },
+            EditorField::Permissions,
+        ),
+        Line::default(),
+    ];
+    if let Some(error) = &editor.error {
+        lines.push(Line::styled(sanitized(error), palette.warning));
+    } else {
+        lines.push(Line::styled(
+            "Tab/↑↓ field · ←/→ permissions · Enter save · Esc cancel",
+            palette.muted,
+        ));
+    }
+    let title = if editor.original.is_some() {
+        " edit profile "
+    } else {
+        " add profile "
+    };
+    let form = Paragraph::new(lines).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(palette.accent),
+    );
+    frame.render_widget(form, popup);
 }
 
 fn render_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
