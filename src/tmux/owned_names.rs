@@ -268,7 +268,7 @@ mod tests {
         let calls = calls(&runner);
         assert_eq!(calls.len(), 2);
         assert!(calls[1][3].contains("'Replacement thread'"));
-        assert!(calls[1][3].contains(&format!("{THREAD}")));
+        assert!(calls[1][3].contains(THREAD));
     }
 
     #[test]
@@ -281,6 +281,6 @@ mod tests {
 
         let calls = calls(&runner);
         assert_eq!(calls.len(), 2);
-        assert!(calls[1][3].contains(&format!("{THREAD}")));
+        assert!(calls[1][3].contains(THREAD));
     }
 }

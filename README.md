@@ -2,7 +2,7 @@
 
 `codex-mux` is a tmux-native agent view for Codex. Press one tmux prefix binding to open a responsive popup, see Codex processes across the current tmux server, switch to one, start a new session, resume an existing thread, or close a pane deliberately.
 
-It talks to public tmux commands and Linux `/proc`. It does not use the Codex app server, read Codex private session files, or require a shell framework. Setforge may install a released binary in the future, but `codex-mux` has no Setforge runtime dependency and Setforge does not own its tmux or theme configuration.
+Its core discovery and control path talks to public tmux commands and Linux `/proc`; it does not read Codex private session files or require a shell framework. The optional Smart Naming feature uses the local Codex app-server protocol described below. Setforge may install a released binary in the future, but `codex-mux` has no Setforge runtime dependency and Setforge does not own its tmux or theme configuration.
 
 ## Quick start
 
@@ -109,6 +109,8 @@ Press your normal tmux prefix, then the configured key. For example, with tmux's
 | second fresh `x` or `Enter` | Confirm close |
 | `q` or `Esc` during confirmation | Cancel close |
 | `t` | Open and cycle the theme picker |
+| `c` | Open configuration |
+| `n` in configuration | Toggle conversation-aware Smart Naming |
 | `Enter` in theme picker | Save the previewed theme |
 | `q` or `Esc` in theme picker | Revert the preview |
 | `q` or `Esc` | Close the popup without changing tmux state |
@@ -126,6 +128,16 @@ When the invoking client is narrower than 90 columns or shorter than 28 rows, th
 ### Themes and color
 
 The built-in themes are adaptive cyan, blue command palette, amber operator, ember orange, and monochrome. The profile picker and editor use the active theme too. The saved theme and launch profiles live at `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml` with user-only file permissions. Existing theme-only files remain valid and receive the default Standard (`s`) and YOLO (`y`) profiles. A profile may override Codex with an absolute executable path; otherwise it uses the configured Codex binary. Setting a non-empty `NO_COLOR` uses monochrome for that invocation without overwriting the saved preference.
+
+### Conversation-aware Smart Naming
+
+Smart Naming is off by default. Open configuration with `c`, then press `n` to enable or disable it. The preference is saved atomically as `smart_naming` in the same config file; older files without that field remain valid and stay off. Enabling or disabling takes effect without restarting tmux, Codex sessions, or the popup. While shutdown is finishing, configuration shows `STOPPING` and prevents a second toggle.
+
+When enabled, one tmux-owned background worker discovers new, resumed, and already-running Codex threads. It asks the configured local `codex app-server` for bounded, completed conversation content and sends that excerpt through Codex to the exact `gpt-5.6-luna` model for a short structured title. Naming is asynchronous, serial, and refreshed only when completed conversation content changes, so popup discovery and input do not wait for the model. This can use your Codex account's model allowance and has the same network/data handling implications as other Codex model requests.
+
+`codex-mux` keeps only a bounded conversation excerpt in worker memory for the request and does not write prompts or transcripts to disk. It caches only a transcript fingerprint and generated title in memory, and stores the current generated thread/title as tmux window options. Disabling joins the worker and clears its in-memory state; it does not erase titles already visible in tmux.
+
+Generated names apply only to a single-pane window whose automatic name or existing codex-mux ownership can be proven. A manual `rename-window` wins: codex-mux releases its marker and does not overwrite that name. If app-server startup, protocol compatibility, model generation, or validation fails, existing panes and names continue working; the worker retries provider startup with bounded backoff and leaves the current/fallback title unchanged.
 
 ## Inspect or remove configuration
 
@@ -158,11 +170,12 @@ codex-mux tmux uninstall --config "$HOME/.tmux.conf"
 - **A phone shows a large layout:** make sure the binding was invoked by that phone's tmux client; the popup uses `client_width` and `client_height` from the invoking client.
 - **Colors are unreadable:** set `NO_COLOR=1` or select the monochrome theme.
 - **Another client saw the selected window change:** clients sharing one tmux session also share that session's active window and window zoom state. Attach the clients to separate sessions when independent views are required.
+- **Smart Naming stays off or a title does not update:** open configuration with `c` and confirm it shows `ON`. Completed conversation content is required. Provider or protocol failures leave the existing title unchanged and retry in the background; a manual tmux name is intentionally preserved.
 - **A command fails:** the popup restores the terminal before printing `codex-mux: ...` to standard error. No fallback action is attempted after an exact tmux command fails.
 
 ## Security and privacy
 
-See [SECURITY.md](SECURITY.md). In short, configuration values are validated and passed as argument vectors where possible, the installer refuses unsafe config paths, and close/switch actions use exact tmux targets. `codex-mux` stores only its theme and launch-profile settings. It does not store prompts, transcripts, Codex session metadata, credentials, or private Codex files.
+See [SECURITY.md](SECURITY.md). In short, configuration values are validated, the installer refuses unsafe config paths, and close/switch/name actions use exact tmux targets. Core operation does not access conversation data. The opt-in Smart Naming worker reads a bounded completed transcript through the local Codex app server and sends it to GPT-5.6 Luna in an ephemeral naming thread. Codex service handling follows the user's service configuration and policy; codex-mux itself does not persist the transcript or read private session files or credentials.
 
 ## Verify from source
 

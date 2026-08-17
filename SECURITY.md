@@ -14,14 +14,22 @@ Once the repository is hosted on GitHub, report vulnerabilities through its priv
 
 The project deliberately:
 
-- uses supported tmux commands instead of the Codex app server;
-- does not read Codex private session files, prompts, transcripts, credentials, or internal databases;
+- uses supported tmux commands for its core discovery and control path;
+- does not read Codex private session files, credentials, or internal databases;
 - discovers processes through Linux `/proc` and validates executable identity conservatively;
-- passes launch and targeting values as argument vectors rather than interpolating them through a shell;
+- passes launch and targeting values as argument vectors where possible, and validates plus quotes values at the required tmux command-parser or `run-shell` boundary;
 - manages only its uniquely marked tmux configuration block and refuses symlinks, ambiguous entrypoints, non-regular files, and non-owner-writable files;
 - requires a second fresh confirmation key before killing the selected pane;
-- stores only a theme identifier and validated launch profiles in `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml`, normally with mode `0600`; custom binaries must be absolute, regular executable files;
+- stores only a theme identifier, validated launch profiles, and the opt-in Smart Naming boolean in `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml`, normally with mode `0600`; custom binaries must be absolute, regular executable files;
 - has no Setforge runtime dependency and does not let Setforge manage tmux or theme configuration.
+
+## Optional Smart Naming data flow
+
+Conversation-aware Smart Naming is disabled by default and requires an explicit toggle in the popup configuration. When enabled, a tmux-owned local worker launches the configured `codex app-server`, requests bounded completed conversation content for the exact discovered thread, and submits that excerpt through Codex to the exact `gpt-5.6-luna` model for a structured short title. This is a model request: conversation content leaves the local process according to the user's Codex service configuration and may consume account allowance.
+
+The worker bounds app-server frames and transcript input, ignores in-progress turns, validates and bounds model output, and rejects stale pane/thread results before publication. `codex-mux` does not write transcripts to disk and drops its local excerpt after the request; the worker retains only an in-memory fingerprint/title cache. Naming runs in an ephemeral app-server thread. Conversation handling outside the local codex-mux process remains governed by the user's Codex service configuration and policy. Tmux stores generated thread and title ownership options so manual renames can be distinguished. Turning the feature off stops and joins the worker without requiring a tmux or Codex restart.
+
+Generated titles are applied only when the exact pane still carries the expected thread, its window has one pane, and either automatic rename is active or the visible name still matches codex-mux's ownership marker. The final check and mutation run as one tmux server-side conditional. A diverging manual name releases ownership and is not overwritten. Provider startup, protocol drift, malformed responses, validation failures, and network/model failures leave existing names and core popup behavior available.
 
 Tmux clients attached to the same session share that session's active window, and clients viewing the same window share its zoom state. Selecting or zooming through `codex-mux` can therefore be visible to those same-session clients. This is expected tmux behavior and should be considered when sharing a tmux server with another person.
 
