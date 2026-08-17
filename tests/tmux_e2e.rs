@@ -52,6 +52,15 @@ fn smart_naming_targets_a_background_pane_format_context() {
         .trim()
         .to_owned();
     let thread_id = "12345678-1234-1234-1234-123456789abc";
+    server.checked(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        &pane,
+        "-c",
+        path(scratch.path()),
+        "sleep 60",
+    ]);
     server.checked(&["select-pane", "-t", &pane, "-T", thread_id]);
     server.checked(&[
         "new-session",
