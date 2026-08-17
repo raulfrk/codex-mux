@@ -62,6 +62,10 @@ fn smart_naming_targets_a_background_pane_format_context() {
         "sleep 60",
     ]);
     server.checked(&["select-pane", "-t", &pane, "-T", thread_id]);
+    let source_title = server
+        .checked(&["display-message", "-p", "-t", &pane, "#{pane_title}"])
+        .trim()
+        .to_owned();
     server.checked(&[
         "new-session",
         "-d",
@@ -75,7 +79,7 @@ fn smart_naming_targets_a_background_pane_format_context() {
         PaneId::new(&pane).unwrap(),
         GeneratedName {
             thread_id: thread_id.to_owned(),
-            source_title: thread_id.to_owned(),
+            source_title,
             source_cwd: scratch.path().to_owned(),
             name: "Background naming works".to_owned(),
         },
