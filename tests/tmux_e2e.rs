@@ -66,6 +66,10 @@ fn smart_naming_targets_a_background_pane_format_context() {
         .checked(&["display-message", "-p", "-t", &pane, "#{pane_title}"])
         .trim()
         .to_owned();
+    let original_window_name = server
+        .checked(&["display-message", "-p", "-t", &pane, "#{window_name}"])
+        .trim()
+        .to_owned();
     server.checked(&[
         "new-session",
         "-d",
@@ -82,6 +86,7 @@ fn smart_naming_targets_a_background_pane_format_context() {
             source_title,
             source_cwd: scratch.path().to_owned(),
             name: "Background naming works".to_owned(),
+            generated_at_unix: 1_700_000_000,
         },
     )]);
     let owned = OwnedTmuxNames::new(SocketRunner(server.socket().to_owned()));
@@ -91,7 +96,7 @@ fn smart_naming_targets_a_background_pane_format_context() {
         server
             .checked(&["display-message", "-p", "-t", "target", "#{window_name}"])
             .trim(),
-        "Background naming works"
+        original_window_name
     );
     assert_eq!(
         server
@@ -103,7 +108,7 @@ fn smart_naming_targets_a_background_pane_format_context() {
                 "#{automatic-rename}"
             ])
             .trim(),
-        "0"
+        "1"
     );
     assert_ne!(
         server
@@ -117,21 +122,179 @@ fn smart_naming_targets_a_background_pane_format_context() {
             .trim(),
         "Background naming works"
     );
+    assert_eq!(
+        server
+            .checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                "foreground",
+                "#{automatic-rename}"
+            ])
+            .trim(),
+        "1"
+    );
 
     server.checked(&["rename-window", "-t", &pane, "Manual override"]);
     owned.reconcile(&names);
-    for (scope, option) in [
-        ("-wv", "@codex_mux_generated_thread"),
-        ("-wv", "@codex_mux_generated_name"),
-        ("-pv", "@codex_mux_generated_source_title"),
-        ("-pv", "@codex_mux_generated_source_cwd"),
+    for (option, expected) in [
+        ("@codex_mux_generated_thread", thread_id),
+        ("@codex_mux_generated_name", "Background naming works"),
+        ("@codex_mux_generated_source_title", thread_id),
+        ("@codex_mux_generated_source_cwd", path(scratch.path())),
+        ("@codex_mux_generated_at", "1700000000"),
     ] {
+        assert_eq!(
+            server
+                .checked(&["show-options", "-pv", "-t", &pane, option])
+                .trim(),
+            expected,
+            "pane-local metadata mismatch for {option}"
+        );
+    }
+}
+
+#[test]
+fn smart_naming_migrates_a_legacy_owned_window_in_real_tmux() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("legacy-smart-name");
+    let config = scratch.join("tmux.conf");
+    fs::write(
+        &config,
+        "set -g status off\nset -g automatic-rename on\nset -g automatic-rename-format '#{pane_current_command}'\n",
+    )
+    .unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    let thread_id = "12345678-1234-1234-1234-123456789abc";
+    server.checked(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        &pane,
+        "-c",
+        path(scratch.path()),
+        "sleep 60",
+    ]);
+    server.checked(&["select-pane", "-t", &pane, "-T", thread_id]);
+    for (scope, option, value) in [
+        ("-p", "@codex_mux_generated_source_title", thread_id),
+        (
+            "-p",
+            "@codex_mux_generated_source_cwd",
+            path(scratch.path()),
+        ),
+        ("-w", "@codex_mux_generated_thread", thread_id),
+        ("-w", "@codex_mux_generated_name", "Legacy smart title"),
+    ] {
+        server.checked(&["set-option", scope, "-t", &pane, option, value]);
+    }
+    server.checked(&["rename-window", "-t", &pane, "Legacy smart title"]);
+    server.checked(&["set-option", "-w", "-t", &pane, "automatic-rename", "off"]);
+
+    OwnedTmuxNames::new(SocketRunner(server.socket().to_owned()))
+        .migrate_legacy_window_names(1_700_000_000);
+
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", &pane, "#{automatic-rename}"])
+            .trim(),
+        "1"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let name = server
+            .checked(&["display-message", "-p", "-t", &pane, "#{window_name}"])
+            .trim()
+            .to_owned();
+        if name != "Legacy smart title" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tmux did not resume automatic window naming"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    for option in ["@codex_mux_generated_thread", "@codex_mux_generated_name"] {
         assert!(
             !server
-                .run(&["show-options", scope, "-t", &pane, option])
+                .run(&["show-options", "-wv", "-t", &pane, option])
                 .status
                 .success(),
-            "manual override retained {option}"
+            "legacy window option remained: {option}"
+        );
+    }
+    for (option, expected) in [
+        ("@codex_mux_generated_thread", thread_id),
+        ("@codex_mux_generated_name", "Legacy smart title"),
+        ("@codex_mux_generated_at", "1700000000"),
+    ] {
+        assert_eq!(
+            server
+                .checked(&["show-options", "-pv", "-t", &pane, option])
+                .trim(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn smart_naming_does_not_migrate_a_pane_local_lookalike() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("pane-local-smart-name");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\nset -g automatic-rename on\n").unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    let thread_id = "12345678-1234-1234-1234-123456789abc";
+    server.checked(&["select-pane", "-t", &pane, "-T", thread_id]);
+    for (option, value) in [
+        ("@codex_mux_generated_thread", thread_id),
+        ("@codex_mux_generated_name", "Intentional window title"),
+        ("@codex_mux_generated_source_title", thread_id),
+        ("@codex_mux_generated_source_cwd", path(scratch.path())),
+        ("@codex_mux_generated_at", "1700000000"),
+    ] {
+        server.checked(&["set-option", "-p", "-t", &pane, option, value]);
+    }
+    server.checked(&["rename-window", "-t", &pane, "Intentional window title"]);
+    server.checked(&["set-option", "-w", "-t", &pane, "automatic-rename", "off"]);
+
+    OwnedTmuxNames::new(SocketRunner(server.socket().to_owned()))
+        .migrate_legacy_window_names(1_800_000_000);
+
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", &pane, "#{window_name}"])
+            .trim(),
+        "Intentional window title"
+    );
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", &pane, "#{automatic-rename}"])
+            .trim(),
+        "0"
+    );
+    for option in ["@codex_mux_generated_thread", "@codex_mux_generated_name"] {
+        assert!(
+            !server
+                .run(&["show-options", "-wv", "-t", &pane, option])
+                .status
+                .success(),
+            "pane-local option leaked into window scope: {option}"
         );
     }
 }

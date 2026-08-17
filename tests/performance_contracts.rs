@@ -166,6 +166,7 @@ fn unzoomed_switch_uses_two_exact_tmux_requests() {
         session_id: SessionId::new("$2").unwrap(),
         title: Some("target".to_owned()),
         generated_title: None,
+        generated_at_unix: None,
         current_path: PathBuf::from("/work/target"),
     };
 

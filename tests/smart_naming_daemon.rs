@@ -298,10 +298,42 @@ fn disable_interrupts_late_provider_retry_backoff() {
                 .then_some(path)
         })
         .expect("daemon lock missing");
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "set-option",
+                "-p",
+                "-t",
+                "naming:0.0",
+                "@codex_mux_generated_name",
+                "cached title",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
     fs::write(&config, "smart_naming = false\n").unwrap();
     assert!(
         wait_for_lock(&lock, Duration::from_secs(2)),
         "retry backoff delayed shutdown acknowledgement"
+    );
+    assert!(
+        !Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "show-options",
+                "-pv",
+                "-t",
+                "naming:0.0",
+                "@codex_mux_generated_name",
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "disable left pane-local generated metadata behind"
     );
     let _ = Command::new("tmux")
         .args(["-L", &socket, "kill-server"])

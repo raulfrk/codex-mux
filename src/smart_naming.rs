@@ -12,7 +12,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
@@ -29,6 +29,12 @@ pub const MAX_CONVERSATION_BYTES: usize = 12 * 1024;
 pub const MAX_NAME_CHARS: usize = 48;
 const THREAD_LIST_PAGE_SIZE: u32 = 100;
 const MAX_THREAD_LIST_PAGES: usize = 20;
+const MAX_APP_SERVER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Minimum age of a new Codex thread before its first smart title.
+pub const INITIAL_NAMING_DELAY: Duration = Duration::from_secs(10 * 60);
+/// Interval between reconsidering an existing smart title.
+pub const NAMING_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+type AppServerMessage = std::result::Result<Value, String>;
 
 /// Lazily constructs naming infrastructure only after an explicit opt-in.
 ///
@@ -42,11 +48,12 @@ pub fn start_if_enabled<T>(enabled: bool, start: impl FnOnce() -> Result<T>) -> 
 pub struct AppServerProcess {
     child: Child,
     stdin: ChildStdin,
-    messages: Option<Receiver<Value>>,
+    messages: Option<Receiver<AppServerMessage>>,
     pending: VecDeque<Value>,
     reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    healthy: Arc<AtomicBool>,
     next_id: u64,
     cancelled: Arc<AtomicBool>,
 }
@@ -82,26 +89,16 @@ impl AppServerProcess {
             .take()
             .ok_or_else(|| protocol("app-server stderr unavailable"))?;
         let (sender, messages) = mpsc::sync_channel(64);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let reader_healthy = healthy.clone();
         let reader = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
-            loop {
-                let mut line = Vec::new();
-                let Ok(read) = reader
-                    .by_ref()
-                    .take(256 * 1024 + 1)
-                    .read_until(b'\n', &mut line)
-                else {
+            while let Some(message) = read_app_server_message(&mut reader) {
+                if !forward_app_server_message(&sender, &reader_healthy, message) {
                     break;
-                };
-                if read == 0 || line.len() > 256 * 1024 || !line.ends_with(b"\n") {
-                    break;
-                }
-                if let Ok(message) = serde_json::from_slice(&line) {
-                    if sender.send(message).is_err() {
-                        break;
-                    }
                 }
             }
+            reader_healthy.store(false, Ordering::Release);
         });
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let captured = stderr.clone();
@@ -118,6 +115,7 @@ impl AppServerProcess {
             reader: Some(reader),
             stderr_reader: Some(stderr_reader),
             stderr,
+            healthy,
             next_id: 1,
             cancelled,
         };
@@ -131,7 +129,7 @@ impl AppServerProcess {
             "capabilities": {"experimentalApi": false}
         }))?;
         let response =
-            self.receive_matching(Duration::from_secs(3), |message| message["id"] == id)?;
+            self.receive_matching(Duration::from_secs(15), |message| message["id"] == id)?;
         response_result(response)?;
         self.write_message(&json!({"method": "initialized"}))
     }
@@ -150,9 +148,12 @@ impl AppServerProcess {
         self.stdin
             .write_all(&encoded)
             .and_then(|()| self.stdin.flush())
-            .map_err(|source| MuxError::Filesystem {
-                path: Path::new("codex app-server stdin").to_owned(),
-                source,
+            .map_err(|source| {
+                self.healthy.store(false, Ordering::Release);
+                MuxError::Filesystem {
+                    path: Path::new("codex app-server stdin").to_owned(),
+                    source,
+                }
             })
     }
 
@@ -177,17 +178,22 @@ impl AppServerProcess {
                 .expect("receiver exists")
                 .recv_timeout(wait);
             let message = match message {
-                Ok(message) => message,
+                Ok(Ok(message)) => message,
+                Ok(Err(detail)) => return Err(protocol(&detail)),
                 Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {
                     continue;
                 }
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(protocol("app-server readiness timed out"));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.healthy.store(false, Ordering::Release);
                     return Err({
                         let detail = String::from_utf8_lossy(&self.stderr.lock().unwrap())
                             .trim()
                             .to_owned();
                         protocol(if detail.is_empty() {
-                            "app-server readiness timed out"
+                            "app-server output closed unexpectedly"
                         } else {
                             &detail
                         })
@@ -204,11 +210,49 @@ impl AppServerProcess {
     }
 }
 
+fn forward_app_server_message(
+    sender: &mpsc::SyncSender<AppServerMessage>,
+    healthy: &AtomicBool,
+    message: AppServerMessage,
+) -> bool {
+    let fatal = message.is_err();
+    if fatal {
+        healthy.store(false, Ordering::Release);
+    }
+    sender.send(message).is_ok() && !fatal
+}
+
+fn read_app_server_message(reader: &mut impl BufRead) -> Option<AppServerMessage> {
+    let mut line = Vec::new();
+    let read = match reader
+        .take((MAX_APP_SERVER_MESSAGE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)
+    {
+        Ok(read) => read,
+        Err(error) => return Some(Err(format!("could not read app-server output: {error}"))),
+    };
+    if read == 0 {
+        return None;
+    }
+    if line.len() > MAX_APP_SERVER_MESSAGE_BYTES {
+        return Some(Err(format!(
+            "app-server message exceeded {MAX_APP_SERVER_MESSAGE_BYTES} bytes"
+        )));
+    }
+    if !line.ends_with(b"\n") {
+        return Some(Err("app-server output ended mid-message".to_owned()));
+    }
+    Some(
+        serde_json::from_slice(&line)
+            .map_err(|error| format!("app-server returned invalid JSON: {error}")),
+    )
+}
+
 impl AppServerSession for AppServerProcess {
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.send_request(method, params)?;
         let response =
-            self.receive_matching(Duration::from_secs(10), |message| message["id"] == id)?;
+            self.receive_matching(Duration::from_secs(30), |message| message["id"] == id)?;
         response_result(response)
     }
 
@@ -224,6 +268,10 @@ impl AppServerSession for AppServerProcess {
             .get("params")
             .cloned()
             .ok_or_else(|| protocol("notification omitted params"))
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
     }
 }
 
@@ -274,6 +322,10 @@ pub trait AppServerSession {
     fn request(&mut self, method: &str, params: Value) -> Result<Value>;
     /// Waits for a notification matching the method and naming thread identifier.
     fn wait_for(&mut self, method: &str, thread_id: &str) -> Result<Value>;
+    /// Reports whether the transport can serve another request.
+    fn is_healthy(&self) -> bool {
+        true
+    }
 }
 
 /// A completed, privacy-bounded conversation ready for naming.
@@ -296,6 +348,10 @@ pub struct NamingTarget {
     pub thread_hint: String,
     /// Exact working directory used to constrain app-server resolution.
     pub cwd: PathBuf,
+    /// Existing pane-local Codex Mux title, when one is valid.
+    pub generated_name: Option<String>,
+    /// Unix timestamp of the last successful title generation.
+    pub generated_at_unix: Option<u64>,
 }
 
 impl NamingTarget {
@@ -309,6 +365,8 @@ impl NamingTarget {
             pane_title: pane_title.to_owned(),
             thread_hint: thread_hint.to_owned(),
             cwd: pane.current_path.clone(),
+            generated_name: pane.generated_title.clone(),
+            generated_at_unix: pane.generated_at_unix,
         })
     }
 }
@@ -318,7 +376,7 @@ fn thread_hint(title: &str) -> Option<&str> {
         return Some(title);
     }
     let prefix = title.strip_suffix("...")?;
-    (prefix.len() >= 8
+    (prefix.chars().filter(|character| *character != '-').count() >= 12
         && prefix.len() < 36
         && prefix
             .chars()
@@ -338,6 +396,10 @@ pub trait ConversationNamer: Send + 'static {
     fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation>;
     /// Generates one validated title.
     fn name(&mut self, conversation: &NamingConversation) -> Result<String>;
+    /// Reports whether the underlying provider can serve another request.
+    fn is_healthy(&self) -> bool {
+        true
+    }
 }
 
 impl<S: AppServerSession + Send + 'static> ConversationNamer for AppServerNamer<S> {
@@ -353,6 +415,10 @@ impl<S: AppServerSession + Send + 'static> ConversationNamer for AppServerNamer<
     fn name(&mut self, conversation: &NamingConversation) -> Result<String> {
         self.generate_name(conversation)
     }
+
+    fn is_healthy(&self) -> bool {
+        self.session.is_healthy()
+    }
 }
 
 /// A generated title bound to the source thread to prevent pane-ID reuse.
@@ -366,6 +432,8 @@ pub struct GeneratedName {
     pub source_cwd: PathBuf,
     /// Validated generated title.
     pub name: String,
+    /// Unix timestamp persisted with the pane-local title.
+    pub generated_at_unix: u64,
 }
 
 /// In-memory generated names published by the worker; conversation text is never stored here.
@@ -381,7 +449,26 @@ pub struct NamingWorker {
 
 impl NamingWorker {
     /// Starts a worker that continuously discovers existing and future targets.
-    pub fn spawn<N, F, D>(start_namer: F, mut discover: D, poll_interval: Duration) -> Self
+    pub fn spawn<N, F, D>(start_namer: F, discover: D, poll_interval: Duration) -> Self
+    where
+        N: ConversationNamer,
+        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
+    {
+        Self::spawn_with_refresh_interval(
+            start_namer,
+            discover,
+            poll_interval,
+            NAMING_REFRESH_INTERVAL,
+        )
+    }
+
+    fn spawn_with_refresh_interval<N, F, D>(
+        start_namer: F,
+        mut discover: D,
+        poll_interval: Duration,
+        refresh_interval: Duration,
+    ) -> Self
     where
         N: ConversationNamer,
         F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
@@ -397,6 +484,7 @@ impl NamingWorker {
                 return;
             };
             let mut cache = HashMap::<String, (u64, String)>::new();
+            let mut last_attempt = HashMap::<(String, PathBuf), std::time::Instant>::new();
             loop {
                 if stopped.try_recv().is_ok() {
                     break;
@@ -421,15 +509,29 @@ impl NamingWorker {
                         .or_default()
                         .push(target);
                 }
-                for (_, targets) in by_thread {
+                for (identity, targets) in by_thread {
                     if stopped.try_recv().is_ok() {
                         return;
                     }
-                    let Some(first) = targets.first() else {
+                    let now = unix_seconds(SystemTime::now());
+                    let Some(due_target) = targets.iter().find(|target| naming_is_due(target, now))
+                    else {
                         continue;
                     };
-                    let Ok(conversation) = namer.read(first) else {
+                    if last_attempt
+                        .get(&identity)
+                        .is_some_and(|attempted| attempted.elapsed() < refresh_interval)
+                    {
                         continue;
+                    }
+                    last_attempt.insert(identity, std::time::Instant::now());
+                    let conversation = match namer.read(due_target) {
+                        Ok(conversation) => conversation,
+                        Err(_) if !namer.is_healthy() => {
+                            let _ = stopped.recv_timeout(refresh_interval);
+                            return;
+                        }
+                        Err(_) => continue,
                     };
                     let thread_id = conversation.thread_id.clone();
                     let fingerprint = transcript_fingerprint(&conversation.transcript);
@@ -437,21 +539,36 @@ impl NamingWorker {
                         if *cached == fingerprint {
                             name.clone()
                         } else {
-                            let Ok(name) = namer.name(&conversation) else {
-                                continue;
+                            let name = match namer.name(&conversation) {
+                                Ok(name) => name,
+                                Err(_) if !namer.is_healthy() => {
+                                    let _ = stopped.recv_timeout(refresh_interval);
+                                    return;
+                                }
+                                Err(_) => continue,
                             };
                             cache.insert(thread_id.clone(), (fingerprint, name.clone()));
                             name
                         }
                     } else {
-                        let Ok(name) = namer.name(&conversation) else {
-                            continue;
+                        let name = match namer.name(&conversation) {
+                            Ok(name) => name,
+                            Err(_) if !namer.is_healthy() => {
+                                let _ = stopped.recv_timeout(refresh_interval);
+                                return;
+                            }
+                            Err(_) => continue,
                         };
                         cache.insert(thread_id.clone(), (fingerprint, name.clone()));
                         name
                     };
-                    let Ok(still_resolved) = namer.resolve(first) else {
-                        continue;
+                    let still_resolved = match namer.resolve(due_target) {
+                        Ok(thread_id) => thread_id,
+                        Err(_) if !namer.is_healthy() => {
+                            let _ = stopped.recv_timeout(refresh_interval);
+                            return;
+                        }
+                        Err(_) => continue,
                     };
                     if still_resolved != thread_id {
                         continue;
@@ -467,6 +584,7 @@ impl NamingWorker {
                                     source_title: target.pane_title,
                                     source_cwd: target.cwd,
                                     name: name.clone(),
+                                    generated_at_unix: now,
                                 },
                             );
                         }
@@ -511,6 +629,33 @@ impl NamingWorker {
             let _ = thread.join();
         }
     }
+}
+
+fn unix_seconds(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn naming_is_due(target: &NamingTarget, now_unix: u64) -> bool {
+    if target.generated_name.is_some() {
+        return target.generated_at_unix.is_none_or(|generated_at| {
+            now_unix.saturating_sub(generated_at) >= NAMING_REFRESH_INTERVAL.as_secs()
+        });
+    }
+    thread_created_at_unix(&target.thread_hint).is_some_and(|created_at| {
+        now_unix.saturating_sub(created_at) >= INITIAL_NAMING_DELAY.as_secs()
+    })
+}
+
+fn thread_created_at_unix(thread_hint: &str) -> Option<u64> {
+    let timestamp = thread_hint
+        .chars()
+        .filter(|character| *character != '-')
+        .take(12)
+        .collect::<String>();
+    (timestamp.len() == 12)
+        .then(|| u64::from_str_radix(&timestamp, 16).ok())
+        .flatten()
+        .map(|milliseconds| milliseconds / 1000)
 }
 
 impl Drop for NamingWorker {
@@ -563,7 +708,8 @@ impl<S: AppServerSession> AppServerNamer<S> {
                     "cursor": cursor,
                     "limit": THREAD_LIST_PAGE_SIZE,
                     "sortKey": "updated_at",
-                    "sortDirection": "desc"
+                    "sortDirection": "desc",
+                    "useStateDbOnly": true
                 }),
             )?;
             let threads = response["data"]
@@ -751,6 +897,102 @@ fn protocol(message: &str) -> MuxError {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn fatal_frame_marks_transport_unhealthy_before_delivery() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let healthy = AtomicBool::new(true);
+
+        assert!(!forward_app_server_message(
+            &sender,
+            &healthy,
+            Err("fatal framing error".to_owned()),
+        ));
+        assert!(receiver.recv().unwrap().is_err());
+        assert!(!healthy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unhealthy_worker_exits_after_one_cooldown() {
+        struct UnhealthyNamer;
+        impl ConversationNamer for UnhealthyNamer {
+            fn read(&mut self, _: &NamingTarget) -> Result<NamingConversation> {
+                Err(protocol("fatal transport failure"))
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                unreachable!()
+            }
+
+            fn is_healthy(&self) -> bool {
+                false
+            }
+        }
+
+        let target = target_created_at(0);
+        let worker = NamingWorker::spawn_with_refresh_interval(
+            |_| Ok(UnhealthyNamer),
+            move || Ok(vec![target.clone()]),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(worker.is_finished());
+        worker.stop();
+    }
+
+    fn target_created_at(created_at_unix: u64) -> NamingTarget {
+        let milliseconds = created_at_unix * 1000;
+        let thread = format!(
+            "{:08x}-{:04x}-7000-8000-000000000000",
+            milliseconds >> 16,
+            milliseconds & 0xffff
+        );
+        NamingTarget {
+            pane_id: PaneId::new("%1").unwrap(),
+            pane_title: thread.clone(),
+            thread_hint: thread,
+            cwd: "/work/project".into(),
+            generated_name: None,
+            generated_at_unix: None,
+        }
+    }
+
+    #[test]
+    fn new_titles_wait_ten_minutes_and_existing_titles_refresh_hourly() {
+        let now = 1_800_000_000;
+        assert!(!naming_is_due(&target_created_at(now - 599), now));
+        assert!(naming_is_due(&target_created_at(now - 600), now));
+
+        let mut existing = target_created_at(now);
+        existing.generated_name = Some("Existing title".to_owned());
+        existing.generated_at_unix = Some(now - 3_599);
+        assert!(!naming_is_due(&existing, now));
+        existing.generated_at_unix = Some(now - 3_600);
+        assert!(naming_is_due(&existing, now));
+    }
+
+    #[test]
+    fn accepts_thread_read_responses_larger_than_the_old_transport_limit() {
+        let payload = "x".repeat(512 * 1024);
+        let encoded =
+            serde_json::to_vec(&json!({"id": 7, "result": {"payload": payload}})).unwrap();
+        let mut input = encoded;
+        input.push(b'\n');
+
+        let message = read_app_server_message(&mut Cursor::new(input))
+            .unwrap()
+            .unwrap();
+        assert_eq!(message["id"], 7);
+        assert_eq!(
+            message["result"]["payload"].as_str().unwrap().len(),
+            512 * 1024
+        );
+    }
 
     #[test]
     fn noisy_multi_turn_traffic_retains_only_future_consumers() {

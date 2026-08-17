@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use codex_mux::{
@@ -110,6 +110,8 @@ fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
     };
 
     let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
@@ -118,6 +120,7 @@ fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
     let calls = calls.lock().unwrap();
     assert_eq!(calls[0].0, "thread/list");
     assert_eq!(calls[0].1["cwd"], "/work/project");
+    assert_eq!(calls[0].1["useStateDbOnly"], true);
     assert_eq!(calls[1].1["cursor"], "page-2");
     assert_eq!(calls[2].0, "thread/read");
     assert_eq!(calls[2].1["threadId"], full);
@@ -138,6 +141,8 @@ fn ambiguous_truncated_thread_fails_closed() {
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
     };
 
     assert!(
@@ -154,7 +159,8 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
         id: PaneId::new("%9").unwrap(),
         session_id: SessionId::new("$1").unwrap(),
         title: Some("01a01001-2dbb-74e2-86ab-996b3...".to_owned()),
-        generated_title: None,
+        generated_title: Some("Existing entry title".to_owned()),
+        generated_at_unix: Some(1_700_000_000),
         current_path: "/work/project".into(),
     };
 
@@ -162,6 +168,31 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
     assert_eq!(target.pane_title, pane.title.unwrap());
     assert_eq!(target.thread_hint, "01a01001-2dbb-74e2-86ab-996b3");
     assert_eq!(target.cwd, std::path::Path::new("/work/project"));
+    assert_eq!(
+        target.generated_name.as_deref(),
+        Some("Existing entry title")
+    );
+    assert_eq!(target.generated_at_unix, Some(1_700_000_000));
+}
+
+#[test]
+fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
+    let pane = Pane {
+        id: PaneId::new("%9").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        title: Some("12345678...".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        current_path: "/work/project".into(),
+    };
+
+    assert_eq!(NamingTarget::from_pane(&pane), None);
+
+    let hyphenated = Pane {
+        title: Some("12345678-123...".to_owned()),
+        ..pane
+    };
+    assert_eq!(NamingTarget::from_pane(&hyphenated), None);
 }
 
 #[test]
@@ -232,7 +263,18 @@ fn target(pane: &str, thread: &str) -> NamingTarget {
         pane_title: thread.to_owned(),
         thread_hint: thread.to_owned(),
         cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
     }
+}
+
+fn thread_created_at(created_at_unix: u64, suffix: &str) -> String {
+    let milliseconds = created_at_unix * 1000;
+    format!(
+        "{:08x}-{:04x}-7000-8000-{suffix:0>12}",
+        milliseconds >> 16,
+        milliseconds & 0xffff
+    )
 }
 
 fn wait_until(description: &str, predicate: impl Fn() -> bool) {
@@ -305,6 +347,128 @@ fn worker_is_non_blocking_deduplicates_and_joins_on_stop() {
             .contains_key(&PaneId::new("%4").unwrap())
     );
     worker.stop();
+}
+
+#[test]
+fn worker_schedules_reads_only_at_initial_and_hourly_deadlines() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let names = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let discoveries = Arc::new(AtomicUsize::new(0));
+    let new = target("%1", &thread_created_at(now - 590, "1"));
+    let mut existing = target("%2", &thread_created_at(now - 7_200, "2"));
+    existing.generated_name = Some("Stable entry title".to_owned());
+    existing.generated_at_unix = Some(now - 3_590);
+    let observed_reads = reads.clone();
+    let provider_started = started.clone();
+    let observed_discoveries = discoveries.clone();
+    let worker = NamingWorker::spawn(
+        move |_| {
+            provider_started.store(true, Ordering::Release);
+            Ok(CountingNamer {
+                reads: observed_reads,
+                names,
+                delay: Duration::ZERO,
+            })
+        },
+        move || {
+            observed_discoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![new.clone(), existing.clone()])
+        },
+        Duration::from_millis(10),
+    );
+
+    wait_until("provider startup and repeated discovery", || {
+        started.load(Ordering::Acquire) && discoveries.load(Ordering::SeqCst) >= 3
+    });
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    worker.stop();
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed_reads = reads.clone();
+    let mut hourly = target("%4", &thread_created_at(now - 7_200, "4"));
+    hourly.generated_name = Some("Hourly title".to_owned());
+    hourly.generated_at_unix = Some(now - 3_610);
+    let initial = target("%3", &thread_created_at(now - 610, "3"));
+    let worker = NamingWorker::spawn(
+        move |_| {
+            Ok(CountingNamer {
+                reads: observed_reads,
+                names: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
+            })
+        },
+        move || Ok(vec![initial.clone(), hourly.clone()]),
+        Duration::from_millis(10),
+    );
+    wait_until("both due conversations to be read", || {
+        reads.load(Ordering::SeqCst) >= 2
+    });
+    worker.stop();
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn duplicate_panes_run_when_any_member_is_due() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let thread_id = thread_created_at(now - 7_200, "5");
+    let mut fresh = target("%1", &thread_id);
+    fresh.generated_name = Some("Fresh title".to_owned());
+    fresh.generated_at_unix = Some(now);
+    let untitled = target("%2", &thread_id);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed_reads = reads.clone();
+    let worker = NamingWorker::spawn(
+        move |_| {
+            Ok(CountingNamer {
+                reads: observed_reads,
+                names: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
+            })
+        },
+        move || Ok(vec![fresh.clone(), untitled.clone()]),
+        Duration::from_millis(10),
+    );
+
+    wait_until("the due duplicate pane to trigger naming", || {
+        worker.names().lock().unwrap().len() == 2
+    });
+    worker.stop();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_refresh_is_not_retried_on_each_poll() {
+    struct FailingNamer(Arc<AtomicUsize>);
+    impl ConversationNamer for FailingNamer {
+        fn read(&mut self, _: &NamingTarget) -> Result<NamingConversation> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(codex_mux::MuxError::Command("transient failure".to_owned()))
+        }
+        fn name(&mut self, _: &NamingConversation) -> Result<String> {
+            unreachable!()
+        }
+    }
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed_reads = reads.clone();
+    let current = target("%1", "01999999-1111-7777-8888-123456789abc");
+    let worker = NamingWorker::spawn(
+        move |_| Ok(FailingNamer(observed_reads)),
+        move || Ok(vec![current.clone()]),
+        Duration::from_millis(5),
+    );
+    wait_until("first failed refresh", || reads.load(Ordering::SeqCst) == 1);
+    thread::sleep(Duration::from_millis(40));
+    worker.stop();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
 }
 
 #[test]

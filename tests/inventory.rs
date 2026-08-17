@@ -145,10 +145,10 @@ fn custom_renamed_executable_and_unnamed_project_fallback_work() {
 }
 
 #[test]
-fn valid_owned_window_name_is_the_visible_inventory_title() {
+fn valid_pane_local_name_is_the_visible_inventory_title() {
     let thread = "12345678-1234-1234-1234-123456789abc";
     let row = format!(
-        "%1\x1f$1\x1f@1\x1fSnappy naming\x1f{thread}\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\x1f{thread}\x1fSnappy naming\n"
+        "%1\x1f$1\x1f@1\x1ftmux-window\x1f{thread}\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\x1f{thread}\x1fSnappy naming\x1f1700000000\n"
     );
     let processes = FakeProcesses(HashMap::from([(
         101,
@@ -164,7 +164,30 @@ fn valid_owned_window_name_is_the_visible_inventory_title() {
 
     assert_eq!(panes[0].title.as_deref(), Some(thread));
     assert_eq!(panes[0].generated_title.as_deref(), Some("Snappy naming"));
+    assert_eq!(panes[0].generated_at_unix, Some(1_700_000_000));
     assert_eq!(panes[0].display_title(), "Snappy naming");
+}
+
+#[test]
+fn malformed_or_too_short_title_prefix_cannot_reuse_generated_metadata() {
+    let thread = "12345678-1234-1234-1234-123456789abc";
+    for title in ["...", "12345678...", "12345678-123..."] {
+        let row = format!(
+            "%1\x1f$1\x1f@1\x1ftmux-window\x1f{title}\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\x1f{thread}\x1fStale name\x1f1700000000\n"
+        );
+        let inventory = PaneInventory::new(
+            FakeRunner::returning(row.into_bytes()),
+            FakeProcesses(HashMap::from([(
+                101,
+                ProcessAnswer::Path(PathBuf::from("/opt/bin/codex")),
+            )])),
+            CodexExecutable::new("/opt/bin/codex").unwrap(),
+        );
+
+        let panes = inventory.discover().unwrap();
+        assert_eq!(panes[0].generated_title, None);
+        assert_eq!(panes[0].generated_at_unix, None);
+    }
 }
 
 #[test]

@@ -96,6 +96,8 @@ pub struct Pane {
     pub title: Option<String>,
     /// Smart title owned by codex-mux, when the tmux ownership marker is valid.
     pub generated_title: Option<String>,
+    /// Unix timestamp of the last successful smart-title generation.
+    pub generated_at_unix: Option<u64>,
     /// Current working directory exposed by tmux.
     pub current_path: PathBuf,
 }
@@ -279,6 +281,7 @@ mod tests {
             session_id: SessionId::new("$1").unwrap(),
             title: None,
             generated_title: None,
+            generated_at_unix: None,
             current_path: PathBuf::from("/work/codex-mux"),
         };
 

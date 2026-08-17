@@ -14,6 +14,7 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
         session_id: SessionId::new("$1").unwrap(),
         title: Some(title.to_owned()),
         generated_title: None,
+        generated_at_unix: None,
         current_path: PathBuf::from(path),
     }
 }

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{self, Event};
@@ -610,7 +610,7 @@ fn start_naming_worker(codex: &CodexExecutable, executables: &[CodexExecutable])
                 .discover()
                 .map(|panes| panes.iter().filter_map(NamingTarget::from_pane).collect())
         },
-        Duration::from_secs(2),
+        Duration::from_secs(30),
     )
 }
 
@@ -619,8 +619,15 @@ fn run_smart_naming_worker(codex_argument: Option<PathBuf>) -> Result<()> {
         return Ok(());
     };
     let store = XdgThemeStore::discover()?;
+    let owned_names = OwnedTmuxNames::new(SystemTmuxRunner::default());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    owned_names.migrate_legacy_window_names(now);
     let preference = store.load_preference();
     if !preference.smart_naming {
+        owned_names.clear_all();
         return Ok(());
     }
     let codex = resolve_codex(codex_argument)?;
@@ -635,30 +642,40 @@ fn run_smart_naming_worker(codex_argument: Option<PathBuf>) -> Result<()> {
             executables.push(executable);
         }
     }
-    let mut worker = start_naming_worker(&codex, &executables);
-    let owned_names = OwnedTmuxNames::new(SystemTmuxRunner::default());
+    let mut worker = Some(start_naming_worker(&codex, &executables));
     let mut applied_names = HashMap::new();
     let mut last_name_reconcile = Instant::now() - Duration::from_secs(2);
     let identity = naming_server_identity_from_environment()?;
     let mut retry = Duration::from_millis(100);
     while store.load_preference().smart_naming && tmux_server_matches(&identity) {
-        let names = worker.names().lock().unwrap().clone();
+        let names = worker
+            .as_ref()
+            .expect("worker exists while daemon loop runs")
+            .names()
+            .lock()
+            .unwrap()
+            .clone();
         if names != applied_names || last_name_reconcile.elapsed() >= Duration::from_secs(2) {
             owned_names.reconcile(&names);
             applied_names = names;
             last_name_reconcile = Instant::now();
         }
-        if worker.is_finished() {
-            worker.stop();
+        if worker.as_ref().is_some_and(NamingWorker::is_finished) {
+            worker.take().expect("finished worker exists").stop();
             if !wait_for_naming_retry(&store, &identity, retry) {
-                return Ok(());
+                break;
             }
             retry = (retry * 2).min(Duration::from_secs(5));
-            worker = start_naming_worker(&codex, &executables);
+            worker = Some(start_naming_worker(&codex, &executables));
         }
         thread::sleep(Duration::from_millis(100));
     }
-    worker.stop();
+    if let Some(worker) = worker {
+        worker.stop();
+    }
+    if !store.load_preference().smart_naming {
+        owned_names.clear_all();
+    }
     Ok(())
 }
 

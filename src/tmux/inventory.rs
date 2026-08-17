@@ -16,7 +16,7 @@ use crate::{
 
 const FIELD_SEPARATOR: u8 = 0x1f;
 const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
 pub struct PaneInventory<R, I> {
@@ -112,6 +112,7 @@ where
             }
 
             let generated_title = record.generated_title();
+            let generated_at_unix = record.generated_at();
             let Ok(id) = PaneId::new(record.pane_id) else {
                 continue;
             };
@@ -123,6 +124,7 @@ where
                 session_id,
                 title: nonempty_title(record.title),
                 generated_title,
+                generated_at_unix,
                 current_path: record.current_path,
             });
         }
@@ -186,6 +188,7 @@ struct TmuxPaneRecord {
     tty: OsString,
     generated_name: String,
     generated_thread: String,
+    generated_at: String,
 }
 
 impl TmuxPaneRecord {
@@ -194,7 +197,7 @@ impl TmuxPaneRecord {
             return None;
         }
         let fields = split_fields(line);
-        if fields.len() != 11 {
+        if !matches!(fields.len(), 11 | 12) {
             return None;
         }
 
@@ -228,12 +231,15 @@ impl TmuxPaneRecord {
             tty: os_string_from_bytes(fields[8]),
             generated_thread: String::from_utf8_lossy(fields[9]).into_owned(),
             generated_name: String::from_utf8_lossy(fields[10]).into_owned(),
+            generated_at: fields.get(11).map_or_else(String::new, |field| {
+                String::from_utf8_lossy(field).into_owned()
+            }),
         })
     }
 
     fn generated_title(&self) -> Option<String> {
-        if self.generated_thread == self.title
-            && self.generated_name == self.window_name
+        if self.generated_at.parse::<u64>().is_ok()
+            && thread_marker_matches_title(&self.generated_thread, &self.title)
             && !self.generated_name.trim().is_empty()
         {
             Some(self.generated_name.clone())
@@ -241,6 +247,39 @@ impl TmuxPaneRecord {
             None
         }
     }
+
+    fn generated_at(&self) -> Option<u64> {
+        self.generated_title()?;
+        self.generated_at.parse().ok()
+    }
+}
+
+fn thread_marker_matches_title(thread: &str, title: &str) -> bool {
+    if !looks_like_thread_id(thread) {
+        return false;
+    }
+    if thread == title {
+        return true;
+    }
+    title.strip_suffix("...").is_some_and(|prefix| {
+        prefix.chars().filter(|character| *character != '-').count() >= 12
+            && prefix.len() < 36
+            && prefix
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() || character == '-')
+            && thread.starts_with(prefix)
+    })
+}
+
+fn looks_like_thread_id(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(index, character)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                character == '-'
+            } else {
+                character.is_ascii_hexdigit()
+            }
+        })
 }
 
 fn split_fields(line: &[u8]) -> Vec<&[u8]> {
