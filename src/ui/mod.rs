@@ -150,6 +150,7 @@ pub struct App {
     smart_naming: bool,
     naming_save_warning: bool,
     smart_naming_pending: bool,
+    inventory_warning: bool,
 }
 
 impl App {
@@ -214,6 +215,7 @@ impl App {
             smart_naming,
             naming_save_warning: false,
             smart_naming_pending: false,
+            inventory_warning: false,
         }
     }
 
@@ -226,6 +228,7 @@ impl App {
     /// Restores the prior value after persistence fails.
     pub fn smart_naming_save_failed(&mut self, error: impl Into<String>) {
         self.warning = Some(error.into());
+        self.inventory_warning = false;
         self.naming_save_warning = true;
         self.smart_naming_pending = false;
     }
@@ -243,12 +246,30 @@ impl App {
     /// Reports a non-blocking provider startup failure while retaining opt-in.
     pub fn smart_naming_runtime_failed(&mut self, error: impl Into<String>) {
         self.warning = Some(error.into());
+        self.inventory_warning = false;
         self.smart_naming_pending = false;
     }
 
     /// Keeps the prior visible state while a daemon shutdown is acknowledged.
     pub fn smart_naming_stopping(&mut self) {
         self.smart_naming_pending = true;
+    }
+
+    /// Publishes one coherent inventory snapshot and clears its prior warning.
+    pub fn inventory_refreshed(&mut self, panes: Vec<Pane>) {
+        self.replace_panes(panes);
+        if self.inventory_warning {
+            self.warning = None;
+            self.inventory_warning = false;
+        }
+    }
+
+    /// Reports a refresh failure without blocking input or discarding the last snapshot.
+    pub fn inventory_failed(&mut self, error: impl Into<String>) {
+        if self.warning.is_none() {
+            self.warning = Some(error.into());
+            self.inventory_warning = true;
+        }
     }
 
     /// Returns the active launch profiles.

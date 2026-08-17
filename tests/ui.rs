@@ -247,6 +247,28 @@ fn configuration_panel_explains_and_toggles_smart_naming() {
 }
 
 #[test]
+fn coherent_inventory_refresh_preserves_selection_and_recovers_from_failure() {
+    let mut app = App::new(
+        vec![
+            pane("%1", "one", "/work/one"),
+            pane("%2", "two", "/work/two"),
+        ],
+        ThemeId::default(),
+        None,
+    );
+    app.select_pane(&PaneId::new("%2").unwrap());
+    app.inventory_failed("slow tmux failed");
+
+    app.inventory_refreshed(vec![
+        pane("%2", "two refreshed", "/work/two"),
+        pane("%3", "three", "/work/three"),
+    ]);
+
+    assert_eq!(app.selected_pane_id(), Some(&PaneId::new("%2").unwrap()));
+    assert_eq!(app.panes()[0].display_title(), "two refreshed");
+}
+
+#[test]
 fn configuration_disclosure_and_controls_remain_visible_on_phone_and_tiny_screens() {
     for (width, height) in [(62, 20), (32, 8)] {
         let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);

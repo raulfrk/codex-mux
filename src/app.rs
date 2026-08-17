@@ -44,6 +44,83 @@ use crate::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+struct RefreshSnapshot {
+    generation: u64,
+    panes: Result<Vec<crate::domain::Pane>>,
+}
+
+enum RefreshCommand {
+    Request(u64),
+    Stop,
+}
+
+struct PaneRefreshWorker {
+    commands: mpsc::Sender<RefreshCommand>,
+    snapshots: mpsc::Receiver<RefreshSnapshot>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PaneRefreshWorker {
+    fn spawn<F>(mut discover: F) -> Self
+    where
+        F: FnMut() -> Result<Vec<crate::domain::Pane>> + Send + 'static,
+    {
+        let (commands, command_receiver) = mpsc::channel();
+        let (snapshot_sender, snapshots) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let mut generation = 0;
+            loop {
+                let panes = discover();
+                if snapshot_sender
+                    .send(RefreshSnapshot { generation, panes })
+                    .is_err()
+                {
+                    return;
+                }
+                let mut command = match command_receiver.recv_timeout(REFRESH_INTERVAL) {
+                    Ok(command) => command,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                };
+                while let Ok(next) = command_receiver.try_recv() {
+                    if matches!(next, RefreshCommand::Stop) {
+                        command = RefreshCommand::Stop;
+                        break;
+                    }
+                    if let RefreshCommand::Request(next_generation) = next {
+                        generation = generation.max(next_generation);
+                    }
+                }
+                match command {
+                    RefreshCommand::Request(next_generation) => {
+                        generation = generation.max(next_generation);
+                    }
+                    RefreshCommand::Stop => return,
+                }
+            }
+        });
+        Self {
+            commands,
+            snapshots,
+            thread: Some(thread),
+        }
+    }
+
+    fn request(&self, generation: u64) {
+        let _ = self.commands.send(RefreshCommand::Request(generation));
+    }
+}
+
+impl Drop for PaneRefreshWorker {
+    fn drop(&mut self) {
+        let _ = self.commands.send(RefreshCommand::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 /// Runs the parsed command and writes management results to standard output.
 pub fn run(cli: Cli) -> Result<()> {
@@ -347,21 +424,22 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
         LinuxProcessInspector::with_executables(codex.clone(), codex_executables.clone());
     let inventory =
         PaneInventory::with_executables(SystemTmuxRunner::default(), inspector, codex_executables);
-    let panes = inventory.discover()?;
+    let refresh_worker = PaneRefreshWorker::spawn(move || inventory.discover());
     let color_policy = if no_color_requested() {
         ColorPolicy::ForceMonochrome
     } else {
         ColorPolicy::Allow
     };
     let mut app = App::with_settings(
-        panes,
+        Vec::new(),
         preference.selected,
         preference.warning,
         color_policy,
         preference.profiles,
         preference.smart_naming,
     );
-    app.select_pane(&context.pane_id);
+    let mut initial_selection_pending = true;
+    let mut minimum_refresh_generation = 0_u64;
     let runner = SystemTmuxRunner::default();
     let actions = TmuxActions::new(&runner, &codex);
     if preference.smart_naming {
@@ -371,35 +449,65 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
     }
     let (shutdown_sender, shutdown_receiver) = mpsc::channel::<Result<()>>();
     let mut shutdown_pending = false;
+    let mut dirty = true;
 
     ui::terminal::with_terminal(io::stdout(), |terminal| {
         loop {
+            let mut newest_snapshot = None;
+            while let Ok(snapshot) = refresh_worker.snapshots.try_recv() {
+                if snapshot.generation >= minimum_refresh_generation {
+                    newest_snapshot = Some(snapshot);
+                }
+            }
+            if let Some(snapshot) = newest_snapshot {
+                match snapshot.panes {
+                    Ok(panes) => {
+                        app.inventory_refreshed(panes);
+                        if initial_selection_pending {
+                            app.select_pane(&context.pane_id);
+                            initial_selection_pending = false;
+                        }
+                        dirty = true;
+                    }
+                    Err(error) => {
+                        app.inventory_failed(error.to_string());
+                        dirty = true;
+                    }
+                }
+            }
             if shutdown_pending {
                 match shutdown_receiver.try_recv() {
                     Ok(Ok(())) => {
                         app.smart_naming_saved(false);
                         shutdown_pending = false;
+                        dirty = true;
                     }
                     Ok(Err(error)) => {
                         app.smart_naming_runtime_failed(error.to_string());
                         shutdown_pending = false;
+                        dirty = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
                         app.smart_naming_runtime_failed("smart-naming shutdown channel closed");
                         shutdown_pending = false;
+                        dirty = true;
                     }
                 }
             }
-            terminal
-                .draw(|frame| ui::render(frame, &app))
-                .map_err(terminal_error)?;
+            if dirty {
+                terminal
+                    .draw(|frame| ui::render(frame, &app))
+                    .map_err(terminal_error)?;
+                dirty = false;
+            }
 
-            if !event::poll(REFRESH_INTERVAL).map_err(terminal_error)? {
-                app.replace_panes(inventory.discover()?);
+            if !event::poll(INPUT_POLL_INTERVAL).map_err(terminal_error)? {
                 continue;
             }
-            let Event::Key(key) = event::read().map_err(terminal_error)? else {
+            let event = event::read().map_err(terminal_error)?;
+            dirty = true;
+            let Event::Key(key) = event else {
                 continue;
             };
             let Some(action) = app.handle_key(key) else {
@@ -465,9 +573,18 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                         .panes()
                         .iter()
                         .find(|pane| pane.id == id)
+                        .cloned()
                         .ok_or_else(|| MuxError::Command("selected pane disappeared".to_owned()))?;
-                    actions.close_pane(pane)?;
-                    app.replace_panes(inventory.discover()?);
+                    actions.close_pane(&pane)?;
+                    app.replace_panes(
+                        app.panes()
+                            .iter()
+                            .filter(|candidate| candidate.id != id)
+                            .cloned()
+                            .collect(),
+                    );
+                    minimum_refresh_generation = minimum_refresh_generation.saturating_add(1);
+                    refresh_worker.request(minimum_refresh_generation);
                 }
                 Action::PersistTheme(theme) => theme_store.save(theme)?,
                 Action::Quit => return Ok(()),
@@ -1060,9 +1177,9 @@ fn os_strings<const N: usize>(values: [&str; N]) -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::mpsc, time::Duration};
 
-    use super::{invocation_context, parse_naming_server_identity};
+    use super::{PaneRefreshWorker, invocation_context, parse_naming_server_identity};
     use crate::cli::Cli;
 
     #[test]
@@ -1093,5 +1210,64 @@ mod tests {
             first,
             parse_naming_server_identity(std::ffi::OsStr::new("/tmp/tmux/socket,9876,0")).unwrap()
         );
+    }
+
+    #[test]
+    fn refresh_worker_starts_without_waiting_and_coalesces_generations() {
+        let (started_sender, started) = mpsc::channel();
+        let (release_sender, release) = mpsc::channel();
+        let mut calls = 0;
+        let worker = PaneRefreshWorker::spawn(move || {
+            calls += 1;
+            if calls == 1 {
+                started_sender.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(Vec::new())
+        });
+
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.request(1);
+        worker.request(2);
+        release_sender.send(()).unwrap();
+
+        let stale = worker
+            .snapshots
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let current = worker
+            .snapshots
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(stale.generation, 0);
+        assert_eq!(current.generation, 2);
+    }
+
+    #[test]
+    fn refresh_worker_recovers_after_a_discovery_error() {
+        let mut calls = 0;
+        let worker = PaneRefreshWorker::spawn(move || {
+            calls += 1;
+            if calls == 1 {
+                Err(crate::MuxError::Command(
+                    "temporary refresh failure".to_owned(),
+                ))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+
+        let failed = worker
+            .snapshots
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(failed.panes.is_err());
+        worker.request(1);
+        let recovered = worker
+            .snapshots
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(recovered.generation, 1);
+        assert!(recovered.panes.is_ok());
     }
 }
