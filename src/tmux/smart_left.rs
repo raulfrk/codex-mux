@@ -54,6 +54,16 @@ enum SmartLeftTarget {
 pub trait ProbeSleeper {
     /// Waits between rendered-cursor observations.
     fn sleep(&self, duration: Duration);
+
+    /// Returns a blocking tmux-side delay when the probe can batch observations.
+    ///
+    /// Test sleepers use the default host-side wait so fake runners remain
+    /// deterministic; the runtime sleeper moves the delay into tmux's command
+    /// queue to avoid launching one tmux client per observation.
+    fn tmux_sleep_command(&self, duration: Duration) -> Option<OsString> {
+        self.sleep(duration);
+        None
+    }
 }
 
 /// Host thread sleeper used by the runtime.
@@ -63,6 +73,14 @@ pub struct SystemSleeper;
 impl ProbeSleeper for SystemSleeper {
     fn sleep(&self, duration: Duration) {
         thread::sleep(duration);
+    }
+
+    fn tmux_sleep_command(&self, duration: Duration) -> Option<OsString> {
+        Some(OsString::from(format!(
+            "sleep {}.{:03}",
+            duration.as_secs(),
+            duration.subsec_millis()
+        )))
     }
 }
 
@@ -129,20 +147,19 @@ where
             return Ok(SmartLeftOutcome::Forwarded);
         };
 
-        let mut current = initial.clone();
-        for _ in 0..POLL_ATTEMPTS {
-            self.sleeper.sleep(POLL_INTERVAL);
-            let Ok(observed) = self.read_state(context) else {
-                return Ok(SmartLeftOutcome::Forwarded);
-            };
-            if observed.pane_pid != initial.pane_pid
-                || observed.cursor_x != initial.cursor_x
-                || observed.cursor_y != initial.cursor_y
-                || !observed.cursor_visible
-                || observed.pane_in_mode
-                || observed.pane_command != initial.pane_command
-                || observed.shell_prompt != initial.shell_prompt
-            {
+        self.sleeper.sleep(POLL_INTERVAL);
+        let Ok(first_observation) = self.read_state(context) else {
+            return Ok(SmartLeftOutcome::Forwarded);
+        };
+        if !state_is_unchanged(&initial, &first_observation) {
+            return Ok(SmartLeftOutcome::Forwarded);
+        }
+        let mut current = first_observation;
+        let Ok(observations) = self.poll_states(context, POLL_ATTEMPTS - 1) else {
+            return Ok(SmartLeftOutcome::Forwarded);
+        };
+        for observed in observations {
+            if !state_is_unchanged(&initial, &observed) {
                 return Ok(SmartLeftOutcome::Forwarded);
             }
             current = observed;
@@ -169,10 +186,41 @@ where
         Ok(SmartLeftOutcome::Opened)
     }
 
+    fn poll_states(&self, context: &InvocationContext, attempts: usize) -> Result<Vec<PaneState>> {
+        let format = self.state_format();
+        let mut arguments = Vec::with_capacity(attempts * 8);
+        for attempt in 0..attempts {
+            if let Some(delay) = self.sleeper.tmux_sleep_command(POLL_INTERVAL) {
+                arguments.extend([OsString::from("run-shell"), delay, OsString::from(";")]);
+            }
+            arguments.extend([
+                OsString::from("display-message"),
+                OsString::from("-p"),
+                OsString::from("-t"),
+                OsString::from(context.pane_id.as_str()),
+                OsString::from(format.clone()),
+            ]);
+            if attempt + 1 < attempts {
+                arguments.push(OsString::from(";"));
+            }
+        }
+        let output = self.run_checked(arguments)?;
+        let states = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(PaneState::parse)
+            .collect::<Result<Vec<_>>>()?;
+        if states.len() != attempts {
+            return Err(MuxError::Command(
+                "tmux returned an incomplete Smart Left observation batch".to_owned(),
+            ));
+        }
+        Ok(states)
+    }
+
     fn read_state(&self, context: &InvocationContext) -> Result<PaneState> {
-        let format = format!(
-            "#{{pane_pid}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}{FIELD_SEPARATOR}#{{pane_current_command}}{FIELD_SEPARATOR}#{{@codex_mux_shell_prompt}}"
-        );
+        let format = self.state_format();
         let output = self.run_checked(vec![
             OsString::from("display-message"),
             OsString::from("-p"),
@@ -181,6 +229,12 @@ where
             OsString::from(format),
         ])?;
         PaneState::parse(&output.stdout)
+    }
+
+    fn state_format(&self) -> String {
+        format!(
+            "#{{pane_pid}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}{FIELD_SEPARATOR}#{{pane_current_command}}{FIELD_SEPARATOR}#{{@codex_mux_shell_prompt}}"
+        )
     }
 
     fn send_left(&self, context: &InvocationContext) -> Result<()> {
@@ -282,6 +336,16 @@ where
             detail
         }))
     }
+}
+
+fn state_is_unchanged(initial: &PaneState, observed: &PaneState) -> bool {
+    observed.pane_pid == initial.pane_pid
+        && observed.cursor_x == initial.cursor_x
+        && observed.cursor_y == initial.cursor_y
+        && observed.cursor_visible
+        && !observed.pane_in_mode
+        && observed.pane_command == initial.pane_command
+        && observed.shell_prompt == initial.shell_prompt
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -470,6 +534,15 @@ mod tests {
         )
     }
 
+    fn polled(states: impl IntoIterator<Item = CommandOutput>) -> CommandOutput {
+        output(
+            states
+                .into_iter()
+                .flat_map(|state| state.stdout)
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn context() -> InvocationContext {
         InvocationContext {
             client_id: ClientId::new("/dev/pts/7").unwrap(),
@@ -549,8 +622,12 @@ mod tests {
 
     #[test]
     fn unchanged_composer_boundary_opens_exact_client_popup() {
-        let mut outputs = vec![state(2, 10, true, false), output([])];
-        outputs.extend((0..6).map(|_| state(2, 10, true, false)));
+        let mut outputs = vec![
+            state(2, 10, true, false),
+            output([]),
+            state(2, 10, true, false),
+        ];
+        outputs.push(polled((0..5).map(|_| state(2, 10, true, false))));
         let mut screen = [""; 11];
         screen[10] = "› draft";
         outputs.push(output(format!("{}\n", screen.join("\n")).into_bytes()));
@@ -578,6 +655,7 @@ mod tests {
         assert_eq!(sleeper.calls.get(), 6);
         assert_eq!(sleeper.elapsed.get(), Duration::from_millis(30));
         let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 7);
         assert_eq!(
             calls.iter().filter(|call| call[0] == "send-keys").count(),
             1
@@ -595,8 +673,8 @@ mod tests {
 
     #[test]
     fn unchanged_marked_shell_boundary_opens_without_composer_glyph() {
-        let mut outputs = vec![shell_state(0, 4, true), output([])];
-        outputs.extend((0..6).map(|_| shell_state(0, 4, true)));
+        let mut outputs = vec![shell_state(0, 4, true), output([]), shell_state(0, 4, true)];
+        outputs.push(polled((0..5).map(|_| shell_state(0, 4, true))));
         outputs.push(output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()));
         outputs.push(output([]));
         let runner = Runner::with(outputs);
@@ -650,8 +728,12 @@ mod tests {
 
     #[test]
     fn unchanged_cursor_outside_composer_fails_through() {
-        let mut outputs = vec![state(2, 3, true, false), output([])];
-        outputs.extend((0..6).map(|_| state(2, 3, true, false)));
+        let mut outputs = vec![
+            state(2, 3, true, false),
+            output([]),
+            state(2, 3, true, false),
+        ];
+        outputs.push(polled((0..5).map(|_| state(2, 3, true, false))));
         outputs.push(output(b"picker\nrow\nselected\nnot a composer\n".to_vec()));
         let runner = Runner::with(outputs);
         let sleeper = Sleeper::default();
