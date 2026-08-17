@@ -75,7 +75,7 @@ where
         }
 
         let mut seen = HashSet::new();
-        let mut panes = Vec::new();
+        let mut records = Vec::new();
         for line in output.stdout.split(|byte| *byte == b'\n') {
             let Some(record) = TmuxPaneRecord::parse(line) else {
                 continue;
@@ -83,8 +83,24 @@ where
             if !seen.insert(record.pane_id.clone()) {
                 continue;
             }
+            records.push(record);
+        }
 
-            let Ok(Some(executable)) = self.processes.foreground_executable(record.pane_pid) else {
+        let pane_pids = records
+            .iter()
+            .map(|record| record.pane_pid)
+            .collect::<Vec<_>>();
+        let executables = self.processes.foreground_executables(&pane_pids);
+        if executables.len() != records.len() {
+            return Err(MuxError::Command(format!(
+                "process inspector returned {} results for {} panes",
+                executables.len(),
+                records.len()
+            )));
+        }
+        let mut panes = Vec::new();
+        for (record, executable) in records.into_iter().zip(executables) {
+            let Ok(Some(executable)) = executable else {
                 continue;
             };
             if !self

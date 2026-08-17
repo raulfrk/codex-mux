@@ -228,6 +228,18 @@ pub trait TmuxCommandRunner {
 pub trait ProcessInspector {
     /// Resolves the foreground executable associated with a tmux pane process.
     fn foreground_executable(&self, pane_pid: u32) -> Result<Option<PathBuf>>;
+
+    /// Resolves a pane set through one batch boundary.
+    ///
+    /// Implementations may override this to share one coherent process snapshot.
+    /// The returned vector must contain exactly one positionally corresponding
+    /// result for every input PID.
+    fn foreground_executables(&self, pane_pids: &[u32]) -> Vec<Result<Option<PathBuf>>> {
+        pane_pids
+            .iter()
+            .map(|pane_pid| self.foreground_executable(*pane_pid))
+            .collect()
+    }
 }
 
 /// Read/write boundary for the codex-mux-owned theme preference.
