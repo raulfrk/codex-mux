@@ -67,7 +67,7 @@ fn packaged_binary_renders_server_wide_rows_rebuilds_and_handles_navigation_size
         (120, 40, "Commands", "Enter open"),
         (89, 35, "Enter switch", "Commands"),
         (62, 35, "Enter open", "Commands"),
-        (32, 10, "n r x t q", "Commands"),
+        (32, 10, "n r x t c q", "Commands"),
     ]
     .into_iter()
     .enumerate()
