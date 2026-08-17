@@ -94,6 +94,8 @@ pub struct Pane {
     pub session_id: SessionId,
     /// Codex thread title exposed through tmux's supported pane-title channel.
     pub title: Option<String>,
+    /// Smart title owned by codex-mux, when the tmux ownership marker is valid.
+    pub generated_title: Option<String>,
     /// Current working directory exposed by tmux.
     pub current_path: PathBuf,
 }
@@ -102,8 +104,9 @@ impl Pane {
     /// Returns the visible title, falling back to the current directory name.
     #[must_use]
     pub fn display_title(&self) -> String {
-        self.title
+        self.generated_title
             .as_deref()
+            .or(self.title.as_deref())
             .map(str::trim)
             .filter(|title| !title.is_empty())
             .map(ToOwned::to_owned)
@@ -275,6 +278,7 @@ mod tests {
             id: PaneId::new("%3").unwrap(),
             session_id: SessionId::new("$1").unwrap(),
             title: None,
+            generated_title: None,
             current_path: PathBuf::from("/work/codex-mux"),
         };
 

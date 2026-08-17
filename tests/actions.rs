@@ -69,6 +69,7 @@ fn pane(id: &str, path: &str) -> Pane {
         id: PaneId::new(id).unwrap(),
         session_id: SessionId::new("$9").unwrap(),
         title: Some("thread".to_owned()),
+        generated_title: None,
         current_path: PathBuf::from(path),
     }
 }

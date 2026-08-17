@@ -968,6 +968,7 @@ mod tests {
             id: PaneId::new(id).unwrap(),
             session_id: SessionId::new("$1").unwrap(),
             title: Some(title.to_owned()),
+            generated_title: None,
             current_path: PathBuf::from(format!("/work/{title}")),
         }
     }

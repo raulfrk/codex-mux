@@ -1,7 +1,7 @@
 //! Runtime composition for the interactive popup and tmux management commands.
 
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     env,
     ffi::OsString,
     fs,
@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{self, Event};
@@ -36,6 +36,7 @@ use crate::{
     tmux::{
         actions::TmuxActions,
         inventory::PaneInventory,
+        owned_names::OwnedTmuxNames,
         runner::SystemTmuxRunner,
         smart_left::{SmartLeftProbe, SystemSleeper},
     },
@@ -518,9 +519,18 @@ fn run_smart_naming_worker(codex_argument: Option<PathBuf>) -> Result<()> {
         }
     }
     let mut worker = start_naming_worker(&codex, &executables);
+    let owned_names = OwnedTmuxNames::new(SystemTmuxRunner::default());
+    let mut applied_names = HashMap::new();
+    let mut last_name_reconcile = Instant::now() - Duration::from_secs(2);
     let identity = naming_server_identity_from_environment()?;
     let mut retry = Duration::from_millis(100);
     while store.load_preference().smart_naming && tmux_server_matches(&identity) {
+        let names = worker.names().lock().unwrap().clone();
+        if names != applied_names || last_name_reconcile.elapsed() >= Duration::from_secs(2) {
+            owned_names.reconcile(&names);
+            applied_names = names;
+            last_name_reconcile = Instant::now();
+        }
         if worker.is_finished() {
             worker.stop();
             if !wait_for_naming_retry(&store, &identity, retry) {

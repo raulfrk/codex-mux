@@ -16,7 +16,7 @@ use crate::{
 
 const FIELD_SEPARATOR: u8 = 0x1f;
 const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
 pub struct PaneInventory<R, I> {
@@ -111,6 +111,7 @@ where
                 continue;
             }
 
+            let generated_title = record.generated_title();
             let Ok(id) = PaneId::new(record.pane_id) else {
                 continue;
             };
@@ -121,6 +122,7 @@ where
                 id,
                 session_id,
                 title: nonempty_title(record.title),
+                generated_title,
                 current_path: record.current_path,
             });
         }
@@ -182,6 +184,8 @@ struct TmuxPaneRecord {
     pane_pid: u32,
     #[allow(dead_code)]
     tty: OsString,
+    generated_name: String,
+    generated_thread: String,
 }
 
 impl TmuxPaneRecord {
@@ -190,7 +194,7 @@ impl TmuxPaneRecord {
             return None;
         }
         let fields = split_fields(line);
-        if fields.len() != 9 {
+        if fields.len() != 11 {
             return None;
         }
 
@@ -222,7 +226,20 @@ impl TmuxPaneRecord {
             command,
             pane_pid,
             tty: os_string_from_bytes(fields[8]),
+            generated_thread: String::from_utf8_lossy(fields[9]).into_owned(),
+            generated_name: String::from_utf8_lossy(fields[10]).into_owned(),
         })
+    }
+
+    fn generated_title(&self) -> Option<String> {
+        if self.generated_thread == self.title
+            && self.generated_name == self.window_name
+            && !self.generated_name.trim().is_empty()
+        {
+            Some(self.generated_name.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -280,7 +297,7 @@ mod tests {
         assert!(TmuxPaneRecord::parse(b"%1\x1f$1").is_none());
         assert!(
             TmuxPaneRecord::parse(
-                b"%1\x1f$1\x1f@1\x1fmain\x1ftitle\x1frelative\x1fcodex\x1f42\x1f/dev/pts/1"
+                b"%1\x1f$1\x1f@1\x1fmain\x1ftitle\x1frelative\x1fcodex\x1f42\x1f/dev/pts/1\x1f\x1f"
             )
             .is_none()
         );
@@ -289,7 +306,7 @@ mod tests {
     #[test]
     fn parser_accepts_tmux_34_octal_escaped_separators() {
         let record = TmuxPaneRecord::parse(
-            b"%1\\037$1\\037@1\\037main\\037thread\\037/work/project\\037codex\\03742\\037/dev/pts/1",
+            b"%1\\037$1\\037@1\\037main\\037thread\\037/work/project\\037codex\\03742\\037/dev/pts/1\\037\\037",
         )
         .expect("tmux 3.4 record should parse");
 

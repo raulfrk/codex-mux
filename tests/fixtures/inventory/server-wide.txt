@@ -1,6 +1,6 @@
-%1|$1|@1|main|Implement parser|/work/codex mux|codex|101|/dev/pts/1
-%2|$2|@3|agents||/srv/über-project|renamed-agent|102|/dev/pts/2
-%3|$3|@5|other|Not Codex|/tmp/unrelated|codex|103|/dev/pts/3
+%1|$1|@1|main|Implement parser|/work/codex mux|codex|101|/dev/pts/1||
+%2|$2|@3|agents||/srv/über-project|renamed-agent|102|/dev/pts/2||
+%3|$3|@5|other|Not Codex|/tmp/unrelated|codex|103|/dev/pts/3||
 malformed|row
-%4|$4|@8|broken|Bad pid|/work/broken|codex|not-a-pid|/dev/pts/4
-%1|$1|@1|duplicate|Duplicate|/work/duplicate|codex|101|/dev/pts/1
+%4|$4|@8|broken|Bad pid|/work/broken|codex|not-a-pid|/dev/pts/4||
+%1|$1|@1|duplicate|Duplicate|/work/duplicate|codex|101|/dev/pts/1||

@@ -69,7 +69,7 @@ fn inventory_fixture(panes: usize, processes: usize) {
     for index in 1..=panes {
         writeln!(
             rows,
-            "%{index}\x1f${index}\x1f@{index}\x1fwindow\x1fthread-{index}\x1f/work/project-{index}\x1fcodex\x1f{}\x1f/dev/pts/{index}",
+            "%{index}\x1f${index}\x1f@{index}\x1fwindow\x1fthread-{index}\x1f/work/project-{index}\x1fcodex\x1f{}\x1f/dev/pts/{index}\x1f\x1f",
             index + 100
         )
         .unwrap();
@@ -120,7 +120,7 @@ fn inventory_rejects_a_malformed_batch_cardinality() {
     }
 
     let runner = CountingRunner::returning(
-        b"%1\x1f$1\x1f@1\x1fwindow\x1fthread\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\n"
+        b"%1\x1f$1\x1f@1\x1fwindow\x1fthread\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\x1f\x1f\n"
             .to_vec(),
     );
     let inventory = PaneInventory::new(
@@ -165,6 +165,7 @@ fn unzoomed_switch_baseline_is_five_exact_tmux_requests() {
         id: PaneId::new("%2").unwrap(),
         session_id: SessionId::new("$2").unwrap(),
         title: Some("target".to_owned()),
+        generated_title: None,
         current_path: PathBuf::from("/work/target"),
     };
 

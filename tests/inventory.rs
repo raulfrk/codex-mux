@@ -145,6 +145,29 @@ fn custom_renamed_executable_and_unnamed_project_fallback_work() {
 }
 
 #[test]
+fn valid_owned_window_name_is_the_visible_inventory_title() {
+    let thread = "12345678-1234-1234-1234-123456789abc";
+    let row = format!(
+        "%1\x1f$1\x1f@1\x1fSnappy naming\x1f{thread}\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\x1f{thread}\x1fSnappy naming\n"
+    );
+    let processes = FakeProcesses(HashMap::from([(
+        101,
+        ProcessAnswer::Path(PathBuf::from("/opt/bin/codex")),
+    )]));
+    let inventory = PaneInventory::new(
+        FakeRunner::returning(row.into_bytes()),
+        processes,
+        CodexExecutable::new("/opt/bin/codex").unwrap(),
+    );
+
+    let panes = inventory.discover().unwrap();
+
+    assert_eq!(panes[0].title.as_deref(), Some(thread));
+    assert_eq!(panes[0].generated_title.as_deref(), Some("Snappy naming"));
+    assert_eq!(panes[0].display_title(), "Snappy naming");
+}
+
+#[test]
 fn inventory_recognizes_configured_and_profile_executables_together() {
     let processes = FakeProcesses(HashMap::from([
         (101, ProcessAnswer::Path(PathBuf::from("/opt/bin/codex"))),
@@ -179,7 +202,7 @@ fn basename_fallback_requires_canonical_file_identity() {
     fs::write(&real, b"fixture").unwrap();
     symlink(&real, &configured).unwrap();
     let row =
-        b"%1\x1f$1\x1f@1\x1fmain\x1fSymlinked\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\n"
+        b"%1\x1f$1\x1f@1\x1fmain\x1fSymlinked\x1f/work/project\x1fcodex\x1f101\x1f/dev/pts/1\x1f\x1f\n"
             .to_vec();
     let processes = FakeProcesses(HashMap::from([(101, ProcessAnswer::Path(real))]));
     let inventory = PaneInventory::new(
@@ -203,7 +226,7 @@ fn empty_dead_and_inaccessible_processes_degrade_without_panics() {
     );
     assert!(empty.discover().unwrap().is_empty());
 
-    let rows = b"%1\x1f$1\x1f@1\x1fmain\x1fone\x1f/work/one\x1fcodex\x1f101\x1f/dev/pts/1\n%2\x1f$1\x1f@1\x1fmain\x1ftwo\x1f/work/two\x1fcodex\x1f102\x1f/dev/pts/2\n".to_vec();
+    let rows = b"%1\x1f$1\x1f@1\x1fmain\x1fone\x1f/work/one\x1fcodex\x1f101\x1f/dev/pts/1\x1f\x1f\n%2\x1f$1\x1f@1\x1fmain\x1ftwo\x1f/work/two\x1fcodex\x1f102\x1f/dev/pts/2\x1f\x1f\n".to_vec();
     let processes = FakeProcesses(HashMap::from([
         (101, ProcessAnswer::Missing),
         (102, ProcessAnswer::Inaccessible),
