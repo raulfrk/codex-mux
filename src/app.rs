@@ -26,6 +26,7 @@ use crate::{
     },
     linux_process::LinuxProcessInspector,
     shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
+    smart_naming::{AppServerProcess, start_if_enabled},
     tmux::{
         actions::TmuxActions,
         inventory::PaneInventory,
@@ -343,16 +344,26 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
     } else {
         ColorPolicy::Allow
     };
-    let mut app = App::with_profiles(
+    let mut app = App::with_settings(
         panes,
         preference.selected,
         preference.warning,
         color_policy,
         preference.profiles,
+        preference.smart_naming,
     );
     app.select_pane(&context.pane_id);
     let runner = SystemTmuxRunner::default();
     let actions = TmuxActions::new(&runner, &codex);
+    let mut naming_process = match start_if_enabled(preference.smart_naming, || {
+        AppServerProcess::spawn(codex.as_path())
+    }) {
+        Ok(process) => process,
+        Err(error) => {
+            app.smart_naming_runtime_failed(error.to_string());
+            None
+        }
+    };
 
     ui::terminal::with_terminal(io::stdout(), |terminal| {
         loop {
@@ -401,6 +412,24 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                     Ok(()) => app.profiles_saved(profiles),
                     Err(error) => app.profile_save_failed(error.to_string()),
                 },
+                Action::PersistSmartNaming(enabled) => {
+                    match theme_store.save_smart_naming(enabled) {
+                        Err(error) => app.smart_naming_save_failed(enabled, error.to_string()),
+                        Ok(()) => {
+                            app.smart_naming_saved();
+                            if enabled && naming_process.is_none() {
+                                match AppServerProcess::spawn(codex.as_path()) {
+                                    Ok(process) => naming_process = Some(process),
+                                    Err(error) => {
+                                        app.smart_naming_runtime_failed(error.to_string())
+                                    }
+                                }
+                            } else if !enabled {
+                                naming_process = None;
+                            }
+                        }
+                    }
+                }
                 Action::Resume => {
                     actions.resume_all(&context, selected_pane(&app))?;
                     return Ok(());

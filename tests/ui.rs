@@ -216,5 +216,84 @@ fn tiny_layout_is_deterministic_and_keeps_primary_controls() {
     let second = rendered(32, 8);
     assert_eq!(first, second);
     assert!(first.contains("shipping feature"));
-    assert!(first.contains("n r x t q"));
+    assert!(first.contains("n r x t c q"));
+}
+
+#[test]
+fn configuration_panel_explains_and_toggles_smart_naming() {
+    let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);
+    assert!(!app.smart_naming_enabled());
+    app.handle_key(key(KeyCode::Char('C')));
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("Conversation-aware names"));
+    assert!(text.contains("OFF (default)"));
+    assert!(text.contains("completed Codex conversation"));
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('N'))),
+        Some(Action::PersistSmartNaming(true))
+    );
+    assert!(app.smart_naming_enabled());
+}
+
+#[test]
+fn configuration_disclosure_and_controls_remain_visible_on_phone_and_tiny_screens() {
+    for (width, height) in [(62, 20), (32, 8)] {
+        let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);
+        app.handle_key(key(KeyCode::Char('c')));
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Smart names: OFF"));
+        assert!(text.contains("GPT-5.6 Luna"));
+        assert!(
+            text.contains("stores no chat")
+                || text.contains("No chat stored")
+                || text.contains("not stored")
+        );
+        assert!(text.contains("N toggle"));
+    }
+}
+
+#[test]
+fn naming_persistence_failure_rolls_back_and_success_clears_its_warning() {
+    let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);
+    app.handle_key(key(KeyCode::Char('c')));
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('n'))),
+        Some(Action::PersistSmartNaming(true))
+    );
+    app.smart_naming_save_failed(true, "disk full");
+    assert!(!app.smart_naming_enabled());
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('n'))),
+        Some(Action::PersistSmartNaming(true))
+    );
+    app.smart_naming_saved();
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!text.contains("disk full"));
 }

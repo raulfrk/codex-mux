@@ -57,6 +57,8 @@ pub enum Action {
     LaunchProfile(LaunchProfile),
     /// Persist a complete replacement profile set.
     PersistProfiles(Vec<LaunchProfile>),
+    /// Persist an explicit conversation-aware naming preference.
+    PersistSmartNaming(bool),
     /// Start Codex with its resume subcommand.
     Resume,
     /// Close the pane after explicit confirmation.
@@ -84,6 +86,7 @@ enum Mode {
     ThemePicker { original: ThemeId },
     ProfilePicker { selected: usize },
     ProfileEditor(ProfileEditor),
+    Configuration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +147,8 @@ pub struct App {
     mode: Mode,
     warning: Option<String>,
     profiles: Vec<LaunchProfile>,
+    smart_naming: bool,
+    naming_save_warning: bool,
 }
 
 impl App {
@@ -179,6 +184,19 @@ impl App {
         color_policy: ColorPolicy,
         profiles: Vec<LaunchProfile>,
     ) -> Self {
+        Self::with_settings(panes, theme, warning, color_policy, profiles, false)
+    }
+
+    /// Creates application state with all persisted user settings.
+    #[must_use]
+    pub fn with_settings(
+        panes: Vec<Pane>,
+        theme: ThemeId,
+        warning: Option<String>,
+        color_policy: ColorPolicy,
+        profiles: Vec<LaunchProfile>,
+        smart_naming: bool,
+    ) -> Self {
         let selected = panes.first().map(|pane| pane.id.clone());
         Self {
             panes,
@@ -192,7 +210,35 @@ impl App {
             mode: Mode::Browse,
             warning,
             profiles,
+            smart_naming,
+            naming_save_warning: false,
         }
+    }
+
+    /// Returns whether conversation-aware naming is currently enabled.
+    #[must_use]
+    pub const fn smart_naming_enabled(&self) -> bool {
+        self.smart_naming
+    }
+
+    /// Restores the prior value after persistence fails.
+    pub fn smart_naming_save_failed(&mut self, enabled: bool, error: impl Into<String>) {
+        self.smart_naming = !enabled;
+        self.warning = Some(error.into());
+        self.naming_save_warning = true;
+    }
+
+    /// Confirms persistence and clears only a prior naming-save warning.
+    pub fn smart_naming_saved(&mut self) {
+        if self.naming_save_warning {
+            self.warning = None;
+            self.naming_save_warning = false;
+        }
+    }
+
+    /// Reports a non-blocking provider startup failure while retaining opt-in.
+    pub fn smart_naming_runtime_failed(&mut self, error: impl Into<String>) {
+        self.warning = Some(error.into());
     }
 
     /// Returns the active launch profiles.
@@ -273,6 +319,7 @@ impl App {
             Mode::ThemePicker { original } => self.handle_theme_key(key.code, original),
             Mode::ProfilePicker { selected } => self.handle_profile_key(key.code, selected),
             Mode::ProfileEditor(editor) => self.handle_editor_key(key.code, editor),
+            Mode::Configuration => self.handle_configuration_key(key.code),
         }
     }
 
@@ -306,7 +353,25 @@ impl App {
                 }
                 None
             }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.mode = Mode::Configuration;
+                None
+            }
             KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+            _ => None,
+        }
+    }
+
+    fn handle_configuration_key(&mut self, code: KeyCode) -> Option<Action> {
+        match code {
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.smart_naming = !self.smart_naming;
+                Some(Action::PersistSmartNaming(self.smart_naming))
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Browse;
+                None
+            }
             _ => None,
         }
     }
@@ -517,6 +582,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             render_profile_picker(frame, area, app, palette, *selected);
         }
         Mode::ProfileEditor(editor) => render_profile_editor(frame, area, editor, palette),
+        Mode::Configuration => render_configuration(frame, area, app, palette),
         _ => {}
     }
 }
@@ -554,6 +620,7 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
         Line::from("r      resume"),
         Line::from("x x    close"),
         Line::from("t      themes"),
+        Line::from("c      config"),
         Line::from("q/Esc  quit"),
     ];
     if matches!(app.mode, Mode::ConfirmClose(_)) {
@@ -589,11 +656,13 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, 
             .style(palette.warning)
             .wrap(Wrap { trim: true })
     } else if phone {
-        Paragraph::new("↕/jk move · Enter open · n new · r resume · x close · t theme")
+        Paragraph::new("↕/jk move · Enter open · n new · r resume · x close · c config")
             .style(palette.muted)
     } else {
-        Paragraph::new("jk/↕ move  Enter switch  n new  r resume  x close  t theme  q quit")
-            .style(palette.muted)
+        Paragraph::new(
+            "jk/↕ move  Enter switch  n new  r resume  x close  t theme  c config  q quit",
+        )
+        .style(palette.muted)
     };
     frame.render_widget(footer, chunks[2]);
 }
@@ -614,7 +683,7 @@ fn render_tiny(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
         vec![
             Line::styled("codex-mux", palette.accent),
             Line::styled(title, palette.selected),
-            Line::styled("↕ open n r x t q", palette.muted),
+            Line::styled("↕ open n r x t c q", palette.muted),
         ]
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
@@ -784,6 +853,63 @@ fn render_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Th
         )
         .alignment(Alignment::Left);
     frame.render_widget(picker, popup);
+}
+
+fn render_configuration(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
+    let constrained = area.width <= 62 || area.height < 16;
+    let popup = centered_rect(
+        area,
+        if constrained { 96 } else { 66 },
+        if constrained { 8 } else { 12 },
+    );
+    frame.render_widget(Clear, popup);
+    let state = if app.smart_naming {
+        "ON"
+    } else {
+        "OFF (default)"
+    };
+    let lines = if area.width < 40 {
+        vec![
+            Line::styled(format!(" N Smart names: {state}"), palette.selected),
+            Line::from("GPT-5.6 Luna gets chat"),
+            Line::from("Uses allowance · not stored"),
+            Line::from("Manual/error keeps title"),
+            Line::styled("N toggle · Esc close", palette.muted),
+        ]
+    } else if constrained {
+        vec![
+            Line::styled(format!(" N  Smart names: {state}"), palette.selected),
+            Line::from("Shares bounded completed chat with GPT-5.6 Luna."),
+            Line::from("Uses Codex allowance; codex-mux stores no chat."),
+            Line::from("No restart. Errors/manual names keep current title."),
+            Line::styled("N toggle · C/Esc close", palette.muted),
+        ]
+    } else {
+        vec![
+            Line::styled(
+                format!(" N  Conversation-aware names  {state}"),
+                palette.selected,
+            ),
+            Line::default(),
+            Line::from("Reads completed Codex conversation text and sends a bounded excerpt"),
+            Line::from("to GPT-5.6 Luna using your existing Codex login. Content is not saved"),
+            Line::from("by codex-mux. Model usage may count against your Codex allowance."),
+            Line::default(),
+            Line::from("Works for running sessions without restart. Failures keep current names."),
+            Line::from("Manually renamed windows are never overwritten."),
+            Line::default(),
+            Line::styled("N toggle · C/Esc close", palette.muted),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(" configuration ")
+                .borders(Borders::ALL)
+                .border_style(palette.accent),
+        ),
+        popup,
+    );
 }
 
 fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {

@@ -82,6 +82,8 @@ pub struct ThemePreference {
     pub was_saved: bool,
     /// Persisted launch profiles, or safe first-run defaults.
     pub profiles: Vec<LaunchProfile>,
+    /// Whether conversation-aware Luna naming is explicitly enabled.
+    pub smart_naming: bool,
 }
 
 impl ThemePreference {
@@ -111,6 +113,8 @@ struct ConfigFile {
     theme: ThemeId,
     #[serde(default = "default_profiles")]
     profiles: Vec<LaunchProfile>,
+    #[serde(default)]
+    smart_naming: bool,
 }
 
 /// Filesystem-backed theme store using an XDG configuration path.
@@ -154,12 +158,14 @@ impl XdgThemeStore {
                 warning: None,
                 was_saved: true,
                 profiles: config.profiles,
+                smart_naming: config.smart_naming,
             },
             Ok(None) => ThemePreference {
                 selected: ThemeId::default(),
                 warning: None,
                 was_saved: false,
                 profiles: default_profiles(),
+                smart_naming: false,
             },
             Err(error) => ThemePreference {
                 selected: ThemeId::default(),
@@ -170,6 +176,7 @@ impl XdgThemeStore {
                 )),
                 was_saved: false,
                 profiles: default_profiles(),
+                smart_naming: false,
             },
         }
     }
@@ -202,10 +209,23 @@ impl XdgThemeStore {
     pub fn save_profiles(&self, profiles: &[LaunchProfile]) -> Result<()> {
         validate_profiles(profiles)?;
         let _lock = self.lock_parent()?;
-        let theme = self
-            .load_parsed_config()?
+        let config = self.load_parsed_config()?;
+        let theme = config
+            .as_ref()
             .map_or_else(ThemeId::default, |config| config.theme);
-        self.save_atomic(theme, profiles)
+        let smart_naming = config.is_some_and(|config| config.smart_naming);
+        self.save_atomic(theme, profiles, smart_naming)
+    }
+
+    /// Atomically persists the explicit conversation-aware naming preference.
+    pub fn save_smart_naming(&self, enabled: bool) -> Result<()> {
+        let _lock = self.lock_parent()?;
+        let config = self.load_config()?;
+        let theme = config
+            .as_ref()
+            .map_or_else(ThemeId::default, |value| value.theme);
+        let profiles = config.map_or_else(default_profiles, |value| value.profiles);
+        self.save_atomic(theme, &profiles, enabled)
     }
 
     fn lock_parent(&self) -> Result<ConfigLock> {
@@ -230,7 +250,12 @@ impl XdgThemeStore {
         Ok(ConfigLock(directory))
     }
 
-    fn save_atomic(&self, theme: ThemeId, profiles: &[LaunchProfile]) -> Result<()> {
+    fn save_atomic(
+        &self,
+        theme: ThemeId,
+        profiles: &[LaunchProfile],
+        smart_naming: bool,
+    ) -> Result<()> {
         let parent = self.path.parent().ok_or_else(|| MuxError::InvalidValue {
             field: "theme configuration path",
             message: "must have a parent directory".to_owned(),
@@ -243,6 +268,7 @@ impl XdgThemeStore {
         let contents = toml::to_string_pretty(&ConfigFile {
             theme,
             profiles: profiles.to_vec(),
+            smart_naming,
         })
         .map_err(|error| {
             MuxError::Command(format!("could not serialize configuration: {error}"))
@@ -313,10 +339,10 @@ impl ThemeStore for XdgThemeStore {
 
     fn save(&self, theme: ThemeId) -> Result<()> {
         let _lock = self.lock_parent()?;
-        let profiles = self
-            .load_config()?
-            .map_or_else(default_profiles, |config| config.profiles);
-        self.save_atomic(theme, &profiles)
+        let profiles = self.load_config()?;
+        let smart_naming = profiles.as_ref().is_some_and(|config| config.smart_naming);
+        let profiles = profiles.map_or_else(default_profiles, |config| config.profiles);
+        self.save_atomic(theme, &profiles, smart_naming)
     }
 }
 

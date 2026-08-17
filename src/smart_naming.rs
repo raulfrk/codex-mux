@@ -1,5 +1,18 @@
 //! Privacy-bounded conversation extraction and Codex app-server naming contract.
 
+use std::{
+    collections::VecDeque,
+    io::{BufRead, BufReader, Read, Write},
+    path::Path,
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -11,6 +24,225 @@ pub const NAMING_MODEL: &str = "gpt-5.6-luna";
 pub const MAX_CONVERSATION_BYTES: usize = 12 * 1024;
 /// Maximum accepted generated title length in Unicode scalar values.
 pub const MAX_NAME_CHARS: usize = 48;
+
+/// Lazily constructs naming infrastructure only after an explicit opt-in.
+///
+/// Keeping construction behind this gate makes the default-off privacy
+/// contract testable: disabled mode cannot spawn app-server or issue requests.
+pub fn start_if_enabled<T>(enabled: bool, start: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    enabled.then(start).transpose()
+}
+
+/// Managed local Codex app-server process used by the naming worker.
+pub struct AppServerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    messages: Option<Receiver<Value>>,
+    pending: VecDeque<Value>,
+    reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    next_id: u64,
+}
+
+impl AppServerProcess {
+    /// Starts app-server with local stdio and the user's existing Codex authentication.
+    pub fn spawn(codex: &Path) -> Result<Self> {
+        let mut child = Command::new(codex)
+            .args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| MuxError::Filesystem {
+                path: codex.to_owned(),
+                source,
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| protocol("app-server stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| protocol("app-server stdout unavailable"))?;
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| protocol("app-server stderr unavailable"))?;
+        let (sender, messages) = mpsc::sync_channel(64);
+        let reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = Vec::new();
+                let Ok(read) = reader
+                    .by_ref()
+                    .take(256 * 1024 + 1)
+                    .read_until(b'\n', &mut line)
+                else {
+                    break;
+                };
+                if read == 0 || line.len() > 256 * 1024 || !line.ends_with(b"\n") {
+                    break;
+                }
+                if let Ok(message) = serde_json::from_slice(&line) {
+                    if sender.send(message).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let captured = stderr.clone();
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr_pipe.take(4096).read_to_end(&mut bytes);
+            *captured.lock().unwrap() = bytes;
+        });
+        let mut process = Self {
+            child,
+            stdin,
+            messages: Some(messages),
+            pending: VecDeque::new(),
+            reader: Some(reader),
+            stderr_reader: Some(stderr_reader),
+            stderr,
+            next_id: 1,
+        };
+        process.initialize()?;
+        Ok(process)
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let id = self.send_request("initialize", json!({
+            "clientInfo": {"name": "codex-mux", "title": "codex-mux smart naming", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": false}
+        }))?;
+        let response =
+            self.receive_matching(Duration::from_secs(3), |message| message["id"] == id)?;
+        response_result(response)?;
+        self.write_message(&json!({"method": "initialized"}))
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write_message(&json!({"id": id, "method": method, "params": params}))?;
+        Ok(id)
+    }
+
+    fn write_message(&mut self, message: &Value) -> Result<()> {
+        let mut encoded = serde_json::to_vec(message)
+            .map_err(|error| protocol(&format!("could not encode request: {error}")))?;
+        encoded.push(b'\n');
+        self.stdin
+            .write_all(&encoded)
+            .and_then(|()| self.stdin.flush())
+            .map_err(|source| MuxError::Filesystem {
+                path: Path::new("codex app-server stdin").to_owned(),
+                source,
+            })
+    }
+
+    fn receive_matching(
+        &mut self,
+        timeout: Duration,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<Value> {
+        if let Some(index) = self.pending.iter().position(&matches) {
+            return Ok(self.pending.remove(index).expect("pending index exists"));
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let message = self
+                .messages
+                .as_ref()
+                .expect("receiver exists")
+                .recv_timeout(remaining)
+                .map_err(|_| {
+                    let detail = String::from_utf8_lossy(&self.stderr.lock().unwrap())
+                        .trim()
+                        .to_owned();
+                    protocol(if detail.is_empty() {
+                        "app-server readiness timed out"
+                    } else {
+                        &detail
+                    })
+                })?;
+            if matches(&message) {
+                return Ok(message);
+            }
+            if should_retain(&message) {
+                retain_pending(&mut self.pending, message)?;
+            }
+        }
+    }
+}
+
+impl AppServerSession for AppServerProcess {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.send_request(method, params)?;
+        let response =
+            self.receive_matching(Duration::from_secs(10), |message| message["id"] == id)?;
+        response_result(response)
+    }
+
+    fn wait_for(&mut self, method: &str, thread_id: &str) -> Result<Value> {
+        let message = self.receive_matching(Duration::from_secs(30), |message| {
+            message["method"] == method
+                && message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
+        })?;
+        self.pending.retain(|pending| {
+            pending.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id)
+        });
+        message
+            .get("params")
+            .cloned()
+            .ok_or_else(|| protocol("notification omitted params"))
+    }
+}
+
+fn should_retain(message: &Value) -> bool {
+    let response = message.get("id").is_some()
+        && message.get("method").is_none()
+        && (message.get("result").is_some() || message.get("error").is_some());
+    response || message["method"] == "turn/completed"
+}
+
+fn retain_pending(pending: &mut VecDeque<Value>, message: Value) -> Result<()> {
+    if pending.len() == 64 {
+        return Err(protocol(
+            "app-server pending message queue exceeded its bound",
+        ));
+    }
+    pending.push_back(message);
+    Ok(())
+}
+
+fn response_result(mut response: Value) -> Result<Value> {
+    if let Some(error) = response.get("error") {
+        return Err(protocol(&format!("app-server rejected request: {error}")));
+    }
+    response
+        .get_mut("result")
+        .map(Value::take)
+        .ok_or_else(|| protocol("app-server response omitted result"))
+}
+
+impl Drop for AppServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.messages.take();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 /// Synchronous request/notification seam implemented by the managed app-server process.
 pub trait AppServerSession {
@@ -187,4 +419,36 @@ fn is_unsafe_format_character(character: char) -> bool {
 
 fn protocol(message: &str) -> MuxError {
     MuxError::Command(format!("Codex app-server protocol error: {message}"))
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn noisy_multi_turn_traffic_retains_only_future_consumers() {
+        let mut pending = VecDeque::new();
+        for index in 0..500 {
+            let delta = json!({"method": "item/agentMessage/delta", "params": {"threadId": "naming", "delta": index}});
+            assert!(!should_retain(&delta));
+        }
+        assert!(!should_retain(&json!({
+            "id": 91,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "naming"}
+        })));
+        for message in [
+            json!({"id": 7, "result": {}}),
+            json!({"method": "turn/completed", "params": {"threadId": "other"}}),
+        ] {
+            if should_retain(&message) {
+                retain_pending(&mut pending, message).unwrap();
+            }
+        }
+        assert_eq!(pending.len(), 2);
+        pending.retain(|message| {
+            message.pointer("/params/threadId").and_then(Value::as_str) != Some("other")
+        });
+        assert_eq!(pending, VecDeque::from([json!({"id": 7, "result": {}})]));
+    }
 }

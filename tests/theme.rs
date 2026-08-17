@@ -68,7 +68,27 @@ fn legacy_theme_only_config_receives_default_profiles() {
         vec![LaunchProfile::standard(), LaunchProfile::yolo()]
     );
     assert!(preference.warning.is_none());
+    assert!(!preference.smart_naming);
 
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn smart_naming_defaults_off_and_round_trips_without_losing_other_settings() {
+    let path = temporary_config("smart-naming");
+    let store = XdgThemeStore::at(&path);
+    assert!(!store.load_preference().smart_naming);
+    store.save(ThemeId::EmberOrange).unwrap();
+    store.save_smart_naming(true).unwrap();
+    let preference = store.load_preference();
+    assert!(preference.smart_naming);
+    assert_eq!(preference.selected, ThemeId::EmberOrange);
+    assert_eq!(
+        preference.profiles,
+        vec![LaunchProfile::standard(), LaunchProfile::yolo()]
+    );
+    store.save_profiles(&[LaunchProfile::standard()]).unwrap();
+    assert!(store.load_preference().smart_naming);
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 

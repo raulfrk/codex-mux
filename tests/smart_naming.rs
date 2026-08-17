@@ -6,7 +6,8 @@ use std::{
 use codex_mux::{
     Result,
     smart_naming::{
-        AppServerNamer, AppServerSession, MAX_CONVERSATION_BYTES, NAMING_MODEL, NamingConversation,
+        AppServerNamer, AppServerProcess, AppServerSession, MAX_CONVERSATION_BYTES, NAMING_MODEL,
+        NamingConversation, start_if_enabled,
     },
 };
 use serde_json::{Value, json};
@@ -14,6 +15,28 @@ use serde_json::{Value, json};
 struct FakeSession {
     replies: VecDeque<Value>,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+#[test]
+fn immediate_app_server_exit_is_a_readiness_error_and_is_reaped() {
+    let error = match AppServerProcess::spawn(std::path::Path::new("/bin/false")) {
+        Ok(_) => panic!("exiting process unexpectedly became ready"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("app-server"));
+}
+
+#[test]
+fn disabled_mode_does_not_construct_or_call_a_provider() {
+    let starts = Arc::new(Mutex::new(0));
+    let observed = starts.clone();
+    let provider = start_if_enabled(false, || {
+        *observed.lock().unwrap() += 1;
+        Ok("provider")
+    })
+    .unwrap();
+    assert_eq!(provider, None);
+    assert_eq!(*starts.lock().unwrap(), 0);
 }
 
 impl AppServerSession for FakeSession {
