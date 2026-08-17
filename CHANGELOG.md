@@ -4,6 +4,12 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-17
+
+### Fixed
+
+- Restore the Codex pane that was active when codex-mux was opened.
+
 ## [0.2.0] - 2026-08-16
 
 ### Added
