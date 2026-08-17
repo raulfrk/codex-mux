@@ -14,7 +14,7 @@ use crossterm::event::{self, Event};
 use crate::{
     MuxError, Result,
     cli::{Cli, Command, ConfigPathArgs, InstallArgs, RemoveArgs, SetupArgs, TmuxCommand},
-    config::{XdgThemeStore, no_color_requested},
+    config::{PermissionPreset, XdgThemeStore, no_color_requested},
     domain::{
         ClientId, CodexExecutable, InvocationContext, PaneId, SessionId, ThemeStore,
         TmuxCommandRunner,
@@ -320,21 +320,36 @@ fn run_smart_left(cli: &Cli, codex_argument: Option<PathBuf>) -> Result<()> {
 fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
     let context = invocation_context(&cli)?;
     let codex = resolve_codex(codex_argument)?;
-    let inventory = PaneInventory::new(
-        SystemTmuxRunner::default(),
-        LinuxProcessInspector::new(codex.clone()),
-        codex.clone(),
-    );
-    let panes = inventory.discover()?;
     let theme_store = XdgThemeStore::discover()?;
     let preference = theme_store.load_preference();
+    let mut codex_executables = vec![codex.clone()];
+    for path in preference
+        .profiles
+        .iter()
+        .filter_map(|profile| profile.executable.clone())
+    {
+        let executable = CodexExecutable::new(path)?;
+        if !codex_executables.contains(&executable) {
+            codex_executables.push(executable);
+        }
+    }
+    let inspector =
+        LinuxProcessInspector::with_executables(codex.clone(), codex_executables.clone());
+    let inventory =
+        PaneInventory::with_executables(SystemTmuxRunner::default(), inspector, codex_executables);
+    let panes = inventory.discover()?;
     let color_policy = if no_color_requested() {
         ColorPolicy::ForceMonochrome
     } else {
         ColorPolicy::Allow
     };
-    let mut app =
-        App::with_color_policy(panes, preference.selected, preference.warning, color_policy);
+    let mut app = App::with_profiles(
+        panes,
+        preference.selected,
+        preference.warning,
+        color_policy,
+        preference.profiles,
+    );
     let runner = SystemTmuxRunner::default();
     let actions = TmuxActions::new(&runner, &codex);
 
@@ -368,6 +383,23 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                     actions.new_session(&context, selected_pane(&app))?;
                     return Ok(());
                 }
+                Action::LaunchProfile(profile) => {
+                    let executable = match profile.executable {
+                        Some(path) => crate::domain::CodexExecutable::new(path)?,
+                        None => codex.clone(),
+                    };
+                    actions.new_session_with_profile(
+                        &context,
+                        selected_pane(&app),
+                        &executable,
+                        profile.permissions == PermissionPreset::Yolo,
+                    )?;
+                    return Ok(());
+                }
+                Action::PersistProfiles(profiles) => match theme_store.save_profiles(&profiles) {
+                    Ok(()) => app.profiles_saved(profiles),
+                    Err(error) => app.profile_save_failed(error.to_string()),
+                },
                 Action::Resume => {
                     actions.resume_all(&context, selected_pane(&app))?;
                     return Ok(());

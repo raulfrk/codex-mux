@@ -41,6 +41,18 @@ pub fn new_window_arguments(
     selected: Option<&Pane>,
     kind: LaunchKind,
 ) -> Vec<OsString> {
+    new_window_arguments_with_permissions(executable, context, selected, kind, false)
+}
+
+/// Builds direct tmux arguments for a profile-selected Codex launch.
+#[must_use]
+pub fn new_window_arguments_with_permissions(
+    executable: &CodexExecutable,
+    context: &InvocationContext,
+    selected: Option<&Pane>,
+    kind: LaunchKind,
+    yolo: bool,
+) -> Vec<OsString> {
     let mut arguments = vec![
         OsString::from("new-window"),
         OsString::from("-d"),
@@ -59,6 +71,8 @@ pub fn new_window_arguments(
 
     if kind == LaunchKind::ResumeAll {
         arguments.extend([OsString::from("resume"), OsString::from("--all")]);
+    } else if yolo {
+        arguments.push(OsString::from("--yolo"));
     }
 
     arguments

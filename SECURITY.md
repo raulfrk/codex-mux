@@ -20,7 +20,7 @@ The project deliberately:
 - passes launch and targeting values as argument vectors rather than interpolating them through a shell;
 - manages only its uniquely marked tmux configuration block and refuses symlinks, ambiguous entrypoints, non-regular files, and non-owner-writable files;
 - requires a second fresh confirmation key before killing the selected pane;
-- stores only a theme identifier in `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml`, normally with mode `0600`;
+- stores only a theme identifier and validated launch profiles in `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml`, normally with mode `0600`; custom binaries must be absolute, regular executable files;
 - has no Setforge runtime dependency and does not let Setforge manage tmux or theme configuration.
 
 Tmux clients attached to the same session share that session's active window, and clients viewing the same window share its zoom state. Selecting or zooming through `codex-mux` can therefore be visible to those same-session clients. This is expected tmux behavior and should be considered when sharing a tmux server with another person.

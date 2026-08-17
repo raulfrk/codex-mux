@@ -145,6 +145,31 @@ fn custom_renamed_executable_and_unnamed_project_fallback_work() {
 }
 
 #[test]
+fn inventory_recognizes_configured_and_profile_executables_together() {
+    let processes = FakeProcesses(HashMap::from([
+        (101, ProcessAnswer::Path(PathBuf::from("/opt/bin/codex"))),
+        (
+            102,
+            ProcessAnswer::Path(PathBuf::from("/opt/bin/renamed-agent")),
+        ),
+    ]));
+    let inventory = PaneInventory::with_executables(
+        FakeRunner::returning(fixture()),
+        processes,
+        vec![
+            CodexExecutable::new("/opt/bin/codex").unwrap(),
+            CodexExecutable::new("/opt/bin/renamed-agent").unwrap(),
+        ],
+    );
+
+    let panes = inventory.discover().unwrap();
+
+    assert_eq!(panes.len(), 2);
+    assert_eq!(panes[0].id.as_str(), "%1");
+    assert_eq!(panes[1].id.as_str(), "%2");
+}
+
+#[test]
 fn basename_fallback_requires_canonical_file_identity() {
     let root = TemporaryDirectory::new("canonical-fallback");
     let real = root.path().join("real/codex");
@@ -234,6 +259,36 @@ fn proc_group_wrapper_requires_absolute_configured_path_evidence() {
         inspector.foreground_executable(10).unwrap(),
         Some(configured)
     );
+    assert!(!inspector.foreground_process_is_exact(10).unwrap());
+}
+
+#[test]
+fn proc_group_wrapper_recognizes_a_profile_specific_executable() {
+    let root = TemporaryDirectory::new("proc-profile-wrapper");
+    let primary = root.path().join("bin/codex");
+    let profile = root.path().join("bin/codex-custom");
+    fs::create_dir_all(primary.parent().unwrap()).unwrap();
+    fs::write(&primary, b"primary").unwrap();
+    fs::write(&profile, b"profile").unwrap();
+    write_process(root.path(), 10, 10, 34816, 20, "/bin/sh", &["/bin/sh"]);
+    write_process(
+        root.path(),
+        20,
+        20,
+        34816,
+        20,
+        "/usr/bin/env",
+        &["/usr/bin/env", profile.to_str().unwrap()],
+    );
+    let primary = CodexExecutable::new(primary).unwrap();
+    let profile_executable = CodexExecutable::new(&profile).unwrap();
+    let inspector = LinuxProcessInspector::with_proc_root_and_executables(
+        primary.clone(),
+        vec![primary, profile_executable],
+        root.path(),
+    );
+
+    assert_eq!(inspector.foreground_executable(10).unwrap(), Some(profile));
     assert!(!inspector.foreground_process_is_exact(10).unwrap());
 }
 

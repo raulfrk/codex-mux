@@ -22,7 +22,7 @@ const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{wind
 pub struct PaneInventory<R, I> {
     runner: R,
     processes: I,
-    codex: CodexExecutable,
+    codex_executables: Vec<CodexExecutable>,
 }
 
 impl<R, I> PaneInventory<R, I>
@@ -36,7 +36,21 @@ where
         Self {
             runner,
             processes,
-            codex,
+            codex_executables: vec![codex],
+        }
+    }
+
+    /// Creates an inventory that recognizes configured and profile-specific binaries.
+    #[must_use]
+    pub fn with_executables(
+        runner: R,
+        processes: I,
+        codex_executables: Vec<CodexExecutable>,
+    ) -> Self {
+        Self {
+            runner,
+            processes,
+            codex_executables,
         }
     }
 
@@ -73,7 +87,11 @@ where
             let Ok(Some(executable)) = self.processes.foreground_executable(record.pane_pid) else {
                 continue;
             };
-            if !matches_executable(&executable, self.codex.as_path(), &record.command) {
+            if !self
+                .codex_executables
+                .iter()
+                .any(|codex| matches_executable(&executable, codex.as_path(), &record.command))
+            {
                 continue;
             }
 

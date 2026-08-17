@@ -5,7 +5,7 @@ use std::{ffi::OsString, str};
 use crate::{
     MuxError, Result,
     domain::{CodexExecutable, CommandOutput, InvocationContext, Pane, PaneId, TmuxCommandRunner},
-    launch::{LaunchKind, new_window_arguments},
+    launch::{LaunchKind, new_window_arguments, new_window_arguments_with_permissions},
 };
 
 /// Executes interactive actions through an injectable tmux command boundary.
@@ -56,6 +56,27 @@ where
         selected: Option<&Pane>,
     ) -> Result<PaneId> {
         self.launch(context, selected, LaunchKind::New)
+    }
+
+    /// Starts a fresh session with a profile-selected executable and permissions.
+    pub fn new_session_with_profile(
+        &self,
+        context: &InvocationContext,
+        selected: Option<&Pane>,
+        executable: &CodexExecutable,
+        yolo: bool,
+    ) -> Result<PaneId> {
+        let arguments = new_window_arguments_with_permissions(
+            executable,
+            context,
+            selected,
+            LaunchKind::New,
+            yolo,
+        );
+        let output = self.run_checked(&arguments)?;
+        let pane_id = parse_pane_id(&output.stdout)?;
+        self.switch_client(context, &pane_id)?;
+        Ok(pane_id)
     }
 
     /// Opens `codex resume --all` in a new window and selects it for the invoking client.
