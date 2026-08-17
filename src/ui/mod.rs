@@ -132,6 +132,13 @@ impl App {
         self.selected.as_ref()
     }
 
+    /// Selects the requested pane when it is present in the current inventory.
+    pub fn select_pane(&mut self, id: &PaneId) {
+        if self.panes.iter().any(|pane| &pane.id == id) {
+            self.selected = Some(id.clone());
+        }
+    }
+
     /// Returns the theme currently shown, including picker live previews.
     #[must_use]
     pub const fn active_theme(&self) -> ThemeId {
@@ -526,6 +533,21 @@ mod tests {
         assert_eq!(app.selected_pane_id().unwrap().as_str(), "%2");
         app.replace_panes(vec![pane("%3", "three"), pane("%1", "one")]);
         assert_eq!(app.selected_pane_id().unwrap().as_str(), "%1");
+    }
+
+    #[test]
+    fn explicit_selection_uses_requested_pane_and_ignores_missing_panes() {
+        let mut app = App::new(
+            vec![pane("%1", "one"), pane("%2", "two")],
+            ThemeId::default(),
+            None,
+        );
+
+        app.select_pane(&PaneId::new("%2").unwrap());
+        assert_eq!(app.selected_pane_id().unwrap().as_str(), "%2");
+
+        app.select_pane(&PaneId::new("%3").unwrap());
+        assert_eq!(app.selected_pane_id().unwrap().as_str(), "%2");
     }
 
     #[test]

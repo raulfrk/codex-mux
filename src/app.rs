@@ -335,6 +335,7 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
     };
     let mut app =
         App::with_color_policy(panes, preference.selected, preference.warning, color_policy);
+    app.select_pane(&context.pane_id);
     let runner = SystemTmuxRunner::default();
     let actions = TmuxActions::new(&runner, &codex);
 
