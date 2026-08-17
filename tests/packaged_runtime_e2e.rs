@@ -77,7 +77,8 @@ fn packaged_binary_renders_server_wide_rows_rebuilds_and_handles_navigation_size
         let before = fixture.scratch.join(format!("stty-before-{index}"));
         let after = fixture.scratch.join(format!("stty-after-{index}"));
         let mut sized = fixture.popup(&binary, &tty, size, &capture, Some((&before, &after)));
-        let screen = sized.wait_text(expected);
+        sized.wait_text(expected);
+        let screen = sized.wait_text("Beta");
         assert!(
             !screen.contains(absent),
             "{size:?} rendered forbidden layout marker {absent:?}: {screen:?}"
@@ -285,7 +286,8 @@ fn installed_prefix_key_opens_the_extracted_binary_popup() {
 
     let (mut client, _tty) = fixture.client("origin", (120, 40), "prefix-client");
     client.send(b"\x02a");
-    let screen = client.wait_text("Commands");
+    client.wait_text("Commands");
+    let screen = client.wait_text("Prefix");
     assert!(
         screen.contains("Prefix"),
         "prefix popup omitted target row: {screen:?}"
@@ -498,6 +500,11 @@ fn packaged_setup_drives_prompt_aware_bash_and_zsh_then_remove_restores_files() 
                     == "1"
             },
         );
+        fixture
+            .server
+            .wait("fresh packaged shell cursor boundary", || {
+                pane_cursor_x(&fixture.server, &fixture.origin_pane) == boundary
+            });
         client.send(b"\x1b[D");
         client.wait_text("sessions");
         client.send(b"q");

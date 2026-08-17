@@ -55,7 +55,10 @@ fn picker_live_previews_every_theme_and_enter_persists_atomically_then_reloads()
     }
 
     popup.send(b"\r");
-    wait_for_exact_file(&config, b"theme = \"monochrome\"\n");
+    wait_for_exact_file(
+        &config,
+        b"theme = \"monochrome\"\nsmart_naming = false\n\n[[profiles]]\nname = \"standard\"\nkey = \"s\"\npermissions = \"standard\"\n\n[[profiles]]\nname = \"yolo\"\nkey = \"y\"\npermissions = \"yolo\"\n",
+    );
     let directory = config.parent().unwrap();
     assert_eq!(
         fs::read_dir(directory).unwrap().count(),
@@ -112,7 +115,8 @@ fn malformed_and_unreadable_preferences_warn_fall_back_and_remain_usable() {
     let malformed_bytes = b"theme = \"ultraviolet\"\n";
     malformed.write_config(malformed_bytes);
     let mut popup = malformed.popup(62, 35, false);
-    let screen = popup.wait_for_text("could not parse theme preference");
+    popup.wait_for_text("could not load configuration");
+    let screen = popup.wait_for_text("theme-agent-thread");
     let screen = String::from_utf8_lossy(&screen);
     assert!(screen.contains("theme-agent-thread"));
     assert!(
@@ -127,7 +131,8 @@ fn malformed_and_unreadable_preferences_warn_fall_back_and_remain_usable() {
     let config = unreadable.config_path();
     fs::create_dir_all(&config).unwrap();
     let mut popup = unreadable.popup(62, 35, false);
-    let screen = popup.wait_for_text("could not read theme preference");
+    popup.wait_for_text("could not load configuration");
+    let screen = popup.wait_for_text("theme-agent-thread");
     let screen = String::from_utf8_lossy(&screen);
     assert!(screen.contains("theme-agent-thread"));
     assert!(

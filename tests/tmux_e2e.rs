@@ -960,14 +960,12 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
             fixture.origin_pane
         );
 
-        let mut popup = fixture.interactive(&client_tty);
-        // Inventory is intentionally populated off the terminal thread. Give the
-        // debug-build E2E fixture time to publish its first useful snapshot before
-        // asserting selected-pane cwd behavior; release latency has a separate budget.
-        thread::sleep(Duration::from_millis(700));
+        let capture = fixture.scratch.join(format!("{label}-popup.capture"));
+        let mut popup = fixture.interactive_captured(&client_tty, &capture);
+        support::wait_for_file_text(&capture, "selected-cwd");
         popup.send(keys);
         popup.wait_for_exit();
-        let log = support::wait_for_file(&fixture.log);
+        let log = support::wait_for_file_text(&fixture.log, "---\n");
         assert!(
             log.contains(&format!("cwd={}\n", selected_dir.display())),
             "{log}"
@@ -1010,16 +1008,20 @@ fn interactive_close_requires_confirmation_and_targets_only_the_selected_pane() 
     let mut client = PtyProcess::attach(&fixture.server, "origin", 120, 40);
     let client_tty = wait_for_client(&fixture.server, "origin");
 
-    let mut popup = fixture.interactive(&client_tty);
-    thread::sleep(Duration::from_millis(700));
-    popup.send(b"xq");
-    thread::sleep(Duration::from_millis(100));
+    let capture = fixture.scratch.join("close-popup.capture");
+    let mut popup = fixture.interactive_captured(&client_tty, &capture);
+    support::wait_for_file_text(&capture, "codex-mux-e2e-close-");
+    popup.send(b"x");
+    support::wait_for_file_text(&capture, "Close selected pane?");
+    let confirmation_end = fs::metadata(&capture).unwrap().len() as usize;
+    popup.send(b"qx");
+    support::wait_for_file_text_after(&capture, confirmation_end, "Close selected pane?");
     assert!(
         pane_exists(&fixture.server, &agent),
-        "one x killed the selected pane"
+        "canceling and reopening confirmation killed the selected pane"
     );
 
-    popup.send(b"q");
+    popup.send(b"qq");
     popup.wait_for_exit();
     assert!(
         pane_exists(&fixture.server, &unrelated),
@@ -1032,8 +1034,9 @@ fn interactive_close_requires_confirmation_and_targets_only_the_selected_pane() 
     let unrelated = fixture.new_shell("unrelated", fixture.scratch.path());
     let mut client = PtyProcess::attach(&fixture.server, "origin", 120, 40);
     let client_tty = wait_for_client(&fixture.server, "origin");
-    let mut popup = fixture.interactive(&client_tty);
-    thread::sleep(Duration::from_millis(700));
+    let capture = fixture.scratch.join("close-popup.capture");
+    let mut popup = fixture.interactive_captured(&client_tty, &capture);
+    support::wait_for_file_text(&capture, "codex-mux-e2e-close-confirmed-");
     popup.send(b"x\rq");
     fixture.server.wait_until("confirmed pane close", || {
         !pane_exists(&fixture.server, &agent)
@@ -1171,17 +1174,6 @@ impl RuntimeFixture {
             .checked(&["display-message", "-p", "-t", session, "#{pane_id}"])
             .trim()
             .to_owned()
-    }
-
-    fn interactive(&self, client_tty: &str) -> PtyProcess {
-        let tmux = self.server.tmux_environment();
-        PtyProcess::run_binary(
-            &self.interactive_arguments(client_tty),
-            &[
-                ("TMUX", &tmux),
-                ("XDG_CONFIG_HOME", path(self.scratch.path())),
-            ],
-        )
     }
 
     fn interactive_captured(&self, client_tty: &str, output: &Path) -> PtyProcess {

@@ -181,10 +181,6 @@ impl PtyProcess {
         Self::spawn_shell_with_stdout(&shell_command, &[], Stdio::from(output))
     }
 
-    pub fn run_binary(arguments: &[String], environment: &[(&str, &str)]) -> Self {
-        Self::run_binary_with_stdout(arguments, environment, Stdio::null())
-    }
-
     pub fn run_binary_captured(
         arguments: &[String],
         environment: &[(&str, &str)],
@@ -259,19 +255,6 @@ impl Drop for PtyProcess {
     }
 }
 
-pub fn wait_for_file(path: &Path) -> String {
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if !contents.is_empty() {
-                return contents;
-            }
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-    panic!("timed out waiting for {}", path.display());
-}
-
 pub fn wait_for_file_text(path: &Path, expected: &str) -> String {
     let deadline = Instant::now() + TEST_TIMEOUT;
     let mut last = String::new();
@@ -287,6 +270,25 @@ pub fn wait_for_file_text(path: &Path, expected: &str) -> String {
     panic!(
         "timed out waiting for {expected:?} in {}; capture={last:?}",
         path.display()
+    );
+}
+
+pub fn wait_for_file_text_after(path: &Path, offset: usize, expected: &str) -> Vec<u8> {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        if let Ok(contents) = fs::read(path) {
+            let tail = String::from_utf8_lossy(contents.get(offset..).unwrap_or_default());
+            if tail.contains(expected) {
+                return contents;
+            }
+            last = tail.into_owned();
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "timed out waiting for {expected:?} after byte {offset} in {}; tail={last:?}",
+        path.display(),
     );
 }
 
