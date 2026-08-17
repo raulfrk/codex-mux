@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -27,6 +27,8 @@ pub const NAMING_MODEL: &str = "gpt-5.6-luna";
 pub const MAX_CONVERSATION_BYTES: usize = 12 * 1024;
 /// Maximum accepted generated title length in Unicode scalar values.
 pub const MAX_NAME_CHARS: usize = 48;
+const THREAD_LIST_PAGE_SIZE: u32 = 100;
+const MAX_THREAD_LIST_PAGES: usize = 20;
 
 /// Lazily constructs naming infrastructure only after an explicit opt-in.
 ///
@@ -288,36 +290,64 @@ pub struct NamingConversation {
 pub struct NamingTarget {
     /// Exact tmux pane identity.
     pub pane_id: PaneId,
-    /// Exact Codex thread identifier exposed in the pane title.
-    pub thread_id: String,
+    /// Exact pane title observed during discovery.
+    pub pane_title: String,
+    /// Full UUID or unambiguous UUID prefix exposed in the pane title.
+    pub thread_hint: String,
+    /// Exact working directory used to constrain app-server resolution.
+    pub cwd: PathBuf,
 }
 
 impl NamingTarget {
     /// Extracts a target only from the supported UUID thread-title shape.
     #[must_use]
     pub fn from_pane(pane: &Pane) -> Option<Self> {
-        let thread_id = pane.title.as_deref()?.trim();
-        if !looks_like_thread_id(thread_id) {
-            return None;
-        }
+        let pane_title = pane.title.as_deref()?.trim();
+        let thread_hint = thread_hint(pane_title)?;
         Some(Self {
             pane_id: pane.id.clone(),
-            thread_id: thread_id.to_owned(),
+            pane_title: pane_title.to_owned(),
+            thread_hint: thread_hint.to_owned(),
+            cwd: pane.current_path.clone(),
         })
     }
 }
 
+fn thread_hint(title: &str) -> Option<&str> {
+    if looks_like_thread_id(title) {
+        return Some(title);
+    }
+    let prefix = title.strip_suffix("...")?;
+    (prefix.len() >= 8
+        && prefix.len() < 36
+        && prefix
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-'))
+    .then_some(prefix)
+}
+
 /// Provider seam used by the asynchronous naming worker.
 pub trait ConversationNamer: Send + 'static {
+    /// Resolves the target's current authoritative full thread identity.
+    fn resolve(&mut self, target: &NamingTarget) -> Result<String> {
+        looks_like_thread_id(&target.thread_hint)
+            .then(|| target.thread_hint.clone())
+            .ok_or_else(|| protocol("conversation namer cannot resolve a truncated thread title"))
+    }
     /// Reads bounded completed conversation content.
-    fn read(&mut self, thread_id: &str) -> Result<NamingConversation>;
+    fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation>;
     /// Generates one validated title.
     fn name(&mut self, conversation: &NamingConversation) -> Result<String>;
 }
 
 impl<S: AppServerSession + Send + 'static> ConversationNamer for AppServerNamer<S> {
-    fn read(&mut self, thread_id: &str) -> Result<NamingConversation> {
-        self.read_completed(thread_id)
+    fn resolve(&mut self, target: &NamingTarget) -> Result<String> {
+        self.resolve_thread_id(target)
+    }
+
+    fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+        let thread_id = self.resolve(target)?;
+        self.read_completed(&thread_id)
     }
 
     fn name(&mut self, conversation: &NamingConversation) -> Result<String> {
@@ -330,6 +360,10 @@ impl<S: AppServerSession + Send + 'static> ConversationNamer for AppServerNamer<
 pub struct GeneratedName {
     /// Source Codex thread identity.
     pub thread_id: String,
+    /// Exact pane title that was resolved to the source thread.
+    pub source_title: String,
+    /// Exact pane working directory used during thread resolution.
+    pub source_cwd: PathBuf,
     /// Validated generated title.
     pub name: String,
 }
@@ -375,23 +409,29 @@ impl NamingWorker {
                 };
                 published.lock().unwrap().retain(|pane_id, generated| {
                     targets.iter().any(|target| {
-                        &target.pane_id == pane_id && target.thread_id == generated.thread_id
+                        &target.pane_id == pane_id
+                            && target.pane_title == generated.source_title
+                            && target.cwd == generated.source_cwd
                     })
                 });
-                let mut by_thread = HashMap::<String, Vec<PaneId>>::new();
+                let mut by_thread = HashMap::<(String, PathBuf), Vec<NamingTarget>>::new();
                 for target in targets {
                     by_thread
-                        .entry(target.thread_id)
+                        .entry((target.thread_hint.clone(), target.cwd.clone()))
                         .or_default()
-                        .push(target.pane_id);
+                        .push(target);
                 }
-                for (thread_id, pane_ids) in by_thread {
+                for (_, targets) in by_thread {
                     if stopped.try_recv().is_ok() {
                         return;
                     }
-                    let Ok(conversation) = namer.read(&thread_id) else {
+                    let Some(first) = targets.first() else {
                         continue;
                     };
+                    let Ok(conversation) = namer.read(first) else {
+                        continue;
+                    };
+                    let thread_id = conversation.thread_id.clone();
                     let fingerprint = transcript_fingerprint(&conversation.transcript);
                     let name = if let Some((cached, name)) = cache.get(&thread_id) {
                         if *cached == fingerprint {
@@ -410,16 +450,22 @@ impl NamingWorker {
                         cache.insert(thread_id.clone(), (fingerprint, name.clone()));
                         name
                     };
+                    let Ok(still_resolved) = namer.resolve(first) else {
+                        continue;
+                    };
+                    if still_resolved != thread_id {
+                        continue;
+                    }
                     let current = discover().unwrap_or_default();
                     let mut published = published.lock().unwrap();
-                    for pane_id in pane_ids {
-                        if current.iter().any(|target| {
-                            target.pane_id == pane_id && target.thread_id == thread_id
-                        }) {
+                    for target in targets {
+                        if current.contains(&target) {
                             published.insert(
-                                pane_id,
+                                target.pane_id,
                                 GeneratedName {
                                     thread_id: thread_id.clone(),
+                                    source_title: target.pane_title,
+                                    source_cwd: target.cwd,
                                     name: name.clone(),
                                 },
                             );
@@ -500,6 +546,58 @@ impl<S: AppServerSession> AppServerNamer<S> {
     #[must_use]
     pub const fn new(session: S) -> Self {
         Self { session }
+    }
+
+    fn resolve_thread_id(&mut self, target: &NamingTarget) -> Result<String> {
+        if looks_like_thread_id(&target.thread_hint) {
+            return Ok(target.thread_hint.clone());
+        }
+
+        let mut cursor: Option<String> = None;
+        let mut matched: Option<String> = None;
+        for _ in 0..MAX_THREAD_LIST_PAGES {
+            let response = self.session.request(
+                "thread/list",
+                json!({
+                    "cwd": target.cwd,
+                    "cursor": cursor,
+                    "limit": THREAD_LIST_PAGE_SIZE,
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc"
+                }),
+            )?;
+            let threads = response["data"]
+                .as_array()
+                .ok_or_else(|| protocol("thread/list did not return thread data"))?;
+            for thread in threads {
+                let Some(id) = thread["id"].as_str() else {
+                    continue;
+                };
+                let same_cwd = thread["cwd"]
+                    .as_str()
+                    .is_some_and(|cwd| Path::new(cwd) == target.cwd);
+                if same_cwd && looks_like_thread_id(id) && id.starts_with(&target.thread_hint) {
+                    if matched.as_deref().is_some_and(|existing| existing != id) {
+                        return Err(protocol("truncated pane title matches multiple threads"));
+                    }
+                    matched = Some(id.to_owned());
+                }
+            }
+
+            let next = response["nextCursor"].as_str().map(ToOwned::to_owned);
+            if next.is_none() {
+                return matched.ok_or_else(|| {
+                    protocol("truncated pane title did not match a thread in its working directory")
+                });
+            }
+            if next == cursor {
+                return Err(protocol("thread/list repeated its pagination cursor"));
+            }
+            cursor = next;
+        }
+        Err(protocol(
+            "thread/list exceeded the bounded pagination limit",
+        ))
     }
 
     /// Reads only structured, completed turns through `thread/read`.

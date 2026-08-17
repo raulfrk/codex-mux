@@ -11,7 +11,9 @@ use crate::{
 const SEPARATOR: char = '\x1f';
 const OWNER_OPTION: &str = "@codex_mux_generated_name";
 const THREAD_OPTION: &str = "@codex_mux_generated_thread";
-const STATE_FORMAT: &str = "#{pane_id}\x1f#{pane_title}\x1f#{window_name}\x1f#{automatic-rename}\x1f#{window_panes}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}";
+const SOURCE_TITLE_OPTION: &str = "@codex_mux_generated_source_title";
+const SOURCE_CWD_OPTION: &str = "@codex_mux_generated_source_cwd";
+const STATE_FORMAT: &str = "#{pane_id}\x1f#{pane_title}\x1f#{window_name}\x1f#{automatic-rename}\x1f#{window_panes}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{pane_current_path}";
 
 /// Applies generated names only while codex-mux can prove it owns the visible name.
 pub struct OwnedTmuxNames<R> {
@@ -37,7 +39,7 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
             .lines()
             .filter_map(|line| {
                 let fields = line.split(SEPARATOR).collect::<Vec<_>>();
-                (fields.len() == 7).then(|| (fields[0].to_owned(), fields[1..].join("\x1f")))
+                (fields.len() == 8).then(|| (fields[0].to_owned(), fields[1..].join("\x1f")))
             })
             .collect::<HashMap<_, _>>();
         for (pane_id, generated) in names {
@@ -54,7 +56,11 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
         state: &str,
     ) -> Result<()> {
         let fields = state.split(SEPARATOR).collect::<Vec<_>>();
-        if fields.len() != 6 || fields[0] != generated.thread_id || fields[3] != "1" {
+        if fields.len() != 7
+            || fields[0] != generated.source_title
+            || fields[3] != "1"
+            || fields[6] != generated.source_cwd.to_string_lossy()
+        {
             return Ok(());
         }
         let current_name = fields[1];
@@ -71,15 +77,13 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
                 return Ok(());
             }
             format!(
-                "#{{&&:#{{==:#{{pane_title}},{}}},#{{&&:#{{==:#{{window_panes}},1}},#{{==:#{{window_name}},#{{@codex_mux_generated_name}}}}}}}}",
-                generated.thread_id
+                "#{{&&:#{{==:#{{pane_title}},#{{{SOURCE_TITLE_OPTION}}}}},#{{&&:#{{==:#{{pane_current_path}},#{{{SOURCE_CWD_OPTION}}}}},#{{&&:#{{==:#{{window_panes}},1}},#{{==:#{{window_name}},#{{@codex_mux_generated_name}}}}}}}}}}"
             )
         } else if !automatic {
             return Ok(());
         } else {
             format!(
-                "#{{&&:#{{==:#{{pane_title}},{}}},#{{&&:#{{==:#{{window_panes}},1}},#{{&&:#{{automatic-rename}},#{{&&:#{{==:#{{@codex_mux_generated_thread}},}},#{{==:#{{@codex_mux_generated_name}},}}}}}}}}}}",
-                generated.thread_id
+                "#{{&&:#{{==:#{{pane_title}},#{{{SOURCE_TITLE_OPTION}}}}},#{{&&:#{{==:#{{pane_current_path}},#{{{SOURCE_CWD_OPTION}}}}},#{{&&:#{{==:#{{window_panes}},1}},#{{&&:#{{automatic-rename}},#{{&&:#{{==:#{{@codex_mux_generated_thread}},}},#{{==:#{{@codex_mux_generated_name}},}}}}}}}}}}}}"
             )
         };
 
@@ -94,21 +98,76 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
             OWNER_OPTION,
             tmux_quote(&generated.name),
         );
-        self.run(["if-shell", "-F", &condition, &mutation])?;
+        let source_cwd = generated.source_cwd.to_string_lossy();
+        self.run_arguments(
+            [
+                "set-option",
+                "-p",
+                "-t",
+                pane_id.as_str(),
+                SOURCE_TITLE_OPTION,
+                &generated.source_title,
+                ";",
+                "set-option",
+                "-p",
+                "-t",
+                pane_id.as_str(),
+                SOURCE_CWD_OPTION,
+                source_cwd.as_ref(),
+                ";",
+                "if-shell",
+                "-F",
+                "-t",
+                pane_id.as_str(),
+                &condition,
+                &mutation,
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )?;
         Ok(())
     }
 
     fn unset_marker(&self, pane_id: &PaneId) -> Result<()> {
-        self.run(["set-option", "-wu", "-t", pane_id.as_str(), THREAD_OPTION])?;
-        self.run(["set-option", "-wu", "-t", pane_id.as_str(), OWNER_OPTION])?;
+        self.run_arguments(
+            [
+                "set-option",
+                "-wu",
+                "-t",
+                pane_id.as_str(),
+                THREAD_OPTION,
+                ";",
+                "set-option",
+                "-wu",
+                "-t",
+                pane_id.as_str(),
+                OWNER_OPTION,
+                ";",
+                "set-option",
+                "-pu",
+                "-t",
+                pane_id.as_str(),
+                SOURCE_TITLE_OPTION,
+                ";",
+                "set-option",
+                "-pu",
+                "-t",
+                pane_id.as_str(),
+                SOURCE_CWD_OPTION,
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )?;
         Ok(())
     }
 
     fn run<const N: usize>(&self, arguments: [&str; N]) -> Result<crate::domain::CommandOutput> {
-        let arguments = arguments
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>();
+        self.run_arguments(arguments.into_iter().map(OsString::from).collect())
+    }
+
+    fn run_arguments(&self, arguments: Vec<OsString>) -> Result<crate::domain::CommandOutput> {
         let output = self.runner.run(&arguments)?;
         if output.status == Some(0) {
             Ok(output)
@@ -183,6 +242,8 @@ mod tests {
             PaneId::new("%7").unwrap(),
             GeneratedName {
                 thread_id: THREAD.to_owned(),
+                source_title: THREAD.to_owned(),
+                source_cwd: "/work/project".into(),
                 name: name.to_owned(),
             },
         )])
@@ -202,50 +263,98 @@ mod tests {
             .collect()
     }
 
+    fn if_shell(calls: &[Vec<String>]) -> (&str, &str) {
+        let batch = calls.get(1).expect("one batched reconciliation command");
+        let index = batch
+            .iter()
+            .position(|argument| argument == "if-shell")
+            .expect("an atomic conditional mutation");
+        (&batch[index + 4], &batch[index + 5])
+    }
+
     #[test]
     fn takes_ownership_with_one_server_side_conditional() {
-        let state = format!("%7\x1f{THREAD}\x1fdefault\x1f1\x1f1\x1f\x1f\n");
+        let state = format!("%7\x1f{THREAD}\x1fdefault\x1f1\x1f1\x1f\x1f\x1f/work/project\n");
         let runner = FakeRunner::with_states(&[&state]);
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("Fast inventory"));
 
         let calls = calls(&runner);
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1][0], "if-shell");
-        assert!(calls[1][3].contains("rename-window -t '%7' 'Fast inventory'"));
-        assert!(calls[1][3].contains(THREAD_OPTION));
-        assert!(calls[1][3].contains(OWNER_OPTION));
+        let (_, mutation) = if_shell(&calls);
+        assert!(mutation.contains("rename-window -t '%7' 'Fast inventory'"));
+        assert!(mutation.contains(THREAD_OPTION));
+        assert!(mutation.contains(OWNER_OPTION));
+    }
+
+    #[test]
+    fn truncated_source_title_can_own_full_thread_marker() {
+        let title = "12345678-1234-1234-1234-12345...";
+        let cwd = "/work/#{hostile},path";
+        let state = format!("%7\x1f{title}\x1fdefault\x1f1\x1f1\x1f\x1f\x1f{cwd}\n");
+        let runner = FakeRunner::with_states(&[&state]);
+        let mut generated = names("Resolved title");
+        generated
+            .get_mut(&PaneId::new("%7").unwrap())
+            .unwrap()
+            .source_title = title.to_owned();
+        generated
+            .get_mut(&PaneId::new("%7").unwrap())
+            .unwrap()
+            .source_cwd = cwd.into();
+
+        OwnedTmuxNames::new(runner.clone()).reconcile(&generated);
+
+        let calls = calls(&runner);
+        assert_eq!(calls.len(), 2);
+        let (condition, mutation) = if_shell(&calls);
+        assert!(condition.contains(SOURCE_TITLE_OPTION));
+        assert!(!condition.contains(title));
+        assert!(!condition.contains(cwd));
+        assert!(calls[1].iter().any(|argument| argument == cwd));
+        assert!(mutation.contains(THREAD));
     }
 
     #[test]
     fn updates_owned_value_with_live_marker_predicates() {
-        let state = format!("%7\x1f{THREAD}\x1fOld title\x1f0\x1f1\x1f{THREAD}\x1fOld title\n");
+        let state = format!(
+            "%7\x1f{THREAD}\x1fOld title\x1f0\x1f1\x1f{THREAD}\x1fOld title\x1f/work/project\n"
+        );
         let runner = FakeRunner::with_states(&[&state]);
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("New title"));
 
         let calls = calls(&runner);
-        assert!(calls[1][2].contains("#{window_name}"));
-        assert!(calls[1][2].contains("#{@codex_mux_generated_name}"));
-        assert!(calls[1][3].contains("'New title'"));
+        let (condition, mutation) = if_shell(&calls);
+        assert!(condition.contains("#{window_name}"));
+        assert!(condition.contains("#{@codex_mux_generated_name}"));
+        assert!(mutation.contains("'New title'"));
     }
 
     #[test]
     fn manual_override_releases_ownership_without_renaming() {
-        let state =
-            format!("%7\x1f{THREAD}\x1fMy manual title\x1f0\x1f1\x1f{THREAD}\x1fOld title\n");
+        let state = format!(
+            "%7\x1f{THREAD}\x1fMy manual title\x1f0\x1f1\x1f{THREAD}\x1fOld title\x1f/work/project\n"
+        );
         let runner = FakeRunner::with_states(&[&state]);
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("New title"));
 
         let calls = calls(&runner);
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[1][4], THREAD_OPTION);
-        assert_eq!(calls[2][4], OWNER_OPTION);
+        assert_eq!(calls.len(), 2);
+        for option in [
+            THREAD_OPTION,
+            OWNER_OPTION,
+            SOURCE_TITLE_OPTION,
+            SOURCE_CWD_OPTION,
+        ] {
+            assert!(calls[1].iter().any(|argument| argument == option));
+        }
     }
 
     #[test]
     fn stale_or_multi_pane_target_is_never_renamed() {
         for state in [
-            "%7\x1faaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\x1fdefault\x1f1\x1f1\x1f\x1f\n",
-            &format!("%7\x1f{THREAD}\x1fdefault\x1f1\x1f2\x1f\x1f\n"),
+            "%7\x1faaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\x1fdefault\x1f1\x1f1\x1f\x1f\x1f/work/project\n",
+            &format!("%7\x1f{THREAD}\x1fdefault\x1f1\x1f2\x1f\x1f\x1f/work/project\n"),
+            &format!("%7\x1f{THREAD}\x1fdefault\x1f1\x1f1\x1f\x1f\x1f/work/other\n"),
         ] {
             let runner = FakeRunner::with_states(&[state]);
             OwnedTmuxNames::new(runner.clone()).reconcile(&names("Wrong target"));
@@ -261,26 +370,30 @@ mod tests {
     #[test]
     fn unchanged_owned_name_can_transition_to_a_replacement_thread() {
         let old_thread = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let state = format!("%7\x1f{THREAD}\x1fOld title\x1f0\x1f1\x1f{old_thread}\x1fOld title\n");
+        let state = format!(
+            "%7\x1f{THREAD}\x1fOld title\x1f0\x1f1\x1f{old_thread}\x1fOld title\x1f/work/project\n"
+        );
         let runner = FakeRunner::with_states(&[&state]);
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("Replacement thread"));
 
         let calls = calls(&runner);
         assert_eq!(calls.len(), 2);
-        assert!(calls[1][3].contains("'Replacement thread'"));
-        assert!(calls[1][3].contains(THREAD));
+        let (_, mutation) = if_shell(&calls);
+        assert!(mutation.contains("'Replacement thread'"));
+        assert!(mutation.contains(THREAD));
     }
 
     #[test]
     fn same_title_replacement_thread_refreshes_ownership_marker() {
         let old_thread = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let state =
-            format!("%7\x1f{THREAD}\x1fSame title\x1f0\x1f1\x1f{old_thread}\x1fSame title\n");
+        let state = format!(
+            "%7\x1f{THREAD}\x1fSame title\x1f0\x1f1\x1f{old_thread}\x1fSame title\x1f/work/project\n"
+        );
         let runner = FakeRunner::with_states(&[&state]);
         OwnedTmuxNames::new(runner.clone()).reconcile(&names("Same title"));
 
         let calls = calls(&runner);
         assert_eq!(calls.len(), 2);
-        assert!(calls[1][3].contains(THREAD));
+        assert!(if_shell(&calls).1.contains(THREAD));
     }
 }

@@ -16,7 +16,7 @@ use codex_mux::{
 };
 use serde_json::{Value, json};
 
-use codex_mux::domain::PaneId;
+use codex_mux::domain::{Pane, PaneId, SessionId};
 
 struct FakeSession {
     replies: VecDeque<Value>,
@@ -85,6 +85,86 @@ fn reads_only_completed_user_and_assistant_text_with_a_hard_bound() {
 }
 
 #[test]
+fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let full = "01a01001-2dbb-74e2-86ab-996b31234567";
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [
+                {"id": full, "cwd": "/other/project"}
+            ], "nextCursor": "page-2"}),
+            json!({"data": [
+                {"id": full, "cwd": "/work/project"}
+            ], "nextCursor": null}),
+            json!({"thread": {"turns": [
+                {"status": "completed", "items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "name this"}]}
+                ]}
+            ]}}),
+        ]),
+        calls: calls.clone(),
+    };
+    let mut namer = AppServerNamer::new(session);
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+    };
+
+    let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
+    assert_eq!(conversation.thread_id, full);
+    assert!(conversation.transcript.contains("User: name this"));
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].0, "thread/list");
+    assert_eq!(calls[0].1["cwd"], "/work/project");
+    assert_eq!(calls[1].1["cursor"], "page-2");
+    assert_eq!(calls[2].0, "thread/read");
+    assert_eq!(calls[2].1["threadId"], full);
+}
+
+#[test]
+fn ambiguous_truncated_thread_fails_closed() {
+    let session = FakeSession {
+        replies: VecDeque::from([json!({"data": [
+            {"id": "01a01001-2dbb-74e2-86ab-996b31234567", "cwd": "/work/project"},
+            {"id": "01a01001-2dbb-74e2-86ab-996b3abcdef0", "cwd": "/work/project"}
+        ], "nextCursor": null})]),
+        calls: Arc::default(),
+    };
+    let mut namer = AppServerNamer::new(session);
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+    };
+
+    assert!(
+        ConversationNamer::read(&mut namer, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple threads")
+    );
+}
+
+#[test]
+fn pane_target_retains_truncated_title_and_exact_cwd() {
+    let pane = Pane {
+        id: PaneId::new("%9").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        title: Some("01a01001-2dbb-74e2-86ab-996b3...".to_owned()),
+        generated_title: None,
+        current_path: "/work/project".into(),
+    };
+
+    let target = NamingTarget::from_pane(&pane).unwrap();
+    assert_eq!(target.pane_title, pane.title.unwrap());
+    assert_eq!(target.thread_hint, "01a01001-2dbb-74e2-86ab-996b3");
+    assert_eq!(target.cwd, std::path::Path::new("/work/project"));
+}
+
+#[test]
 fn starts_an_ephemeral_exact_luna_thread_and_validates_output() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let session = FakeSession {
@@ -132,10 +212,10 @@ struct CountingNamer {
 }
 
 impl ConversationNamer for CountingNamer {
-    fn read(&mut self, thread_id: &str) -> Result<NamingConversation> {
+    fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         Ok(NamingConversation {
-            thread_id: thread_id.to_owned(),
+            thread_id: target.thread_hint.clone(),
             transcript: "completed chat".to_owned(),
         })
     }
@@ -149,8 +229,21 @@ impl ConversationNamer for CountingNamer {
 fn target(pane: &str, thread: &str) -> NamingTarget {
     NamingTarget {
         pane_id: PaneId::new(pane).unwrap(),
-        thread_id: thread.to_owned(),
+        pane_title: thread.to_owned(),
+        thread_hint: thread.to_owned(),
+        cwd: "/work/project".into(),
     }
+}
+
+fn wait_until(description: &str, predicate: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        thread::yield_now();
+    }
+    panic!("timed out waiting for {description}");
 }
 
 #[test]
@@ -216,26 +309,74 @@ fn worker_is_non_blocking_deduplicates_and_joins_on_stop() {
 
 #[test]
 fn worker_discovers_future_targets_and_rejects_stale_results() {
+    struct GatedNamer {
+        reads: Arc<AtomicUsize>,
+        names: Arc<AtomicUsize>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl ConversationNamer for GatedNamer {
+        fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(NamingConversation {
+                thread_id: target.thread_hint.clone(),
+                transcript: "completed chat".to_owned(),
+            })
+        }
+        fn name(&mut self, _: &NamingConversation) -> Result<String> {
+            let call = self.names.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.entered.store(true, Ordering::Release);
+                while !self.release.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                self.finished.store(true, Ordering::Release);
+            }
+            Ok("Useful generated name".to_owned())
+        }
+    }
+
     let reads = Arc::new(AtomicUsize::new(0));
     let names = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let current = Arc::new(Mutex::new(Vec::new()));
     let discovered = current.clone();
+    let discovery_calls = Arc::new(AtomicUsize::new(0));
+    let observed_discovery_calls = discovery_calls.clone();
     let provider_names = names.clone();
+    let provider_entered = entered.clone();
+    let provider_release = release.clone();
+    let provider_finished = finished.clone();
     let worker = NamingWorker::spawn(
         move |_| {
-            Ok(CountingNamer {
+            Ok(GatedNamer {
                 reads,
                 names: provider_names,
-                delay: Duration::from_millis(50),
+                entered: provider_entered,
+                release: provider_release,
+                finished: provider_finished,
             })
         },
-        move || Ok(discovered.lock().unwrap().clone()),
+        move || {
+            observed_discovery_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(discovered.lock().unwrap().clone())
+        },
         Duration::from_millis(10),
     );
     *current.lock().unwrap() = vec![target("%2", "01999999-2222-7777-8888-123456789abc")];
-    thread::sleep(Duration::from_millis(20));
+    wait_until("the naming provider to start", || {
+        entered.load(Ordering::Acquire)
+    });
     current.lock().unwrap().clear();
-    thread::sleep(Duration::from_millis(100));
+    let before_revalidation = discovery_calls.load(Ordering::SeqCst);
+    release.store(true, Ordering::Release);
+    wait_until("the stale result revalidation", || {
+        finished.load(Ordering::Acquire)
+            && discovery_calls.load(Ordering::SeqCst) != before_revalidation
+    });
     assert!(
         worker.names().lock().unwrap().is_empty(),
         "stale result was published"
@@ -268,6 +409,56 @@ fn worker_discovers_future_targets_and_rejects_stale_results() {
 }
 
 #[test]
+fn worker_re_resolves_truncated_identity_before_publishing() {
+    struct ChangingResolver {
+        resolutions: usize,
+        names: Arc<AtomicUsize>,
+    }
+    impl ConversationNamer for ChangingResolver {
+        fn resolve(&mut self, _: &NamingTarget) -> Result<String> {
+            self.resolutions += 1;
+            Ok(if self.resolutions % 2 == 1 {
+                "01999999-4444-7777-8888-123456789abc"
+            } else {
+                "01999999-4444-7777-8888-abcdef012345"
+            }
+            .to_owned())
+        }
+
+        fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+            Ok(NamingConversation {
+                thread_id: self.resolve(target)?,
+                transcript: "completed chat".to_owned(),
+            })
+        }
+
+        fn name(&mut self, _: &NamingConversation) -> Result<String> {
+            self.names.fetch_add(1, Ordering::SeqCst);
+            Ok("Must not publish".to_owned())
+        }
+    }
+
+    let names = Arc::new(AtomicUsize::new(0));
+    let observed_names = names.clone();
+    let worker = NamingWorker::spawn(
+        move |_| {
+            Ok(ChangingResolver {
+                resolutions: 0,
+                names,
+            })
+        },
+        move || Ok(vec![target("%8", "01999999-4444-7777-8888-12345...")]),
+        Duration::from_millis(10),
+    );
+    wait_until("a generated name before identity revalidation", || {
+        observed_names.load(Ordering::SeqCst) > 0
+    });
+    thread::sleep(Duration::from_millis(20));
+    assert!(worker.names().lock().unwrap().is_empty());
+    worker.stop();
+}
+
+#[test]
 fn stop_cancels_active_provider_work_before_joining() {
     use std::sync::atomic::AtomicBool;
 
@@ -276,9 +467,9 @@ fn stop_cancels_active_provider_work_before_joining() {
         entered: Arc<AtomicBool>,
     }
     impl ConversationNamer for BlockingNamer {
-        fn read(&mut self, thread_id: &str) -> Result<NamingConversation> {
+        fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
             Ok(NamingConversation {
-                thread_id: thread_id.to_owned(),
+                thread_id: target.thread_hint.clone(),
                 transcript: "chat".to_owned(),
             })
         }

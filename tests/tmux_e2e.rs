@@ -1,6 +1,8 @@
 mod support;
 
 use std::{
+    collections::HashMap,
+    ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -9,7 +11,105 @@ use std::{
     time::Duration,
 };
 
+use codex_mux::{
+    Result,
+    domain::{CommandOutput, PaneId, TmuxCommandRunner},
+    smart_naming::GeneratedName,
+    tmux::owned_names::OwnedTmuxNames,
+};
+
 use support::{PtyProcess, Scratch, TmuxServer, assert_success, serial_tmux_test, tools_available};
+
+struct SocketRunner(String);
+
+impl TmuxCommandRunner for SocketRunner {
+    fn run(&self, arguments: &[OsString]) -> Result<CommandOutput> {
+        let output = Command::new("tmux")
+            .args(["-L", &self.0])
+            .args(arguments)
+            .output()
+            .unwrap();
+        Ok(CommandOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            status: output.status.code(),
+        })
+    }
+}
+
+#[test]
+fn smart_naming_targets_a_background_pane_format_context() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("owned-background");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\nset -g automatic-rename on\n").unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    let thread_id = "12345678-1234-1234-1234-123456789abc";
+    server.checked(&["select-pane", "-t", &pane, "-T", thread_id]);
+    server.checked(&[
+        "new-session",
+        "-d",
+        "-s",
+        "foreground",
+        "-c",
+        path(scratch.path()),
+    ]);
+
+    let names = HashMap::from([(
+        PaneId::new(&pane).unwrap(),
+        GeneratedName {
+            thread_id: thread_id.to_owned(),
+            source_title: thread_id.to_owned(),
+            source_cwd: scratch.path().to_owned(),
+            name: "Background naming works".to_owned(),
+        },
+    )]);
+    let owned = OwnedTmuxNames::new(SocketRunner(server.socket().to_owned()));
+    owned.reconcile(&names);
+
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", "target", "#{window_name}"])
+            .trim(),
+        "Background naming works"
+    );
+    assert_ne!(
+        server
+            .checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                "foreground",
+                "#{window_name}"
+            ])
+            .trim(),
+        "Background naming works"
+    );
+
+    server.checked(&["rename-window", "-t", &pane, "Manual override"]);
+    owned.reconcile(&names);
+    for (scope, option) in [
+        ("-wv", "@codex_mux_generated_thread"),
+        ("-wv", "@codex_mux_generated_name"),
+        ("-pv", "@codex_mux_generated_source_title"),
+        ("-pv", "@codex_mux_generated_source_cwd"),
+    ] {
+        assert!(
+            !server
+                .run(&["show-options", scope, "-t", &pane, option])
+                .status
+                .success(),
+            "manual override retained {option}"
+        );
+    }
+}
 
 #[test]
 fn installer_cli_loads_a_real_prefix_binding_with_responsive_geometry() {
