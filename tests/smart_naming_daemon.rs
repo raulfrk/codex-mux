@@ -97,6 +97,19 @@ fn wait_for_lock(path: &Path, timeout: Duration) -> bool {
     }
 }
 
+fn daemon_lock(root: &Path) -> PathBuf {
+    fs::read_dir(root.join("runtime"))
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()?
+                .to_string_lossy()
+                .starts_with("codex-mux-namer-")
+                .then_some(path)
+        })
+        .expect("daemon lock missing")
+}
+
 #[test]
 fn worker_is_singleton_and_survives_its_launcher_until_persisted_disable() {
     let root = scratch();
@@ -199,9 +212,14 @@ fn tmux_owned_launcher_cleans_provider_on_disable_and_server_death() {
         .expect("tmux-owned daemon did not start provider")
         .parse::<u32>()
         .unwrap();
+    let lock = daemon_lock(&root);
     assert!(Path::new(&format!("/proc/{first_pid}")).exists());
     fs::write(&config, "smart_naming = false\n").unwrap();
     assert!(wait_for_pid_gone(first_pid, Duration::from_secs(3)));
+    assert!(
+        wait_for_lock(&lock, Duration::from_secs(3)),
+        "daemon did not release singleton lock"
+    );
 
     fs::remove_file(&provider_pid).unwrap();
     fs::write(&config, "smart_naming = true\n").unwrap();
@@ -215,6 +233,10 @@ fn tmux_owned_launcher_cleans_provider_on_disable_and_server_death() {
         .args(["-L", &socket, "kill-server"])
         .status();
     assert!(wait_for_pid_gone(second_pid, Duration::from_secs(3)));
+    assert!(
+        wait_for_lock(&lock, Duration::from_secs(3)),
+        "daemon did not release singleton lock after tmux server exit"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -288,16 +310,7 @@ fn disable_interrupts_late_provider_retry_backoff() {
         fs::read(&attempts).unwrap().len() >= 4,
         "provider did not reach exponential backoff"
     );
-    let lock = fs::read_dir(root.join("runtime"))
-        .unwrap()
-        .find_map(|entry| {
-            let path = entry.unwrap().path();
-            path.file_name()?
-                .to_string_lossy()
-                .starts_with("codex-mux-namer-")
-                .then_some(path)
-        })
-        .expect("daemon lock missing");
+    let lock = daemon_lock(&root);
     assert!(
         Command::new("tmux")
             .args([
