@@ -261,6 +261,29 @@ impl Pty {
         );
     }
 
+    pub fn wait_appended_frame(&self, previous: u64, expected: &str) -> String {
+        const FRAME_END: &str = "\u{1b}[?25l";
+        let previous = usize::try_from(previous).expect("PTY capture length fits usize");
+        wait(
+            &format!("complete appended frame containing {expected:?}"),
+            || {
+                fs::read(&self.capture).is_ok_and(|bytes| {
+                    bytes
+                        .get(previous..)
+                        .map(String::from_utf8_lossy)
+                        .and_then(|tail| {
+                            tail.find(expected)
+                                .map(|text| tail[text + expected.len()..].contains(FRAME_END))
+                        })
+                        .unwrap_or(false)
+                })
+            },
+            || fs::read_to_string(&self.capture).unwrap_or_default(),
+        );
+        let bytes = fs::read(&self.capture).expect("read PTY capture after complete frame");
+        String::from_utf8_lossy(&bytes[previous..]).into_owned()
+    }
+
     pub fn wait_exit(&mut self) -> std::process::ExitStatus {
         let mut status = None;
         wait(
