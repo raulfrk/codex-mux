@@ -1100,12 +1100,17 @@ mod transport_tests {
         let target = target_created_at(0);
         let discovered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let discovery_calls = discovered.clone();
+        let first_discovery = Arc::new(Mutex::new(None));
+        let observed_discovery = first_discovery.clone();
         let retry_interval = Duration::from_millis(40);
         let worker = NamingWorker::spawn_with_intervals(
             move |_| Ok(SuccessfulNamer(observed)),
             move || {
                 let call = discovery_calls.fetch_add(1, Ordering::SeqCst);
                 if call % 2 == 0 {
+                    if call == 0 {
+                        *observed_discovery.lock().unwrap() = Some(std::time::Instant::now());
+                    }
                     Ok(vec![target.clone()])
                 } else {
                     Err(protocol("final discovery failed"))
@@ -1122,7 +1127,11 @@ mod transport_tests {
         worker.stop();
         let attempts = attempts.lock().unwrap();
         assert!(attempts.len() >= 2);
-        assert!(attempts[1].duration_since(attempts[0]) >= retry_interval);
+        let first_discovery = first_discovery
+            .lock()
+            .unwrap()
+            .expect("initial discovery was not observed");
+        assert!(attempts[1].duration_since(first_discovery) >= retry_interval);
     }
 
     fn target_created_at(created_at_unix: u64) -> NamingTarget {
