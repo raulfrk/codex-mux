@@ -98,6 +98,102 @@ fn packaged_binary_renders_server_wide_rows_rebuilds_and_handles_navigation_size
 }
 
 #[test]
+fn packaged_adaptive_rows_keep_smart_titles_paths_and_selection_useful_at_approved_sizes() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("adaptive-rows");
+    let first_dir = fixture.scratch.join("first-session");
+    let deep_dir = fixture
+        .scratch
+        .join("改善/very/deep/project/with/many/components/adaptive/session-row-renderer");
+    fs::create_dir_all(&first_dir).unwrap();
+    fs::create_dir_all(&deep_dir).unwrap();
+    let first = fixture.agent("adaptive-first", &first_dir, "first");
+    fixture.title(&first, "First conversation");
+    let target = fixture.agent("adaptive-target", &deep_dir, "target");
+    let unicode_pattern = "界👩‍💻e\u{301}";
+    let smart_title = format!("Unicode rows: {}tail", unicode_pattern.repeat(40));
+    let wide_title = format!("Unicode rows: {}界…", unicode_pattern.repeat(14));
+    let phone_title = format!("Unicode rows: {}…", unicode_pattern.repeat(9));
+    fixture.smart_title(&target, &smart_title);
+    let (mut client, tty) = fixture.client("origin", (120, 40), "adaptive-client");
+
+    for (index, size) in [(120, 30), (89, 28), (62, 20), (32, 8)]
+        .into_iter()
+        .enumerate()
+    {
+        fixture
+            .server
+            .checked(&["switch-client", "-c", &tty, "-t", "origin"]);
+        assert_eq!(client_fields(&fixture.server, &tty).1, fixture.origin_pane);
+        let capture = fixture.scratch.join(format!("adaptive-size-{index}.log"));
+        let mut popup = fixture.popup(&binary, &tty, size, &capture, None);
+        popup.wait_appended_frame(0, "First conversation");
+        let before_selection = popup.capture_len();
+        popup.send(b"j");
+        popup.wait_growth(before_selection);
+        let expected_title = if size.0 >= 89 {
+            wide_title.as_str()
+        } else if size.0 >= 62 {
+            phone_title.as_str()
+        } else {
+            "Unicode rows:"
+        };
+        let expected_tail = if size.0 == 32 {
+            expected_title
+        } else {
+            "session-row-renderer"
+        };
+        let rendered = popup.wait_appended_frame(before_selection, expected_tail);
+        let visible = without_csi(&rendered);
+
+        assert!(
+            !visible.contains(&smart_title),
+            "{size:?} leaked the unelided smart title: {rendered:?}"
+        );
+        assert!(
+            visible.contains(expected_title),
+            "{size:?} split a Unicode grapheme or used the wrong terminal-cell budget: {rendered:?}"
+        );
+        if size.0 == 32 {
+            assert!(
+                !visible.contains("session-row-renderer") && !visible.contains("改善"),
+                "{size:?} rendered path content in the tiny layout: {rendered:?}"
+            );
+        } else {
+            let title = visible
+                .rfind(expected_title)
+                .expect("selected smart title prefix");
+            let path = visible
+                .rfind("session-row-renderer")
+                .expect("selected deep-path tail");
+            assert!(
+                title < path,
+                "{size:?} did not render title before its path: {rendered:?}"
+            );
+            assert!(
+                visible[title..path].matches('…').count() >= 2,
+                "{size:?} did not end-elide the title and start-elide the path: {rendered:?}"
+            );
+            assert!(
+                !visible.contains(deep_dir.to_string_lossy().as_ref()),
+                "{size:?} leaked the unelided deep path: {rendered:?}"
+            );
+        }
+
+        popup.send(b"\r");
+        assert!(popup.wait_exit().success());
+        assert_eq!(
+            client_fields(&fixture.server, &tty).1,
+            target,
+            "{size:?} activated the wrong selected pane"
+        );
+    }
+    client.send(b"\x02d");
+}
+
+#[test]
 fn packaged_enter_switches_exact_client_cross_session_and_zooms() {
     let Some(binary) = require_prerequisites() else {
         return;
@@ -717,6 +813,26 @@ impl Fixture {
             .checked(&["select-pane", "-t", pane, "-T", title]);
     }
 
+    fn smart_title(&self, pane: &str, title: &str) {
+        let thread = "12345678-1234-1234-1234-123456789abc";
+        let source_cwd = self
+            .server
+            .checked(&["display-message", "-p", "-t", pane, "#{pane_current_path}"])
+            .trim()
+            .to_owned();
+        self.title(pane, thread);
+        for (option, value) in [
+            ("@codex_mux_generated_thread", thread),
+            ("@codex_mux_generated_name", title),
+            ("@codex_mux_generated_source_title", thread),
+            ("@codex_mux_generated_source_cwd", source_cwd.as_str()),
+            ("@codex_mux_generated_at", "1700000000"),
+        ] {
+            self.server
+                .checked(&["set-option", "-p", "-t", pane, option, value]);
+        }
+    }
+
     fn install_binding(&self, binary: &Path, key: &str) {
         let output = Command::new(binary)
             .env("TMUX", self.server.environment())
@@ -894,6 +1010,23 @@ fn client_fields(server: &Server, target: &str) -> (String, String) {
             (tty == target).then(|| (session.to_owned(), pane.to_owned()))
         })
         .unwrap_or_else(|| panic!("client {target:?} disappeared"))
+}
+
+fn without_csi(value: &str) -> String {
+    let mut visible = String::new();
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' && characters.next_if_eq(&'[').is_some() {
+            for parameter in characters.by_ref() {
+                if ('@'..='~').contains(&parameter) {
+                    break;
+                }
+            }
+        } else {
+            visible.push(character);
+        }
+    }
+    visible
 }
 
 fn pane_exists(server: &Server, pane: &str) -> bool {
