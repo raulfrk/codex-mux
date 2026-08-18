@@ -84,6 +84,27 @@ where
         self.launch(context, selected, LaunchKind::ResumeAll)
     }
 
+    /// Opens `codex resume --all` with a profile-selected executable and permissions.
+    pub fn resume_all_with_profile(
+        &self,
+        context: &InvocationContext,
+        selected: Option<&Pane>,
+        executable: &CodexExecutable,
+        yolo: bool,
+    ) -> Result<PaneId> {
+        let arguments = new_window_arguments_with_permissions(
+            executable,
+            context,
+            selected,
+            LaunchKind::ResumeAll,
+            yolo,
+        );
+        let output = self.run_checked(&arguments)?;
+        let pane_id = parse_pane_id(&output.stdout)?;
+        self.switch_client(context, &pane_id, false)?;
+        Ok(pane_id)
+    }
+
     /// Kills exactly `pane`; callers are responsible for obtaining UI confirmation first.
     pub fn close_pane(&self, pane: &Pane) -> Result<()> {
         self.run_checked(&os_strings(["kill-pane", "-t", pane.id.as_str()]))?;

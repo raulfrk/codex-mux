@@ -270,6 +270,64 @@ fn resume_uses_invoking_cwd_fallback_and_resume_all_exactly() {
 }
 
 #[test]
+fn yolo_resume_profile_uses_custom_executable_and_global_permission_flag() {
+    let runner = RecordingRunner::with_outputs([stdout("%95\n"), ok()]);
+    let configured = CodexExecutable::new("/configured/codex").unwrap();
+    let custom = CodexExecutable::new("/opt/custom codex").unwrap();
+    let actions = TmuxActions::new(&runner, &configured);
+    let context = context("/fallback");
+    let selected = pane("%73", "/selected");
+
+    assert_eq!(
+        actions
+            .resume_all_with_profile(&context, Some(&selected), &custom, true)
+            .unwrap(),
+        PaneId::new("%95").unwrap()
+    );
+
+    assert_eq!(
+        runner.commands(),
+        vec![
+            args(&[
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "$7",
+                "-c",
+                "/selected",
+                "--",
+                "/opt/custom codex",
+                "-c",
+                TERMINAL_TITLE_CONFIG,
+                "--yolo",
+                "resume",
+                "--all",
+            ]),
+            args(&[
+                "select-window",
+                "-t",
+                "%95",
+                ";",
+                "select-pane",
+                "-Z",
+                "-t",
+                "%95",
+                ";",
+                "switch-client",
+                "-Z",
+                "-c",
+                "/dev/pts/42; display-message hacked",
+                "-t",
+                "%95",
+            ]),
+        ]
+    );
+}
+
+#[test]
 fn close_kills_only_the_explicit_selected_pane() {
     let runner = RecordingRunner::default();
     let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();

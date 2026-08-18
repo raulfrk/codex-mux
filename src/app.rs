@@ -565,7 +565,19 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                     }
                 }
                 Action::Resume => {
-                    actions.resume_all(&context, selected_pane(&app))?;
+                    let profile = app.resume_profile().ok_or_else(|| {
+                        MuxError::Command("resume profile selection disappeared".to_owned())
+                    })?;
+                    let executable = match &profile.executable {
+                        Some(path) => crate::domain::CodexExecutable::new(path.clone())?,
+                        None => codex.clone(),
+                    };
+                    actions.resume_all_with_profile(
+                        &context,
+                        selected_pane(&app),
+                        &executable,
+                        profile.permissions == PermissionPreset::Yolo,
+                    )?;
                     return Ok(());
                 }
                 Action::Close(id) => {

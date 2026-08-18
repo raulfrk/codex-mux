@@ -101,10 +101,10 @@ Press your normal tmux prefix, then the configured key. For example, with tmux's
 | `j` / `Down`, `k` / `Up` | Move selection |
 | `Enter` | Open the selected Codex pane and make its window full-screen |
 | `n` | Open the launch-profile picker for a new Codex session |
-| profile key (default `s` or `y`) | Immediately start that profile; `s` is standard and `y` adds Codex's `--yolo` flag |
+| profile key (default `s` or `y`) | After `n` or `r`, immediately use that profile; `s` is standard and `y` adds Codex's `--yolo` flag |
 | `j` / `Down`, `k` / `Up`, then `Enter` in profile picker | Choose and start a profile |
 | `a` / `e` in profile picker | Add a profile or edit the selected profile |
-| `r` | Start `codex resume --all` with the same directory rule |
+| `r` | Open the launch-profile picker, then start `codex resume --all` with the chosen profile and the same directory rule |
 | `x` | Ask to close the selected pane |
 | second fresh `x` or `Enter` | Confirm close |
 | `q` or `Esc` during confirmation | Cancel close |

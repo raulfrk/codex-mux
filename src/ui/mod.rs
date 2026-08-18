@@ -85,10 +85,21 @@ pub enum ColorPolicy {
 enum Mode {
     Browse,
     ConfirmClose(PaneId),
-    ThemePicker { original: ThemeId },
-    ProfilePicker { selected: usize },
+    ThemePicker {
+        original: ThemeId,
+    },
+    ProfilePicker {
+        selected: usize,
+        launch_kind: ProfileLaunchKind,
+    },
     ProfileEditor(ProfileEditor),
     Configuration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileLaunchKind {
+    New,
+    Resume,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,10 +119,11 @@ struct ProfileEditor {
     permissions: PermissionPreset,
     field: EditorField,
     error: Option<String>,
+    launch_kind: ProfileLaunchKind,
 }
 
 impl ProfileEditor {
-    fn create() -> Self {
+    fn create(launch_kind: ProfileLaunchKind) -> Self {
         Self {
             original: None,
             name: String::new(),
@@ -120,10 +132,11 @@ impl ProfileEditor {
             permissions: PermissionPreset::Standard,
             field: EditorField::Name,
             error: None,
+            launch_kind,
         }
     }
 
-    fn edit(index: usize, profile: &LaunchProfile) -> Self {
+    fn edit(index: usize, profile: &LaunchProfile, launch_kind: ProfileLaunchKind) -> Self {
         Self {
             original: Some(index),
             name: profile.name.clone(),
@@ -135,6 +148,7 @@ impl ProfileEditor {
             permissions: profile.permissions,
             field: EditorField::Name,
             error: None,
+            launch_kind,
         }
     }
 }
@@ -149,6 +163,7 @@ pub struct App {
     mode: Mode,
     warning: Option<String>,
     profiles: Vec<LaunchProfile>,
+    resume_profile: Option<LaunchProfile>,
     smart_naming: bool,
     naming_save_warning: bool,
     smart_naming_pending: bool,
@@ -214,6 +229,7 @@ impl App {
             mode: Mode::Browse,
             warning,
             profiles,
+            resume_profile: None,
             smart_naming,
             naming_save_warning: false,
             smart_naming_pending: false,
@@ -280,16 +296,26 @@ impl App {
         &self.profiles
     }
 
+    /// Returns the profile selected for a pending resume action.
+    #[must_use]
+    pub const fn resume_profile(&self) -> Option<&LaunchProfile> {
+        self.resume_profile.as_ref()
+    }
+
     /// Completes a successful profile save and returns to the picker.
     pub fn profiles_saved(&mut self, profiles: Vec<LaunchProfile>) {
-        let selected = match &self.mode {
-            Mode::ProfileEditor(editor) => {
-                editor.original.unwrap_or(profiles.len().saturating_sub(1))
-            }
-            _ => 0,
+        let (selected, launch_kind) = match &self.mode {
+            Mode::ProfileEditor(editor) => (
+                editor.original.unwrap_or(profiles.len().saturating_sub(1)),
+                editor.launch_kind,
+            ),
+            _ => (0, ProfileLaunchKind::New),
         };
         self.profiles = profiles;
-        self.mode = Mode::ProfilePicker { selected };
+        self.mode = Mode::ProfilePicker {
+            selected,
+            launch_kind,
+        };
     }
 
     /// Keeps the editor open and displays a persistence or validation failure.
@@ -350,7 +376,10 @@ impl App {
             Mode::Browse => self.handle_browse_key(key.code),
             Mode::ConfirmClose(id) => self.handle_confirmation_key(key, id),
             Mode::ThemePicker { original } => self.handle_theme_key(key.code, original),
-            Mode::ProfilePicker { selected } => self.handle_profile_key(key.code, selected),
+            Mode::ProfilePicker {
+                selected,
+                launch_kind,
+            } => self.handle_profile_key(key.code, selected, launch_kind),
             Mode::ProfileEditor(editor) => self.handle_editor_key(key.code, editor),
             Mode::Configuration => self.handle_configuration_key(key.code),
         }
@@ -368,10 +397,21 @@ impl App {
             }
             KeyCode::Enter => self.selected.clone().map(Action::Activate),
             KeyCode::Char('n') => {
-                self.mode = Mode::ProfilePicker { selected: 0 };
+                self.resume_profile = None;
+                self.mode = Mode::ProfilePicker {
+                    selected: 0,
+                    launch_kind: ProfileLaunchKind::New,
+                };
                 None
             }
-            KeyCode::Char('r') => Some(Action::Resume),
+            KeyCode::Char('r') => {
+                self.resume_profile = None;
+                self.mode = Mode::ProfilePicker {
+                    selected: 0,
+                    launch_kind: ProfileLaunchKind::Resume,
+                };
+                None
+            }
             KeyCode::Char('x') => {
                 if let Some(id) = self.selected.clone() {
                     self.mode = Mode::ConfirmClose(id);
@@ -447,45 +487,56 @@ impl App {
         }
     }
 
-    fn handle_profile_key(&mut self, code: KeyCode, selected: usize) -> Option<Action> {
+    fn handle_profile_key(
+        &mut self,
+        code: KeyCode,
+        selected: usize,
+        launch_kind: ProfileLaunchKind,
+    ) -> Option<Action> {
         match code {
             KeyCode::Char('j') | KeyCode::Down => {
                 let next = selected
                     .saturating_add(1)
                     .min(self.profiles.len().saturating_sub(1));
-                self.mode = Mode::ProfilePicker { selected: next };
+                self.mode = Mode::ProfilePicker {
+                    selected: next,
+                    launch_kind,
+                };
                 None
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.mode = Mode::ProfilePicker {
                     selected: selected.saturating_sub(1),
+                    launch_kind,
                 };
                 None
             }
-            KeyCode::Enter => self
-                .profiles
-                .get(selected)
-                .cloned()
-                .map(Action::LaunchProfile),
+            KeyCode::Enter => {
+                let profile = self.profiles.get(selected)?.clone();
+                Some(self.profile_launch_action(launch_kind, profile))
+            }
             KeyCode::Char('a') => {
-                self.mode = Mode::ProfileEditor(ProfileEditor::create());
+                self.mode = Mode::ProfileEditor(ProfileEditor::create(launch_kind));
                 None
             }
             KeyCode::Char('e') => {
                 let profile = self.profiles.get(selected)?.clone();
-                self.mode = Mode::ProfileEditor(ProfileEditor::edit(selected, &profile));
+                self.mode =
+                    Mode::ProfileEditor(ProfileEditor::edit(selected, &profile, launch_kind));
                 None
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = Mode::Browse;
                 None
             }
-            KeyCode::Char(key) => self
-                .profiles
-                .iter()
-                .find(|profile| profile.key.eq_ignore_ascii_case(&key))
-                .cloned()
-                .map(Action::LaunchProfile),
+            KeyCode::Char(key) => {
+                let profile = self
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.key.eq_ignore_ascii_case(&key))?
+                    .clone();
+                Some(self.profile_launch_action(launch_kind, profile))
+            }
             _ => None,
         }
     }
@@ -496,6 +547,7 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::ProfilePicker {
                     selected: editor.original.unwrap_or(0),
+                    launch_kind: editor.launch_kind,
                 };
                 return None;
             }
@@ -577,6 +629,16 @@ impl App {
         self.selected = Some(self.panes[next].id.clone());
     }
 
+    fn profile_launch_action(&mut self, kind: ProfileLaunchKind, profile: LaunchProfile) -> Action {
+        match kind {
+            ProfileLaunchKind::New => Action::LaunchProfile(profile),
+            ProfileLaunchKind::Resume => {
+                self.resume_profile = Some(profile);
+                Action::Resume
+            }
+        }
+    }
+
     fn cycle_theme(&mut self, delta: isize) {
         let current = ThemeId::ALL
             .iter()
@@ -609,7 +671,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_theme_picker(frame, area, app, palette);
     }
     match &app.mode {
-        Mode::ProfilePicker { selected } => {
+        Mode::ProfilePicker { selected, .. } => {
             render_profile_picker(frame, area, app, palette, *selected);
         }
         Mode::ProfileEditor(editor) => render_profile_editor(frame, area, editor, palette),

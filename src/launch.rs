@@ -69,10 +69,11 @@ pub fn new_window_arguments_with_permissions(
         OsString::from(TERMINAL_TITLE_CONFIG),
     ];
 
+    if yolo {
+        arguments.push(OsString::from("--yolo"));
+    }
     if kind == LaunchKind::ResumeAll {
         arguments.extend([OsString::from("resume"), OsString::from("--all")]);
-    } else if yolo {
-        arguments.push(OsString::from("--yolo"));
     }
 
     arguments

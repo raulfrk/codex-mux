@@ -1132,7 +1132,12 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
     for (keys, label, expected_tail) in [
         (&b"ns"[..], "new", ""),
         (&b"ny"[..], "yolo", "arg2=--yolo\n"),
-        (&b"r"[..], "resume", "arg2=resume\narg3=--all\n"),
+        (&b"rs"[..], "resume", "arg2=resume\narg3=--all\n"),
+        (
+            &b"ry"[..],
+            "resume-yolo",
+            "arg2=--yolo\narg3=resume\narg4=--all\n",
+        ),
     ] {
         let fixture = RuntimeFixture::new(label);
         let selected_dir = fixture.scratch.join("selected-cwd");
@@ -1172,9 +1177,14 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
                 "new action unexpectedly resumed: {log}"
             );
         }
+        let launched_pane = client_pane(&fixture.server, &client_tty);
+        assert_ne!(
+            launched_pane, fixture.origin_pane,
+            "launch left the invoking client on its original pane"
+        );
         assert_eq!(
             client_pane(&fixture.server, &shared_tty),
-            client_pane(&fixture.server, &client_tty),
+            launched_pane,
             "clients attached to one tmux session must reflect its shared active window"
         );
         client.send(b"\x02d");

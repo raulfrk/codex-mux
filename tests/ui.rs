@@ -93,12 +93,41 @@ fn documented_browse_keys_produce_their_actions() {
         Some(Action::LaunchProfile(LaunchProfile::standard()))
     );
     app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.handle_key(key(KeyCode::Char('r'))), None);
     assert_eq!(
-        app.handle_key(key(KeyCode::Char('r'))),
+        app.handle_key(key(KeyCode::Char('s'))),
         Some(Action::Resume)
     );
+    assert_eq!(app.resume_profile(), Some(&LaunchProfile::standard()));
+    app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Some(Action::Quit));
     assert_eq!(app.handle_key(key(KeyCode::Esc)), Some(Action::Quit));
+}
+
+#[test]
+fn editing_a_profile_from_resume_retains_resume_intent_after_save() {
+    let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);
+    app.handle_key(key(KeyCode::Char('r')));
+    app.handle_key(key(KeyCode::Char('e')));
+    let Some(Action::PersistProfiles(profiles)) = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("editor did not request profile persistence");
+    };
+    app.profiles_saved(profiles.clone());
+
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Resume));
+    assert_eq!(app.resume_profile(), Some(&profiles[0]));
+}
+
+#[test]
+fn resume_profile_navigation_and_editor_cancel_retain_resume_intent() {
+    let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);
+    app.handle_key(key(KeyCode::Char('r')));
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Char('e')));
+    app.handle_key(key(KeyCode::Esc));
+
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Resume));
+    assert_eq!(app.resume_profile(), Some(&LaunchProfile::yolo()));
 }
 
 #[test]

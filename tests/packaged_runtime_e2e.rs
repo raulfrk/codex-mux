@@ -538,7 +538,7 @@ fn packaged_new_resume_fallback_and_confirmed_close_cross_process_boundaries() {
     };
     for (label, keys, expected) in [
         ("new", &b"ns"[..], None),
-        ("resume", &b"r"[..], Some("arg2=resume\narg3=--all\n")),
+        ("resume", &b"rs"[..], Some("arg2=resume\narg3=--all\n")),
     ] {
         let fixture = Fixture::new(label);
         let fallback = fixture.scratch.join("invoking-fallback");
