@@ -541,6 +541,12 @@ impl NamingWorker {
                         }
                         Err(_) => continue,
                     };
+                    if conversation.transcript.trim().is_empty() {
+                        // A running first turn is pending, not a provider failure. Keeping the
+                        // failure cooldown here would hide text completed just after this read.
+                        last_attempt.remove(&identity);
+                        continue;
+                    }
                     let thread_id = conversation.thread_id.clone();
                     let fingerprint = transcript_fingerprint(&conversation.transcript);
                     let name = if let Some((cached, name)) = cache.get(&thread_id) {
@@ -996,6 +1002,59 @@ mod transport_tests {
         let attempts = attempts.lock().unwrap();
         assert!(attempts.len() >= 2);
         assert!(attempts[1].duration_since(attempts[0]) >= retry_interval);
+    }
+
+    #[test]
+    fn pending_conversations_retry_before_the_failure_interval() {
+        struct PendingNamer(Arc<std::sync::atomic::AtomicUsize>);
+        impl ConversationNamer for PendingNamer {
+            fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+                let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(NamingConversation {
+                    thread_id: target.thread_hint.clone(),
+                    transcript: if attempt == 0 {
+                        String::new()
+                    } else {
+                        "completed chat".to_owned()
+                    },
+                })
+            }
+
+            fn name(&mut self, conversation: &NamingConversation) -> Result<String> {
+                if conversation.transcript.is_empty() {
+                    return Err(protocol("conversation is not ready"));
+                }
+                Ok("Generated title".to_owned())
+            }
+        }
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let target = target_created_at(0);
+        let worker = NamingWorker::spawn_with_intervals(
+            move |_| Ok(PendingNamer(observed)),
+            move || Ok(vec![target.clone()]),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while worker.names().lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let names = worker.names();
+        worker.stop();
+
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            names
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .map(|name| name.name.as_str()),
+            Some("Generated title")
+        );
     }
 
     #[test]
