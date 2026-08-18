@@ -32,10 +32,13 @@ fn rendered(width: u16, height: u16) -> String {
 }
 
 fn rendered_panes(panes: Vec<Pane>, width: u16, height: u16) -> String {
-    let app = App::new(panes, ThemeId::EmberOrange, None);
+    rendered_app(&App::new(panes, ThemeId::EmberOrange, None), width, height)
+}
+
+fn rendered_app(app: &App, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &app)).unwrap();
+    terminal.draw(|frame| render(frame, app)).unwrap();
     let buffer = terminal.backend().buffer();
     (0..height)
         .map(|y| {
@@ -257,6 +260,91 @@ fn narrow_rows_wire_directional_unicode_elision_into_the_renderer() {
     assert!(UnicodeWidthStr::width(path) + 4 <= 40);
     assert!(!screen.contains("narrow terminals"));
     assert!(!screen.contains("/home/raul"));
+}
+
+#[test]
+fn approved_sizes_preserve_adaptive_title_and_path_contract() {
+    let long_title = concat!(
+        "Improve e\u{301} Unicode session rows across wide compact and phone ",
+        "terminal layouts while preserving a useful conversation summary"
+    );
+    let deep_path = concat!(
+        "/home/raul/workspace/改善/very/deep/project/with/many/components/",
+        "adaptive/session-row-renderer"
+    );
+
+    for (width, height) in [(120, 30), (89, 28), (62, 20)] {
+        let screen = rendered_panes(vec![pane("%19", long_title, deep_path)], width, height);
+        let lines = screen.lines().collect::<Vec<_>>();
+        let title_index = lines
+            .iter()
+            .position(|line| line.contains("Improve e\u{301}"))
+            .unwrap_or_else(|| panic!("missing title at {width}x{height}"));
+        let title = lines[title_index]
+            .split_once("› ")
+            .unwrap()
+            .1
+            .split('│')
+            .next()
+            .unwrap()
+            .trim_end();
+        let path = lines[title_index + 1]
+            .split('│')
+            .find(|segment| segment.contains('…'))
+            .unwrap()
+            .trim();
+
+        assert!(
+            title.ends_with('…'),
+            "title did not end-elide at {width}x{height}: {title:?}"
+        );
+        assert!(
+            path.starts_with('…'),
+            "path did not start-elide at {width}x{height}: {path:?}"
+        );
+        assert!(
+            path.ends_with("session-row-renderer"),
+            "path tail was lost at {width}x{height}: {path:?}"
+        );
+        assert!(UnicodeWidthStr::width(title) + 2 <= usize::from(width));
+        // TestBackend exposes wide-glyph continuation cells as spaces in reconstructed rows,
+        // so string-width measurement would double-count them. Ellipsis plus the retained tail
+        // proves the renderer budget kept the useful path content inside the visible row.
+    }
+
+    let tiny = rendered_panes(vec![pane("%19", "selected conversation", deep_path)], 32, 8);
+    assert!(tiny.contains("selected conversation"));
+    assert!(!tiny.contains("session-row-renderer"));
+    assert!(!tiny.contains("/home/raul"));
+}
+
+#[test]
+fn constrained_session_list_scrolls_selected_final_two_line_row_into_view() {
+    let panes = (0..7)
+        .map(|index| {
+            pane(
+                &format!("%{}", index + 1),
+                &format!("conversation-{index}"),
+                &format!("/work/project-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = App::new(panes, ThemeId::EmberOrange, None);
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Down));
+    }
+
+    let screen = rendered_app(&app, 40, 12);
+    let lines = screen.lines().collect::<Vec<_>>();
+    let title_index = lines
+        .iter()
+        .position(|line| line.contains("conversation-6"))
+        .expect("selected final title was not scrolled into view");
+
+    assert!(lines[title_index].starts_with("› conversation-6"));
+    assert!(lines[title_index + 1].contains("/work/project-6"));
+    assert!(!screen.contains("conversation-0"));
+    assert!(!screen.contains("/work/project-0"));
 }
 
 #[test]
