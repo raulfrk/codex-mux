@@ -7,6 +7,7 @@ use codex_mux::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
+use unicode_width::UnicodeWidthStr;
 
 fn pane(id: &str, title: &str, path: &str) -> Pane {
     Pane {
@@ -20,14 +21,18 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
 }
 
 fn rendered(width: u16, height: u16) -> String {
-    let app = App::new(
+    rendered_panes(
         vec![
             pane("%19", "shipping feature", "/work/shipping"),
             pane("%83", "review release", "/work/release"),
         ],
-        ThemeId::EmberOrange,
-        None,
-    );
+        width,
+        height,
+    )
+}
+
+fn rendered_panes(panes: Vec<Pane>, width: u16, height: u16) -> String {
+    let app = App::new(panes, ThemeId::EmberOrange, None);
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -207,9 +212,51 @@ fn constrained_picker_scrolls_to_keep_a_long_list_selection_visible() {
 fn phone_layout_at_62_columns_is_readable_and_hides_internal_pane_ids() {
     let screen = rendered(62, 20);
     assert!(screen.contains("shipping feature"));
+    let lines = screen.lines().collect::<Vec<_>>();
+    let title_line = lines
+        .iter()
+        .position(|line| line.contains("shipping feature"))
+        .unwrap();
+    let path_line = lines
+        .iter()
+        .position(|line| line.contains("/work/shipping"))
+        .unwrap();
+    assert_eq!(path_line, title_line + 1);
     assert!(screen.contains("Enter open"));
     assert!(!screen.contains("%19"));
     assert!(!screen.contains("%83"));
+}
+
+#[test]
+fn narrow_rows_wire_directional_unicode_elision_into_the_renderer() {
+    let screen = rendered_panes(
+        vec![pane(
+            "%19",
+            "Improve e\u{301} Unicode session row truncation across narrow terminals",
+            "/home/raul/workspace/very/deep/repository/session-rows",
+        )],
+        40,
+        20,
+    );
+    let lines = screen.lines().collect::<Vec<_>>();
+    let title_index = lines
+        .iter()
+        .position(|line| line.contains("Improve"))
+        .unwrap();
+    let title = lines[title_index].strip_prefix("› ").unwrap().trim_end();
+    let path_line = lines[title_index + 1];
+    let path = path_line.strip_prefix("    ").unwrap().trim_end();
+
+    assert!(title.ends_with('…'), "title must end-elide: {title:?}");
+    assert!(path.starts_with('…'), "path must start-elide: {path:?}");
+    assert!(
+        path.ends_with("session-rows"),
+        "path tail was lost: {path:?}"
+    );
+    assert!(UnicodeWidthStr::width(title) + 2 <= 40);
+    assert!(UnicodeWidthStr::width(path) + 4 <= 40);
+    assert!(!screen.contains("narrow terminals"));
+    assert!(!screen.contains("/home/raul"));
 }
 
 #[test]

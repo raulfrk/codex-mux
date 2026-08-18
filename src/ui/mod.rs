@@ -9,9 +9,11 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
-    text::{Line, Span},
+    text::Line,
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config::{LaunchProfile, PermissionPreset, validate_profiles},
@@ -26,7 +28,7 @@ pub enum LayoutKind {
     Wide,
     /// Full-width list with a footer command bar.
     Compact,
-    /// Single-line rows and abbreviated phone controls.
+    /// Compact two-line rows and abbreviated phone controls.
     Phone,
     /// Minimal selected-session view for severely constrained terminals.
     Tiny,
@@ -641,7 +643,7 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(45), Constraint::Length(29)])
         .split(inner);
-    render_list(frame, columns[0], app, palette, false);
+    render_list(frame, columns[0], app, palette);
     let mut help_lines = vec![
         Line::styled("Commands", palette.accent),
         Line::from("Enter  switch"),
@@ -677,7 +679,7 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, 
         ])
         .split(area);
     frame.render_widget(Paragraph::new("codex-mux").style(palette.accent), chunks[0]);
-    render_list(frame, chunks[1], app, palette, phone);
+    render_list(frame, chunks[1], app, palette);
     let footer = if matches!(app.mode, Mode::ConfirmClose(_)) {
         Paragraph::new("press x/Enter again to close · Esc cancels").style(palette.warning)
     } else if let Some(warning) = &app.warning {
@@ -718,28 +720,78 @@ fn render_tiny(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
-fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, single_line: bool) {
+fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
+    const HIGHLIGHT_SYMBOL: &str = "› ";
+    const PATH_INDENT: &str = "  ";
+
+    // Ratatui reserves the highlight-symbol width for every item whenever a selection exists.
+    // Budget inside that shared item area so selected and unselected rows elide identically.
+    let highlight_width = UnicodeWidthStr::width(HIGHLIGHT_SYMBOL) as u16;
+    let path_indent_width = UnicodeWidthStr::width(PATH_INDENT) as u16;
+    let title_width = usize::from(area.width.saturating_sub(highlight_width));
+    let path_width = usize::from(
+        area.width
+            .saturating_sub(highlight_width + path_indent_width),
+    );
     let items = app.panes.iter().map(|pane| {
-        let title = sanitized(&pane.display_title());
-        let path = sanitized(&pane.current_path.to_string_lossy());
-        if single_line {
-            ListItem::new(Line::from(vec![
-                Span::raw(title),
-                Span::styled(format!("  {path}"), palette.muted),
-            ]))
-        } else {
-            ListItem::new(vec![
-                Line::from(title),
-                Line::styled(format!("  {path}"), palette.muted),
-            ])
-        }
+        let title = end_elide(&sanitized(&pane.display_title()), title_width);
+        let path = start_elide(&sanitized(&pane.current_path.to_string_lossy()), path_width);
+        ListItem::new(vec![
+            Line::from(title),
+            Line::styled(format!("{PATH_INDENT}{path}"), palette.muted),
+        ])
     });
     let mut state = ListState::default().with_selected(app.selected_index());
     let list = List::new(items)
         .highlight_style(palette.selected)
-        .highlight_symbol("› ")
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
         .block(Block::default().title(" sessions "));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn end_elide(value: &str, max_width: usize) -> String {
+    elide(value, max_width, false)
+}
+
+fn start_elide(value: &str, max_width: usize) -> String {
+    elide(value, max_width, true)
+}
+
+fn elide(value: &str, max_width: usize, from_start: bool) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let available = max_width - UnicodeWidthStr::width("…");
+    if from_start {
+        let mut width = 0;
+        let mut suffix = Vec::new();
+        for grapheme in value.graphemes(true).rev() {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if width + grapheme_width > available {
+                break;
+            }
+            suffix.push(grapheme);
+            width += grapheme_width;
+        }
+        format!("…{}", suffix.into_iter().rev().collect::<String>())
+    } else {
+        let mut width = 0;
+        let mut prefix = String::new();
+        for grapheme in value.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if width + grapheme_width > available {
+                break;
+            }
+            prefix.push_str(grapheme);
+            width += grapheme_width;
+        }
+        prefix.push('…');
+        prefix
+    }
 }
 
 fn render_profile_picker(
@@ -980,9 +1032,10 @@ mod tests {
     use super::terminal::{TerminalControl, with_restoration};
     use super::{
         Action, App, ColorPolicy, KeyCode, KeyEvent, LayoutKind, Pane, PaneId, TerminalSize,
-        ThemeId, layout_kind,
+        ThemeId, end_elide, layout_kind, start_elide,
     };
     use crate::domain::SessionId;
+    use unicode_width::UnicodeWidthStr;
 
     fn pane(id: &str, title: &str) -> Pane {
         Pane {
@@ -997,6 +1050,32 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn elision_preserves_direction_graphemes_and_terminal_width() {
+        assert_eq!(end_elide("short", 5), "short");
+        assert_eq!(end_elide("abcdef", 5), "abcd…");
+        assert_eq!(start_elide("/alpha/beta", 6), "…/beta");
+        assert_eq!(end_elide("e\u{301}clair", 4), "e\u{301}cl…");
+        assert_eq!(end_elide("👩‍💻abc", 4), "👩‍💻a…");
+
+        for (value, width) in [
+            (end_elide("改善 session title", 8), 8),
+            (start_elide("/work/改善/session", 8), 8),
+            (end_elide("👩‍💻 builds", 6), 6),
+        ] {
+            assert!(UnicodeWidthStr::width(value.as_str()) <= width);
+        }
+    }
+
+    #[test]
+    fn elision_handles_empty_and_tiny_budgets() {
+        assert_eq!(end_elide("", 0), "");
+        assert_eq!(end_elide("abc", 0), "");
+        assert_eq!(start_elide("abc", 0), "");
+        assert_eq!(end_elide("abc", 1), "…");
+        assert_eq!(start_elide("abc", 1), "…");
     }
 
     #[test]
