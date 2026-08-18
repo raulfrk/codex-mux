@@ -350,7 +350,7 @@ fn worker_is_non_blocking_deduplicates_and_joins_on_stop() {
 }
 
 #[test]
-fn worker_schedules_reads_only_at_initial_and_hourly_deadlines() {
+fn worker_schedules_reads_only_at_initial_and_thirty_minute_deadlines() {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -359,10 +359,10 @@ fn worker_schedules_reads_only_at_initial_and_hourly_deadlines() {
     let names = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let discoveries = Arc::new(AtomicUsize::new(0));
-    let new = target("%1", &thread_created_at(now - 590, "1"));
+    let new = target("%1", &thread_created_at(now - 290, "1"));
     let mut existing = target("%2", &thread_created_at(now - 7_200, "2"));
     existing.generated_name = Some("Stable entry title".to_owned());
-    existing.generated_at_unix = Some(now - 3_590);
+    existing.generated_at_unix = Some(now - 1_790);
     let observed_reads = reads.clone();
     let provider_started = started.clone();
     let observed_discoveries = discoveries.clone();
@@ -390,10 +390,10 @@ fn worker_schedules_reads_only_at_initial_and_hourly_deadlines() {
 
     let reads = Arc::new(AtomicUsize::new(0));
     let observed_reads = reads.clone();
-    let mut hourly = target("%4", &thread_created_at(now - 7_200, "4"));
-    hourly.generated_name = Some("Hourly title".to_owned());
-    hourly.generated_at_unix = Some(now - 3_610);
-    let initial = target("%3", &thread_created_at(now - 610, "3"));
+    let mut refresh_due = target("%4", &thread_created_at(now - 7_200, "4"));
+    refresh_due.generated_name = Some("Refreshable title".to_owned());
+    refresh_due.generated_at_unix = Some(now - 1_810);
+    let initial = target("%3", &thread_created_at(now - 310, "3"));
     let worker = NamingWorker::spawn(
         move |_| {
             Ok(CountingNamer {
@@ -402,7 +402,7 @@ fn worker_schedules_reads_only_at_initial_and_hourly_deadlines() {
                 delay: Duration::ZERO,
             })
         },
-        move || Ok(vec![initial.clone(), hourly.clone()]),
+        move || Ok(vec![initial.clone(), refresh_due.clone()]),
         Duration::from_millis(10),
     );
     wait_until("both due conversations to be read", || {

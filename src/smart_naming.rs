@@ -31,9 +31,11 @@ const THREAD_LIST_PAGE_SIZE: u32 = 100;
 const MAX_THREAD_LIST_PAGES: usize = 20;
 const MAX_APP_SERVER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Minimum age of a new Codex thread before its first smart title.
-pub const INITIAL_NAMING_DELAY: Duration = Duration::from_secs(10 * 60);
+pub const INITIAL_NAMING_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Interval between reconsidering an existing smart title.
-pub const NAMING_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const NAMING_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Cooldown before retrying a failed naming attempt or restarting an unhealthy provider.
+const NAMING_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 type AppServerMessage = std::result::Result<Value, String>;
 
 /// Lazily constructs naming infrastructure only after an explicit opt-in.
@@ -455,19 +457,21 @@ impl NamingWorker {
         F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
     {
-        Self::spawn_with_refresh_interval(
+        Self::spawn_with_intervals(
             start_namer,
             discover,
             poll_interval,
             NAMING_REFRESH_INTERVAL,
+            NAMING_RETRY_INTERVAL,
         )
     }
 
-    fn spawn_with_refresh_interval<N, F, D>(
+    fn spawn_with_intervals<N, F, D>(
         start_namer: F,
         mut discover: D,
         poll_interval: Duration,
         refresh_interval: Duration,
+        retry_interval: Duration,
     ) -> Self
     where
         N: ConversationNamer,
@@ -484,7 +488,8 @@ impl NamingWorker {
                 return;
             };
             let mut cache = HashMap::<String, (u64, String)>::new();
-            let mut last_attempt = HashMap::<(String, PathBuf), std::time::Instant>::new();
+            let mut last_attempt =
+                HashMap::<(String, PathBuf), (std::time::Instant, Duration)>::new();
             loop {
                 if stopped.try_recv().is_ok() {
                     break;
@@ -520,15 +525,18 @@ impl NamingWorker {
                     };
                     if last_attempt
                         .get(&identity)
-                        .is_some_and(|attempted| attempted.elapsed() < refresh_interval)
+                        .is_some_and(|(attempted, cooldown)| attempted.elapsed() < *cooldown)
                     {
                         continue;
                     }
-                    last_attempt.insert(identity, std::time::Instant::now());
+                    last_attempt.insert(
+                        identity.clone(),
+                        (std::time::Instant::now(), retry_interval),
+                    );
                     let conversation = match namer.read(due_target) {
                         Ok(conversation) => conversation,
                         Err(_) if !namer.is_healthy() => {
-                            let _ = stopped.recv_timeout(refresh_interval);
+                            let _ = stopped.recv_timeout(retry_interval);
                             return;
                         }
                         Err(_) => continue,
@@ -542,7 +550,7 @@ impl NamingWorker {
                             let name = match namer.name(&conversation) {
                                 Ok(name) => name,
                                 Err(_) if !namer.is_healthy() => {
-                                    let _ = stopped.recv_timeout(refresh_interval);
+                                    let _ = stopped.recv_timeout(retry_interval);
                                     return;
                                 }
                                 Err(_) => continue,
@@ -554,7 +562,7 @@ impl NamingWorker {
                         let name = match namer.name(&conversation) {
                             Ok(name) => name,
                             Err(_) if !namer.is_healthy() => {
-                                let _ = stopped.recv_timeout(refresh_interval);
+                                let _ = stopped.recv_timeout(retry_interval);
                                 return;
                             }
                             Err(_) => continue,
@@ -565,7 +573,7 @@ impl NamingWorker {
                     let still_resolved = match namer.resolve(due_target) {
                         Ok(thread_id) => thread_id,
                         Err(_) if !namer.is_healthy() => {
-                            let _ = stopped.recv_timeout(refresh_interval);
+                            let _ = stopped.recv_timeout(retry_interval);
                             return;
                         }
                         Err(_) => continue,
@@ -573,10 +581,14 @@ impl NamingWorker {
                     if still_resolved != thread_id {
                         continue;
                     }
-                    let current = discover().unwrap_or_default();
+                    let Ok(current) = discover() else {
+                        continue;
+                    };
                     let mut published = published.lock().unwrap();
+                    let mut published_any = false;
                     for target in targets {
                         if current.contains(&target) {
+                            published_any = true;
                             published.insert(
                                 target.pane_id,
                                 GeneratedName {
@@ -588,6 +600,10 @@ impl NamingWorker {
                                 },
                             );
                         }
+                    }
+                    if published_any {
+                        last_attempt
+                            .insert(identity, (std::time::Instant::now(), refresh_interval));
                     }
                 }
                 if stopped.recv_timeout(poll_interval).is_ok() {
@@ -931,10 +947,11 @@ mod transport_tests {
         }
 
         let target = target_created_at(0);
-        let worker = NamingWorker::spawn_with_refresh_interval(
+        let worker = NamingWorker::spawn_with_intervals(
             |_| Ok(UnhealthyNamer),
             move || Ok(vec![target.clone()]),
             Duration::from_millis(1),
+            Duration::from_millis(5),
             Duration::from_millis(10),
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -943,6 +960,169 @@ mod transport_tests {
         }
         assert!(worker.is_finished());
         worker.stop();
+    }
+
+    #[test]
+    fn transient_failures_wait_for_the_retry_interval() {
+        struct FailingNamer(Arc<Mutex<Vec<std::time::Instant>>>);
+        impl ConversationNamer for FailingNamer {
+            fn read(&mut self, _: &NamingTarget) -> Result<NamingConversation> {
+                self.0.lock().unwrap().push(std::time::Instant::now());
+                Err(protocol("transient failure"))
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                unreachable!()
+            }
+        }
+
+        assert_eq!(NAMING_RETRY_INTERVAL, Duration::from_secs(60 * 60));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+        let target = target_created_at(0);
+        let retry_interval = Duration::from_millis(40);
+        let worker = NamingWorker::spawn_with_intervals(
+            move |_| Ok(FailingNamer(observed)),
+            move || Ok(vec![target.clone()]),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            retry_interval,
+        );
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while attempts.lock().unwrap().len() < 2 && std::time::Instant::now() < retry_deadline {
+            thread::yield_now();
+        }
+        worker.stop();
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts.len() >= 2);
+        assert!(attempts[1].duration_since(attempts[0]) >= retry_interval);
+    }
+
+    #[test]
+    fn successful_attempts_wait_for_the_refresh_interval() {
+        struct SuccessfulNamer(Arc<Mutex<Vec<std::time::Instant>>>);
+        impl ConversationNamer for SuccessfulNamer {
+            fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+                self.0.lock().unwrap().push(std::time::Instant::now());
+                Ok(NamingConversation {
+                    thread_id: target.thread_hint.clone(),
+                    transcript: "completed chat".to_owned(),
+                })
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                Ok("Generated title".to_owned())
+            }
+        }
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+        let target = target_created_at(0);
+        let refresh_interval = Duration::from_millis(40);
+        let worker = NamingWorker::spawn_with_intervals(
+            move |_| Ok(SuccessfulNamer(observed)),
+            move || Ok(vec![target.clone()]),
+            Duration::from_millis(1),
+            refresh_interval,
+            Duration::from_secs(2),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while attempts.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        worker.stop();
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts.len() >= 2);
+        assert!(attempts[1].duration_since(attempts[0]) >= refresh_interval);
+    }
+
+    #[test]
+    fn stale_resolution_waits_for_the_retry_interval() {
+        struct StaleNamer(Arc<Mutex<Vec<std::time::Instant>>>);
+        impl ConversationNamer for StaleNamer {
+            fn resolve(&mut self, _: &NamingTarget) -> Result<String> {
+                Ok("00000000-0000-7000-8000-000000000001".to_owned())
+            }
+
+            fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+                self.0.lock().unwrap().push(std::time::Instant::now());
+                Ok(NamingConversation {
+                    thread_id: target.thread_hint.clone(),
+                    transcript: "completed chat".to_owned(),
+                })
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                Ok("Stale title".to_owned())
+            }
+        }
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+        let target = target_created_at(0);
+        let retry_interval = Duration::from_millis(40);
+        let worker = NamingWorker::spawn_with_intervals(
+            move |_| Ok(StaleNamer(observed)),
+            move || Ok(vec![target.clone()]),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            retry_interval,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while attempts.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        worker.stop();
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts.len() >= 2);
+        assert!(attempts[1].duration_since(attempts[0]) >= retry_interval);
+    }
+
+    #[test]
+    fn final_discovery_failure_waits_for_the_retry_interval() {
+        struct SuccessfulNamer(Arc<Mutex<Vec<std::time::Instant>>>);
+        impl ConversationNamer for SuccessfulNamer {
+            fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+                self.0.lock().unwrap().push(std::time::Instant::now());
+                Ok(NamingConversation {
+                    thread_id: target.thread_hint.clone(),
+                    transcript: "completed chat".to_owned(),
+                })
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                Ok("Generated title".to_owned())
+            }
+        }
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+        let target = target_created_at(0);
+        let discovered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let discovery_calls = discovered.clone();
+        let retry_interval = Duration::from_millis(40);
+        let worker = NamingWorker::spawn_with_intervals(
+            move |_| Ok(SuccessfulNamer(observed)),
+            move || {
+                let call = discovery_calls.fetch_add(1, Ordering::SeqCst);
+                if call % 2 == 0 {
+                    Ok(vec![target.clone()])
+                } else {
+                    Err(protocol("final discovery failed"))
+                }
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            retry_interval,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while attempts.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        worker.stop();
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts.len() >= 2);
+        assert!(attempts[1].duration_since(attempts[0]) >= retry_interval);
     }
 
     fn target_created_at(created_at_unix: u64) -> NamingTarget {
@@ -963,16 +1143,16 @@ mod transport_tests {
     }
 
     #[test]
-    fn new_titles_wait_ten_minutes_and_existing_titles_refresh_hourly() {
+    fn new_titles_wait_five_minutes_and_existing_titles_refresh_every_thirty_minutes() {
         let now = 1_800_000_000;
-        assert!(!naming_is_due(&target_created_at(now - 599), now));
-        assert!(naming_is_due(&target_created_at(now - 600), now));
+        assert!(!naming_is_due(&target_created_at(now - 299), now));
+        assert!(naming_is_due(&target_created_at(now - 300), now));
 
         let mut existing = target_created_at(now);
         existing.generated_name = Some("Existing title".to_owned());
-        existing.generated_at_unix = Some(now - 3_599);
+        existing.generated_at_unix = Some(now - 1_799);
         assert!(!naming_is_due(&existing, now));
-        existing.generated_at_unix = Some(now - 3_600);
+        existing.generated_at_unix = Some(now - 1_800);
         assert!(naming_is_due(&existing, now));
     }
 
