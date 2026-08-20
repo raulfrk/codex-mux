@@ -10,9 +10,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use regex::Regex;
+
 use crate::{
     MuxError, Result,
-    domain::{CodexExecutable, ProcessInspector},
+    config::MatchScope,
+    domain::{CodexExecutable, PaneProcess, ProcessInspector},
 };
 
 /// Resolves foreground process groups from a configurable procfs root.
@@ -20,6 +23,8 @@ use crate::{
 pub struct LinuxProcessInspector {
     proc_root: PathBuf,
     recognized: Vec<CodexExecutable>,
+    match_scope: MatchScope,
+    match_command_regexes: Vec<Regex>,
 }
 
 impl LinuxProcessInspector {
@@ -35,6 +40,8 @@ impl LinuxProcessInspector {
         Self {
             proc_root: proc_root.into(),
             recognized: vec![codex.clone()],
+            match_scope: MatchScope::Foreground,
+            match_command_regexes: Vec::new(),
         }
     }
 
@@ -64,7 +71,52 @@ impl LinuxProcessInspector {
         Self {
             proc_root: proc_root.into(),
             recognized,
+            match_scope: MatchScope::Foreground,
+            match_command_regexes: Vec::new(),
         }
+    }
+
+    /// Creates an inspector with explicit candidate scope and normalized-argv regexes.
+    pub fn with_matcher(
+        recognized: Vec<CodexExecutable>,
+        match_scope: MatchScope,
+        match_command_regexes: &[String],
+    ) -> Result<Self> {
+        let primary = recognized
+            .first()
+            .cloned()
+            .expect("validated non-empty matches");
+        let regexes = match_command_regexes
+            .iter()
+            .map(|expression| {
+                Regex::new(expression).map_err(|error| MuxError::InvalidValue {
+                    field: "process match command regex",
+                    message: format!("invalid regex {expression:?}: {error}"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            proc_root: PathBuf::from("/proc"),
+            recognized: if recognized.is_empty() {
+                vec![primary]
+            } else {
+                recognized
+            },
+            match_scope,
+            match_command_regexes: regexes,
+        })
+    }
+
+    /// Creates a scoped matcher rooted at a hermetic procfs tree.
+    pub fn with_proc_root_and_matcher(
+        recognized: Vec<CodexExecutable>,
+        match_scope: MatchScope,
+        match_command_regexes: &[String],
+        proc_root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let mut inspector = Self::with_matcher(recognized, match_scope, match_command_regexes)?;
+        inspector.proc_root = proc_root.into();
+        Ok(inspector)
     }
 
     /// Returns whether the pane foreground matches any configured exact binary
@@ -82,6 +134,97 @@ impl LinuxProcessInspector {
                 path: self.proc_root.clone(),
                 source,
             })
+    }
+
+    /// Returns whether a pane matches using the configured scope and rules.
+    pub fn pane_process_matches(&self, pane: &PaneProcess) -> Result<bool> {
+        self.inspect_scoped(pane)
+            .map(|matched| matched.is_some())
+            .map_err(|source| MuxError::Filesystem {
+                path: self.proc_root.clone(),
+                source,
+            })
+    }
+
+    fn inspect_scoped(&self, pane: &PaneProcess) -> std::io::Result<Option<PathBuf>> {
+        if self.match_scope == MatchScope::Foreground {
+            return self.inspect(pane.pid);
+        }
+        let Some(initial) = self.read_process(pane.pid)? else {
+            return Ok(None);
+        };
+        let snapshot = self.process_snapshot()?;
+        let candidates = match self.match_scope {
+            MatchScope::Foreground => unreachable!(),
+            MatchScope::PaneTree => descendants(&snapshot, initial.pid),
+            MatchScope::PaneTty => {
+                let Some(tty_nr) = tty_number(&pane.tty) else {
+                    return Ok(None);
+                };
+                if initial.tty_nr != tty_nr {
+                    return Ok(None);
+                }
+                snapshot
+                    .iter()
+                    .filter(|candidate| candidate.tty_nr == tty_nr)
+                    .collect()
+            }
+        };
+        for allow_regex in [false, true] {
+            for candidate in &candidates {
+                let matched = if allow_regex {
+                    self.command_regex_matches(candidate)
+                        .then(|| self.recognized[0].as_path().to_owned())
+                } else {
+                    self.recognized_match(candidate)
+                        .map(|path| path.as_path().to_owned())
+                };
+                let Some(path) = matched else { continue };
+                if self.scoped_candidate_is_current(&initial, candidate)? {
+                    return Ok(Some(path));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn scoped_candidate_is_current(
+        &self,
+        initial: &ProcessEvidence,
+        candidate: &ProcessEvidence,
+    ) -> std::io::Result<bool> {
+        let current = self.process_snapshot()?;
+        let Some(current_pane) = current.iter().find(|process| process.pid == initial.pid) else {
+            return Ok(false);
+        };
+        let Some(current_candidate) = current.iter().find(|process| process.pid == candidate.pid)
+        else {
+            return Ok(false);
+        };
+        if !same_process_evidence(initial, current_pane)
+            || !same_process_evidence(candidate, current_candidate)
+        {
+            return Ok(false);
+        }
+        Ok(match self.match_scope {
+            MatchScope::Foreground => unreachable!(),
+            MatchScope::PaneTree => descendants(&current, initial.pid)
+                .iter()
+                .any(|process| process.pid == candidate.pid),
+            MatchScope::PaneTty => current_pane.tty_nr == initial.tty_nr,
+        })
+    }
+
+    fn command_regex_matches(&self, process: &ProcessEvidence) -> bool {
+        if self.match_command_regexes.is_empty() {
+            return false;
+        }
+        let Some(command) = normalized_argv(&process.arguments) else {
+            return false;
+        };
+        self.match_command_regexes
+            .iter()
+            .any(|regex| regex.is_match(&command))
     }
 
     /// Legacy exact-binary probe retained for API compatibility.
@@ -167,6 +310,21 @@ impl LinuxProcessInspector {
                 same_process_evidence(&pane, &current).then(|| executable.as_path().to_owned())
             );
         }
+        if pane.tty_nr != 0
+            && pane.tpgid > 0
+            && pane.pgrp == pane.tpgid
+            && (self.recognized_match(&pane).is_some() || self.command_regex_matches(&pane))
+        {
+            let Some(current) = self.read_process(pane_pid)? else {
+                return Ok(None);
+            };
+            return Ok(same_process_evidence(&pane, &current).then(|| {
+                self.recognized_match(&pane).map_or_else(
+                    || self.recognized[0].as_path().to_owned(),
+                    |executable| executable.as_path().to_owned(),
+                )
+            }));
+        }
         if pane.tty_nr == 0 || pane.tpgid <= 0 {
             return Ok(None);
         }
@@ -208,6 +366,19 @@ impl LinuxProcessInspector {
                 return Ok((same_process_evidence(candidate, &current_candidate)
                     && same_foreground_snapshot(&pane, &current_pane))
                 .then(|| executable.as_path().to_owned()));
+            }
+        }
+        for candidate in &candidates {
+            if self.command_regex_matches(candidate) {
+                let Some(current_candidate) = self.read_process(candidate.pid)? else {
+                    return Ok(None);
+                };
+                let Some(current_pane) = self.read_process(pane_pid)? else {
+                    return Ok(None);
+                };
+                return Ok((same_process_evidence(candidate, &current_candidate)
+                    && same_foreground_snapshot(&pane, &current_pane))
+                .then(|| self.recognized[0].as_path().to_owned()));
             }
         }
 
@@ -290,6 +461,12 @@ impl LinuxProcessInspector {
                     .find_map(|process| {
                         self.recognized_match_cached(process, &recognized_paths)
                             .map(|executable| (process, executable.as_path().to_owned()))
+                    })
+                    .or_else(|| {
+                        candidates.iter().find_map(|process| {
+                            self.command_regex_matches(process)
+                                .then(|| (process, self.recognized[0].as_path().to_owned()))
+                        })
                     })
                     .or_else(|| {
                         candidates
@@ -430,7 +607,7 @@ impl LinuxProcessInspector {
             }
             Err(error) => return Err(error),
         };
-        let Some((pgrp, tty_nr, tpgid, start_time)) = parse_stat(&stat) else {
+        let Some((parent_pid, pgrp, tty_nr, tpgid, start_time)) = parse_stat(&stat) else {
             return Ok(None);
         };
         let executable = fs::read_link(directory.join("exe")).ok();
@@ -443,16 +620,22 @@ impl LinuxProcessInspector {
                     .collect()
             })
             .unwrap_or_default();
-        let Some((current_pgrp, current_tty_nr, current_tpgid, current_start_time)) =
-            fs::read(directory.join("stat"))
-                .ok()
-                .as_deref()
-                .and_then(parse_stat)
+        let Some((
+            current_parent_pid,
+            current_pgrp,
+            current_tty_nr,
+            current_tpgid,
+            current_start_time,
+        )) = fs::read(directory.join("stat"))
+            .ok()
+            .as_deref()
+            .and_then(parse_stat)
         else {
             return Ok(None);
         };
-        if (pgrp, tty_nr, tpgid, start_time)
+        if (parent_pid, pgrp, tty_nr, tpgid, start_time)
             != (
+                current_parent_pid,
                 current_pgrp,
                 current_tty_nr,
                 current_tpgid,
@@ -464,6 +647,7 @@ impl LinuxProcessInspector {
 
         Ok(Some(ProcessEvidence {
             pid,
+            parent_pid,
             pgrp,
             tty_nr,
             tpgid,
@@ -494,6 +678,21 @@ impl ProcessInspector for LinuxProcessInspector {
             })
             .collect()
     }
+
+    fn pane_executable(&self, pane: &PaneProcess) -> Result<Option<PathBuf>> {
+        self.inspect_scoped(pane)
+            .map_err(|source| MuxError::Filesystem {
+                path: self.proc_root.clone(),
+                source,
+            })
+    }
+
+    fn pane_executables(&self, panes: &[PaneProcess]) -> Vec<Result<Option<PathBuf>>> {
+        panes
+            .iter()
+            .map(|pane| self.pane_executable(pane))
+            .collect()
+    }
 }
 
 fn clone_io_error(error: &std::io::Error) -> std::io::Error {
@@ -502,6 +701,7 @@ fn clone_io_error(error: &std::io::Error) -> std::io::Error {
 
 struct ProcessEvidence {
     pid: u32,
+    parent_pid: u32,
     pgrp: i64,
     tty_nr: i64,
     tpgid: i64,
@@ -521,6 +721,7 @@ fn same_foreground_snapshot(initial: &ProcessEvidence, current: &ProcessEvidence
 
 fn same_process_evidence(initial: &ProcessEvidence, current: &ProcessEvidence) -> bool {
     initial.pid == current.pid
+        && initial.parent_pid == current.parent_pid
         && initial.pgrp == current.pgrp
         && initial.tty_nr == current.tty_nr
         && initial.tpgid == current.tpgid
@@ -582,7 +783,7 @@ fn shell_executable_matches(executable: &Path, command: &str) -> bool {
             .any(|candidate| candidate.is_file() && same_file(&candidate, executable))
 }
 
-fn parse_stat(stat: &[u8]) -> Option<(i64, i64, i64, u64)> {
+fn parse_stat(stat: &[u8]) -> Option<(u32, i64, i64, i64, u64)> {
     // comm is parenthesized and may itself contain spaces or right parentheses;
     // the last `)` precedes the fixed-position numeric fields.
     let close = stat.iter().rposition(|byte| *byte == b')')?;
@@ -592,11 +793,55 @@ fn parse_stat(stat: &[u8]) -> Option<(i64, i64, i64, u64)> {
         return None;
     }
     Some((
+        fields[1].parse().ok()?,
         fields[2].parse().ok()?,
         fields[4].parse().ok()?,
         fields[5].parse().ok()?,
         fields[19].parse().ok()?,
     ))
+}
+
+fn descendants(processes: &[ProcessEvidence], root: u32) -> Vec<&ProcessEvidence> {
+    let mut matched = vec![root];
+    let mut cursor = 0;
+    while cursor < matched.len() {
+        let parent = matched[cursor];
+        for process in processes {
+            if process.parent_pid == parent && !matched.contains(&process.pid) {
+                matched.push(process.pid);
+            }
+        }
+        cursor += 1;
+    }
+    processes
+        .iter()
+        .filter(|process| matched.contains(&process.pid))
+        .collect()
+}
+
+fn normalized_argv(arguments: &[OsString]) -> Option<String> {
+    arguments
+        .iter()
+        .map(|argument| argument.to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|arguments| arguments.join(" "))
+}
+
+fn tty_number(path: &Path) -> Option<i64> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = fs::metadata(path).ok()?;
+    if !path.is_absolute() || !metadata.file_type().is_char_device() {
+        return None;
+    }
+    let rdev = metadata.rdev();
+    let major = ((rdev >> 8) & 0x0fff) | ((rdev >> 32) & !0x0fff);
+    let minor = (rdev & 0x00ff) | ((rdev >> 12) & !0x00ff);
+    Some(
+        (((major & 0x0fff) << 8)
+            | (minor & 0x00ff)
+            | ((minor & !0x00ff) << 12)
+            | ((major & !0x0fff) << 32)) as i64,
+    )
 }
 
 fn same_file(candidate: &Path, configured: &Path) -> bool {
@@ -612,10 +857,13 @@ fn is_trusted_interpreter(executable: &Path) -> bool {
         return false;
     };
     let known_name = [
-        "env", "sh", "bash", "dash", "zsh", "node", "nodejs", "bun", "deno",
+        "env", "sh", "bash", "dash", "zsh", "node", "nodejs", "bun", "deno", "python", "python3",
     ]
     .iter()
-    .any(|wrapper| name == *wrapper);
+    .any(|wrapper| name == *wrapper)
+        || name
+            .to_str()
+            .is_some_and(|name| name.starts_with("python3."));
     if !known_name {
         return false;
     }
@@ -636,31 +884,44 @@ fn interpreted_script_argument<'a>(
     arguments: &'a [OsString],
 ) -> Option<&'a OsString> {
     let name = executable.file_name()?.to_str()?;
-    let mut candidates = arguments.iter().skip(1);
+    let candidates = arguments.get(1..)?;
     if name == "env" {
-        return candidates.find(|argument| {
-            argument
-                .to_str()
-                .is_some_and(|value| !value.starts_with('-') && !value.contains('='))
-        });
+        for argument in candidates {
+            let value = argument.to_str()?;
+            if value.starts_with('-') {
+                return None;
+            }
+            if !value.contains('=') {
+                return Some(argument);
+            }
+        }
+        return None;
     }
-    candidates.find(|argument| {
-        argument
-            .to_str()
-            .is_some_and(|value| !value.starts_with('-'))
-    })
+    let mut candidates = candidates.iter();
+    let first = candidates.next()?;
+    let first_value = first.to_str()?;
+    if first_value == "--" {
+        return candidates.next();
+    }
+    if name == "deno" {
+        return (first_value == "run").then(|| candidates.next()).flatten();
+    }
+    // Interpreter flags have interpreter-specific operands and execution
+    // modes (`-c`, `--rcfile`, `-X`, and similar). Treat all of them as
+    // ambiguous rather than mistaking their data operand for a script path.
+    (!first_value.starts_with('-')).then_some(first)
 }
 
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
-    use super::{ProcessEvidence, parse_stat, same_foreground_snapshot};
+    use super::{ProcessEvidence, descendants, parse_stat, same_foreground_snapshot};
 
     #[test]
     fn parses_stat_with_spaces_and_parentheses_in_comm() {
         let stat = b"42 (odd ) process) S 1 42 42 34816 42 0 0 0 0 0 0 0 0 0 0 0 0 0 1234";
-        assert_eq!(parse_stat(stat), Some((42, 34816, 42, 1234)));
+        assert_eq!(parse_stat(stat), Some((1, 42, 34816, 42, 1234)));
     }
 
     #[test]
@@ -672,6 +933,7 @@ mod tests {
     fn foreground_snapshot_rejects_pid_reuse() {
         let evidence = |start_time| ProcessEvidence {
             pid: 42,
+            parent_pid: 1,
             pgrp: 42,
             tty_nr: 34816,
             tpgid: 42,
@@ -682,5 +944,28 @@ mod tests {
 
         assert!(same_foreground_snapshot(&evidence(100), &evidence(100)));
         assert!(!same_foreground_snapshot(&evidence(100), &evidence(101)));
+    }
+
+    #[test]
+    fn rebuilt_descendant_snapshot_rejects_a_reparented_chain() {
+        let evidence = |pid: u32, parent_pid: u32| ProcessEvidence {
+            pid,
+            parent_pid,
+            pgrp: pid.into(),
+            tty_nr: 34816,
+            tpgid: pid.into(),
+            start_time: u64::from(pid),
+            executable: Some(PathBuf::from("/opt/process")),
+            arguments: vec![OsString::from("/opt/process")],
+        };
+        let original = vec![evidence(10, 1), evidence(20, 10), evidence(30, 20)];
+        let reparented = vec![evidence(10, 1), evidence(20, 1), evidence(30, 20)];
+
+        assert!(descendants(&original, 10).iter().any(|item| item.pid == 30));
+        assert!(
+            !descendants(&reparented, 10)
+                .iter()
+                .any(|item| item.pid == 30)
+        );
     }
 }

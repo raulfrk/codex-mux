@@ -135,6 +135,15 @@ pub struct InvocationContext {
     pub current_path: PathBuf,
 }
 
+/// Tmux evidence used to select candidate processes for a pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneProcess {
+    /// Tmux pane leader PID.
+    pub pid: u32,
+    /// Tmux pane TTY path, when tmux supplied one.
+    pub tty: PathBuf,
+}
+
 /// Terminal dimensions used to select a responsive layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalSize {
@@ -234,6 +243,11 @@ pub trait ProcessInspector {
     /// Resolves the foreground executable associated with a tmux pane process.
     fn foreground_executable(&self, pane_pid: u32) -> Result<Option<PathBuf>>;
 
+    /// Resolves a pane using its PID and exact tmux TTY evidence.
+    fn pane_executable(&self, pane: &PaneProcess) -> Result<Option<PathBuf>> {
+        self.foreground_executable(pane.pid)
+    }
+
     /// Resolves a pane set through one batch boundary.
     ///
     /// Implementations may override this to share one coherent process snapshot.
@@ -244,6 +258,12 @@ pub trait ProcessInspector {
             .iter()
             .map(|pane_pid| self.foreground_executable(*pane_pid))
             .collect()
+    }
+
+    /// Resolves panes through one batch boundary.
+    fn pane_executables(&self, panes: &[PaneProcess]) -> Vec<Result<Option<PathBuf>>> {
+        let pids = panes.iter().map(|pane| pane.pid).collect::<Vec<_>>();
+        self.foreground_executables(&pids)
     }
 }
 

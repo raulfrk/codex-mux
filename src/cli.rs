@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::config::MatchScope;
+
 /// Parsed `codex-mux` command line.
 #[derive(Clone, Debug, Eq, Parser, PartialEq)]
 #[command(
@@ -28,6 +30,18 @@ pub struct Cli {
     /// Exact tmux pane_current_command value accepted by Smart Left.
     #[arg(long, global = true, value_name = "COMMAND", conflicts_with = "codex")]
     pub pane_command: Vec<String>,
+
+    /// Process candidates accepted during discovery.
+    #[arg(long, global = true, value_name = "SCOPE", conflicts_with = "codex")]
+    pub match_scope: Option<MatchScope>,
+
+    /// Regex applied to a normalized readable process argv during discovery.
+    #[arg(long, global = true, value_name = "REGEX", conflicts_with = "codex")]
+    pub match_command_regex: Vec<String>,
+
+    /// Regex applied to tmux pane_current_command before Smart Left probes.
+    #[arg(long, global = true, value_name = "REGEX", conflicts_with = "codex")]
+    pub pane_command_regex: Vec<String>,
 
     /// Exact tmux client that opened the popup.
     #[arg(long, value_name = "CLIENT")]
@@ -204,6 +218,28 @@ mod tests {
             panic!("expected install command");
         };
         assert!(install.smart_left);
+    }
+
+    #[test]
+    fn parses_scoped_regex_process_overrides() {
+        let cli = Cli::try_parse_from([
+            "codex-mux",
+            "--launch-executable",
+            "/opt/launcher",
+            "--match-executable",
+            "/opt/launcher",
+            "--match-scope",
+            "pane-tree",
+            "--match-command-regex",
+            "launcher-[0-9]+",
+            "--pane-command-regex",
+            "^supervisor$",
+            "setup",
+        ])
+        .unwrap();
+        assert_eq!(cli.match_scope.unwrap().to_string(), "pane-tree");
+        assert_eq!(cli.match_command_regex, ["launcher-[0-9]+"]);
+        assert_eq!(cli.pane_command_regex, ["^supervisor$"]);
     }
 
     #[test]

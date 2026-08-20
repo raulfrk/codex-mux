@@ -24,6 +24,9 @@ const CODEX_FIELD: &str = "# codex-executable: ";
 const LAUNCH_FIELD: &str = "# codex-launch-executable: ";
 const MATCH_FIELD: &str = "# codex-match-executable: ";
 const PANE_COMMAND_FIELD: &str = "# codex-pane-command: ";
+const MATCH_SCOPE_FIELD: &str = "# codex-match-scope: ";
+const MATCH_COMMAND_REGEX_FIELD: &str = "# codex-match-command-regex: ";
+const PANE_COMMAND_REGEX_FIELD: &str = "# codex-pane-command-regex: ";
 const SMART_LEFT_FIELD: &str = "# codex-mux-smart-left: ";
 const LEADING_NEWLINE_FIELD: &str = "# codex-mux-owned-leading-newline: ";
 
@@ -190,8 +193,29 @@ pub struct ExecutablePaths {
     pub match_executables: Vec<PathBuf>,
     /// Exact tmux pane commands accepted by Smart Left.
     pub pane_commands: Vec<String>,
+    /// Candidate scope serialized into generated bindings.
+    pub match_scope: String,
+    /// Regexes matched against normalized process command lines.
+    pub match_command_regexes: Vec<String>,
+    /// Regexes matched against pane_current_command.
+    pub pane_command_regexes: Vec<String>,
     /// Whether generated invocations retain the legacy `--codex` shorthand.
     pub legacy_shorthand: bool,
+}
+
+/// Process detection metadata embedded in the managed tmux block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessMetadata {
+    /// Exact executable or script identities accepted during discovery.
+    pub match_executables: Vec<PathBuf>,
+    /// Exact Smart Left pane-command prefilters.
+    pub pane_commands: Vec<String>,
+    /// Candidate-process selection scope.
+    pub match_scope: String,
+    /// Regex fallbacks for normalized process argv.
+    pub match_command_regexes: Vec<String>,
+    /// Regex Smart Left pane-command prefilters.
+    pub pane_command_regexes: Vec<String>,
 }
 
 impl ExecutablePaths {
@@ -202,18 +226,37 @@ impl ExecutablePaths {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_owned();
-        Self::with_process(mux, codex.clone(), vec![codex], vec![pane_command], true)
+        Self::with_process(
+            mux,
+            codex.clone(),
+            ProcessMetadata {
+                match_executables: vec![codex],
+                pane_commands: vec![pane_command],
+                match_scope: "foreground".to_owned(),
+                match_command_regexes: Vec::new(),
+                pane_command_regexes: Vec::new(),
+            },
+            true,
+        )
     }
 
     /// Validates complete launch and process-detection metadata.
     pub fn with_process(
         mux: PathBuf,
         codex: PathBuf,
-        match_executables: Vec<PathBuf>,
-        pane_commands: Vec<String>,
+        metadata: ProcessMetadata,
         legacy_shorthand: bool,
     ) -> InstallResult<Self> {
-        if match_executables.is_empty() || pane_commands.is_empty() {
+        let ProcessMetadata {
+            match_executables,
+            pane_commands,
+            match_scope,
+            match_command_regexes,
+            pane_command_regexes,
+        } = metadata;
+        if match_executables.is_empty()
+            || (pane_commands.is_empty() && pane_command_regexes.is_empty())
+        {
             return Err(InstallError::InvalidValue {
                 field: "process configuration",
                 reason: "match executables and pane commands must be non-empty".to_owned(),
@@ -266,11 +309,22 @@ impl ExecutablePaths {
                 });
             }
         }
+        for expression in match_command_regexes.iter().chain(&pane_command_regexes) {
+            if expression.is_empty() || expression.chars().any(char::is_control) {
+                return Err(InstallError::InvalidValue {
+                    field: "process regex",
+                    reason: "must be non-empty and contain no control characters".to_owned(),
+                });
+            }
+        }
         Ok(Self {
             mux,
             codex,
             match_executables,
             pane_commands,
+            match_scope,
+            match_command_regexes,
+            pane_command_regexes,
             legacy_shorthand,
         })
     }
@@ -482,6 +536,12 @@ pub struct InstallStatus {
     pub match_executables: Vec<PathBuf>,
     /// Installed exact Smart Left prefilter commands.
     pub pane_commands: Vec<String>,
+    /// Installed candidate matching scope.
+    pub match_scope: Option<String>,
+    /// Installed process command regexes.
+    pub match_command_regexes: Vec<String>,
+    /// Installed Smart Left pane-command regexes.
+    pub pane_command_regexes: Vec<String>,
     /// Whether the owned root-table Smart Left binding is enabled.
     pub smart_left: bool,
     /// Human-readable path mismatches.
@@ -501,6 +561,9 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
             codex: None,
             match_executables: Vec::new(),
             pane_commands: Vec::new(),
+            match_scope: None,
+            match_command_regexes: Vec::new(),
+            pane_command_regexes: Vec::new(),
             smart_left: false,
             drift: Vec::new(),
         });
@@ -521,6 +584,9 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
         match_executables.extend(legacy_codex.clone());
     }
     let mut pane_commands = fields(block, PANE_COMMAND_FIELD);
+    let match_scope = field(block, MATCH_SCOPE_FIELD).map(ToOwned::to_owned);
+    let match_command_regexes = fields(block, MATCH_COMMAND_REGEX_FIELD);
+    let pane_command_regexes = fields(block, PANE_COMMAND_REGEX_FIELD);
     if pane_commands.is_empty() {
         pane_commands.extend(
             legacy_codex
@@ -563,6 +629,19 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
             expected.pane_commands.join(",")
         ));
     }
+    if match_scope.as_deref() != Some(expected.match_scope.as_str()) {
+        drift.push(format!(
+            "Codex match scope: installed={} resolved={}",
+            match_scope.as_deref().unwrap_or("<missing>"),
+            expected.match_scope
+        ));
+    }
+    if match_command_regexes != expected.match_command_regexes {
+        drift.push("Codex match command regexes differ".to_owned());
+    }
+    if pane_command_regexes != expected.pane_command_regexes {
+        drift.push("Codex pane command regexes differ".to_owned());
+    }
     Ok(InstallStatus {
         path: path.to_owned(),
         installed: true,
@@ -571,6 +650,9 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
         codex,
         match_executables,
         pane_commands,
+        match_scope,
+        match_command_regexes,
+        pane_command_regexes,
         smart_left,
         drift,
     })
@@ -749,11 +831,22 @@ fn render_block(
         .iter()
         .map(|command| format!("{PANE_COMMAND_FIELD}{command}\n"))
         .collect::<String>();
+    let match_regexes = executables
+        .match_command_regexes
+        .iter()
+        .map(|expression| format!("{MATCH_COMMAND_REGEX_FIELD}{expression}\n"))
+        .collect::<String>();
+    let pane_regexes = executables
+        .pane_command_regexes
+        .iter()
+        .map(|expression| format!("{PANE_COMMAND_REGEX_FIELD}{expression}\n"))
+        .collect::<String>();
     format!(
-        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{LAUNCH_FIELD}{}\n{matches}{pane_commands}{SMART_LEFT_FIELD}{smart_left}\nbind-key {key} run-shell -C {popup}\n{smart_binding}{END_MARKER}\n",
+        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{LAUNCH_FIELD}{}\n{MATCH_SCOPE_FIELD}{}\n{matches}{pane_commands}{match_regexes}{pane_regexes}{SMART_LEFT_FIELD}{smart_left}\nbind-key {key} run-shell -C {popup}\n{smart_binding}{END_MARKER}\n",
         executables.mux.display(),
         executables.codex.display(),
         executables.codex.display(),
+        executables.match_scope,
     )
 }
 
@@ -790,8 +883,15 @@ fn render_smart_left_binding(executables: &ExecutablePaths) -> String {
         .pane_commands
         .iter()
         .map(|command| format!("#{{==:#{{pane_current_command}},{command}}}"))
-        .reduce(|left, right| format!("#{{||:{left},{right}}}"))
-        .expect("validated non-empty pane commands");
+        .reduce(|left, right| format!("#{{||:{left},{right}}}"));
+    // Regex prefiltering is performed by the Rust probe after this safe tmux
+    // fast-path. Do not interpolate user regex syntax into tmux format strings.
+    let command_matches = match (command_matches, executables.pane_command_regexes.is_empty()) {
+        (Some(exact), true) => exact,
+        (Some(exact), false) => format!("#{{||:{exact},1}}"),
+        (None, false) => "1".to_owned(),
+        (None, true) => "0".to_owned(),
+    };
     let eligible = format!("#{{||:{command_matches},{shell_is_at_prompt}}}");
     let condition = format!("#{{&&:{eligible},#{{!=:#{{@codex_mux_smart_left_active}},1}}}}");
     format!(
@@ -815,6 +915,16 @@ fn process_arguments(executables: &ExecutablePaths) -> Vec<String> {
     for command in &executables.pane_commands {
         arguments.push("--pane-command".to_owned());
         arguments.push(command.clone());
+    }
+    arguments.push("--match-scope".to_owned());
+    arguments.push(executables.match_scope.clone());
+    for expression in &executables.match_command_regexes {
+        arguments.push("--match-command-regex".to_owned());
+        arguments.push(shell_literal(expression));
+    }
+    for expression in &executables.pane_command_regexes {
+        arguments.push("--pane-command-regex".to_owned());
+        arguments.push(shell_literal(expression));
     }
     arguments
 }
@@ -1205,7 +1315,42 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::atomic_replace_with;
+    use super::{ExecutablePaths, ProcessMetadata, atomic_replace_with, process_arguments};
+
+    #[test]
+    fn regex_arguments_are_shell_literal_and_controls_are_refused() {
+        let paths = ExecutablePaths::with_process(
+            PathBuf::from("/opt/codex-mux"),
+            PathBuf::from("/opt/launcher"),
+            ProcessMetadata {
+                match_executables: vec![PathBuf::from("/opt/launcher")],
+                pane_commands: vec!["supervisor".to_owned()],
+                match_scope: "pane-tree".to_owned(),
+                match_command_regexes: vec!["x; touch /tmp/nope ' $(id) # space".to_owned()],
+                pane_command_regexes: vec!["^super visor$".to_owned()],
+            },
+            false,
+        )
+        .unwrap();
+        let arguments = process_arguments(&paths).join(" ");
+        assert!(arguments.contains("'x; touch /tmp/nope '\\'' $(id) # space'"));
+        assert!(arguments.contains("'^super visor$'"));
+        assert!(
+            ExecutablePaths::with_process(
+                PathBuf::from("/opt/codex-mux"),
+                PathBuf::from("/opt/launcher"),
+                ProcessMetadata {
+                    match_executables: vec![PathBuf::from("/opt/launcher")],
+                    pane_commands: vec!["supervisor".to_owned()],
+                    match_scope: "foreground".to_owned(),
+                    match_command_regexes: vec!["bad\nvalue".to_owned()],
+                    pane_command_regexes: Vec::new()
+                },
+                false,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn failed_rename_keeps_original_and_removes_temporary_file() {

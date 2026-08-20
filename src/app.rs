@@ -21,17 +21,17 @@ use crate::{
     MuxError, Result,
     cli::{Cli, Command, ConfigPathArgs, InstallArgs, RemoveArgs, SetupArgs, TmuxCommand},
     config::{
-        PermissionPreset, ProcessSettings, ThemePreference, XdgThemeStore, no_color_requested,
-        validate_process_settings,
+        MatchScope, PermissionPreset, ProcessSettings, ThemePreference, XdgThemeStore,
+        no_color_requested, validate_process_settings,
     },
     domain::{
         ClientId, CodexExecutable, InvocationContext, PaneId, SessionId, ThemeStore,
         TmuxCommandRunner,
     },
     install::{
-        DiscoveryContext, ExecutablePaths, InstallError, ServerEvidence, TmuxReloader,
-        atomic_replace, discover_config, install_with_options, read, smart_left_owner, status,
-        uninstall, validate_regular_writable,
+        DiscoveryContext, ExecutablePaths, InstallError, ProcessMetadata, ServerEvidence,
+        TmuxReloader, atomic_replace, discover_config, install_with_options, read,
+        smart_left_owner, status, uninstall, validate_regular_writable,
     },
     linux_process::LinuxProcessInspector,
     shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
@@ -41,7 +41,7 @@ use crate::{
         inventory::PaneInventory,
         owned_names::OwnedTmuxNames,
         runner::SystemTmuxRunner,
-        smart_left::{SmartLeftProbe, SystemSleeper},
+        smart_left::{SmartLeftMatcher, SmartLeftProbe, SystemSleeper},
     },
     ui::{self, Action, App, ColorPolicy},
     update::{UpdateOutcome, update},
@@ -56,6 +56,9 @@ struct ProcessArguments {
     launch_executable: Option<PathBuf>,
     match_executables: Vec<PathBuf>,
     pane_commands: Vec<String>,
+    match_scope: Option<MatchScope>,
+    match_command_regexes: Vec<String>,
+    pane_command_regexes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +66,9 @@ struct ResolvedProcessConfig {
     launch: CodexExecutable,
     matches: Vec<CodexExecutable>,
     pane_commands: Vec<String>,
+    match_scope: MatchScope,
+    match_command_regexes: Vec<String>,
+    pane_command_regexes: Vec<String>,
     legacy_shorthand: bool,
 }
 
@@ -149,6 +155,9 @@ pub fn run(cli: Cli) -> Result<()> {
         launch_executable: cli.launch_executable.clone(),
         match_executables: cli.match_executable.clone(),
         pane_commands: cli.pane_command.clone(),
+        match_scope: cli.match_scope,
+        match_command_regexes: cli.match_command_regex.clone(),
+        pane_command_regexes: cli.pane_command_regex.clone(),
     };
     match cli.command.clone() {
         Some(Command::Update(arguments)) => {
@@ -182,7 +191,10 @@ fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Resul
     validate_distinct_config_targets(&tmux_path, &shell_paths)?;
     let persist_process = process_arguments.launch_executable.is_some()
         || !process_arguments.match_executables.is_empty()
-        || !process_arguments.pane_commands.is_empty();
+        || !process_arguments.pane_commands.is_empty()
+        || process_arguments.match_scope.is_some()
+        || !process_arguments.match_command_regexes.is_empty()
+        || !process_arguments.pane_command_regexes.is_empty();
     let preference_required = process_preference_required(&process_arguments);
     let store = (persist_process || preference_required)
         .then(XdgThemeStore::discover)
@@ -207,6 +219,9 @@ fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Resul
                 .map(|executable| executable.as_path().to_owned())
                 .collect(),
             pane_commands: process.pane_commands.clone(),
+            match_scope: process.match_scope,
+            match_command_regexes: process.match_command_regexes.clone(),
+            pane_command_regexes: process.pane_command_regexes.clone(),
         })?;
         Some(snapshot)
     } else {
@@ -536,15 +551,28 @@ fn run_smart_left(cli: &Cli, process_arguments: &ProcessArguments) -> Result<()>
             source,
         })?;
     let runner = SystemTmuxRunner::default();
-    let inspector = LinuxProcessInspector::matching_executables(process.matches.clone());
-    SmartLeftProbe::with_pane_commands(
+    let inspector = LinuxProcessInspector::with_matcher(
+        process.matches.clone(),
+        process.match_scope,
+        &process.match_command_regexes,
+    )?;
+    SmartLeftProbe::with_process_matcher(
         &runner,
         &inspector,
         &SystemSleeper,
         &mux,
         &process.launch,
-        &process.pane_commands,
-        &process.matches,
+        SmartLeftMatcher {
+            pane_commands: &process.pane_commands,
+            match_executables: &process.matches,
+            pane_command_regexes: &process.pane_command_regexes,
+            match_scope: match process.match_scope {
+                MatchScope::Foreground => "foreground",
+                MatchScope::PaneTree => "pane-tree",
+                MatchScope::PaneTty => "pane-tty",
+            },
+            match_command_regexes: &process.match_command_regexes,
+        },
     )
     .run(&context)?;
     Ok(())
@@ -567,7 +595,11 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
             codex_executables.push(executable);
         }
     }
-    let inspector = LinuxProcessInspector::matching_executables(codex_executables.clone());
+    let inspector = LinuxProcessInspector::with_matcher(
+        codex_executables.clone(),
+        process.match_scope,
+        &process.match_command_regexes,
+    )?;
     let inventory =
         PaneInventory::with_executables(SystemTmuxRunner::default(), inspector, codex_executables);
     let refresh_worker = PaneRefreshWorker::spawn(move || inventory.discover());
@@ -745,7 +777,12 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
 
 fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
     let codex_path = process.launch.as_path().to_owned();
-    let inspector = LinuxProcessInspector::matching_executables(process.matches.clone());
+    let inspector = LinuxProcessInspector::with_matcher(
+        process.matches.clone(),
+        process.match_scope,
+        &process.match_command_regexes,
+    )
+    .expect("resolved process matcher is valid");
     let inventory = PaneInventory::with_executables(
         SystemTmuxRunner::default(),
         inspector,
@@ -1020,6 +1057,16 @@ fn show_status(arguments: ConfigPathArgs, process_arguments: &ProcessArguments) 
         println!("pane-command: {command}");
     }
     println!(
+        "match-scope: {}",
+        report.match_scope.as_deref().unwrap_or("<missing>")
+    );
+    for expression in &report.match_command_regexes {
+        println!("match-command-regex: {expression}");
+    }
+    for expression in &report.pane_command_regexes {
+        println!("pane-command-regex: {expression}");
+    }
+    println!(
         "smart-left: {}",
         if report.smart_left {
             "enabled"
@@ -1058,12 +1105,22 @@ fn executable_paths(process: &ResolvedProcessConfig) -> Result<ExecutablePaths> 
     ExecutablePaths::with_process(
         mux,
         process.launch.as_path().to_owned(),
-        process
-            .matches
-            .iter()
-            .map(|path| path.as_path().to_owned())
-            .collect(),
-        process.pane_commands.clone(),
+        ProcessMetadata {
+            match_executables: process
+                .matches
+                .iter()
+                .map(|path| path.as_path().to_owned())
+                .collect(),
+            pane_commands: process.pane_commands.clone(),
+            match_scope: match process.match_scope {
+                MatchScope::Foreground => "foreground",
+                MatchScope::PaneTree => "pane-tree",
+                MatchScope::PaneTty => "pane-tty",
+            }
+            .to_owned(),
+            match_command_regexes: process.match_command_regexes.clone(),
+            pane_command_regexes: process.pane_command_regexes.clone(),
+        },
         process.legacy_shorthand,
     )
     .map_err(install_error)
@@ -1119,10 +1176,40 @@ fn resolve_process(
     } else {
         vec![legacy_pane_command(&launch)?]
     };
+    let match_scope = if arguments.codex.is_some() {
+        MatchScope::Foreground
+    } else if let Some(scope) = arguments.match_scope {
+        scope
+    } else if let Some(settings) = &stored {
+        settings.match_scope
+    } else {
+        MatchScope::Foreground
+    };
+    let match_command_regexes = if arguments.codex.is_some() {
+        Vec::new()
+    } else if !arguments.match_command_regexes.is_empty() {
+        arguments.match_command_regexes.clone()
+    } else if let Some(settings) = &stored {
+        settings.match_command_regexes.clone()
+    } else {
+        Vec::new()
+    };
+    let pane_command_regexes = if arguments.codex.is_some() {
+        Vec::new()
+    } else if !arguments.pane_command_regexes.is_empty() {
+        arguments.pane_command_regexes.clone()
+    } else if let Some(settings) = &stored {
+        settings.pane_command_regexes.clone()
+    } else {
+        Vec::new()
+    };
     let settings = ProcessSettings {
         launch_executable: launch.clone(),
         match_executables: match_executables.clone(),
         pane_commands: pane_commands.clone(),
+        match_scope,
+        match_command_regexes: match_command_regexes.clone(),
+        pane_command_regexes: pane_command_regexes.clone(),
     };
     validate_process_settings(&settings)?;
     let mut matches = match_executables
@@ -1139,6 +1226,9 @@ fn resolve_process(
                 launch_executable: path.clone(),
                 match_executables: vec![path.clone()],
                 pane_commands: vec![legacy_pane_command(&path)?],
+                match_scope: MatchScope::Foreground,
+                match_command_regexes: Vec::new(),
+                pane_command_regexes: Vec::new(),
             };
             validate_process_settings(&settings)?;
             let executable = CodexExecutable::new(path)?;
@@ -1151,6 +1241,9 @@ fn resolve_process(
         launch: CodexExecutable::new(launch)?,
         matches,
         pane_commands,
+        match_scope,
+        match_command_regexes,
+        pane_command_regexes,
         legacy_shorthand,
     })
 }
@@ -1167,7 +1260,7 @@ fn process_preference_required(arguments: &ProcessArguments) -> bool {
     arguments.codex.is_none()
         && !(arguments.launch_executable.is_some()
             && !arguments.match_executables.is_empty()
-            && !arguments.pane_commands.is_empty())
+            && (!arguments.pane_commands.is_empty() || !arguments.pane_command_regexes.is_empty()))
 }
 
 fn legacy_pane_command(path: &Path) -> Result<String> {
@@ -1199,6 +1292,25 @@ fn process_cli_words(process: &ResolvedProcessConfig) -> Result<Vec<String>> {
     for command in &process.pane_commands {
         words.push("--pane-command".to_owned());
         words.push(format!("'{}'", command.replace('\'', "'\\''")));
+    }
+    if !process.legacy_shorthand {
+        words.push("--match-scope".to_owned());
+        words.push(
+            match process.match_scope {
+                MatchScope::Foreground => "foreground",
+                MatchScope::PaneTree => "pane-tree",
+                MatchScope::PaneTty => "pane-tty",
+            }
+            .to_owned(),
+        );
+        for expression in &process.match_command_regexes {
+            words.push("--match-command-regex".to_owned());
+            words.push(format!("'{}'", expression.replace('\'', "'\\''")));
+        }
+        for expression in &process.pane_command_regexes {
+            words.push("--pane-command-regex".to_owned());
+            words.push(format!("'{}'", expression.replace('\'', "'\\''")));
+        }
     }
     Ok(words)
 }
@@ -1487,6 +1599,9 @@ mod tests {
             launch_executable: None,
             match_executable: Vec::new(),
             pane_command: Vec::new(),
+            match_scope: None,
+            match_command_regex: Vec::new(),
+            pane_command_regex: Vec::new(),
             client: Some("/dev/pts/3".to_owned()),
             invoking_pane: Some("%4".to_owned()),
             invoking_session: Some("$2".to_owned()),

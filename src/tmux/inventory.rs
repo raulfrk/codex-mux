@@ -11,7 +11,9 @@ use std::os::unix::ffi::OsStringExt;
 
 use crate::{
     MuxError, Result,
-    domain::{CodexExecutable, Pane, PaneId, ProcessInspector, SessionId, TmuxCommandRunner},
+    domain::{
+        CodexExecutable, Pane, PaneId, PaneProcess, ProcessInspector, SessionId, TmuxCommandRunner,
+    },
 };
 
 const FIELD_SEPARATOR: u8 = 0x1f;
@@ -86,11 +88,14 @@ where
             records.push(record);
         }
 
-        let pane_pids = records
+        let process_panes = records
             .iter()
-            .map(|record| record.pane_pid)
+            .map(|record| PaneProcess {
+                pid: record.pane_pid,
+                tty: record.tty.clone(),
+            })
             .collect::<Vec<_>>();
-        let executables = self.processes.foreground_executables(&pane_pids);
+        let executables = self.processes.pane_executables(&process_panes);
         if executables.len() != records.len() {
             return Err(MuxError::Command(format!(
                 "process inspector returned {} results for {} panes",
@@ -184,8 +189,7 @@ struct TmuxPaneRecord {
     current_path: PathBuf,
     command: OsString,
     pane_pid: u32,
-    #[allow(dead_code)]
-    tty: OsString,
+    tty: PathBuf,
     generated_name: String,
     generated_thread: String,
     generated_at: String,
@@ -228,7 +232,7 @@ impl TmuxPaneRecord {
             current_path,
             command,
             pane_pid,
-            tty: os_string_from_bytes(fields[8]),
+            tty: PathBuf::from(String::from_utf8_lossy(fields[8]).into_owned()),
             generated_thread: String::from_utf8_lossy(fields[9]).into_owned(),
             generated_name: String::from_utf8_lossy(fields[10]).into_owned(),
             generated_at: fields.get(11).map_or_else(String::new, |field| {

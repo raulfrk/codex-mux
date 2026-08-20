@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -13,7 +13,8 @@ use std::{
 
 use codex_mux::{
     MuxError, Result,
-    domain::{CodexExecutable, CommandOutput, ProcessInspector, TmuxCommandRunner},
+    config::MatchScope,
+    domain::{CodexExecutable, CommandOutput, PaneProcess, ProcessInspector, TmuxCommandRunner},
     linux_process::LinuxProcessInspector,
     tmux::{inventory::PaneInventory, runner::SystemTmuxRunner, smart_left::DirectCodexInspector},
 };
@@ -698,6 +699,133 @@ fn detached_wrapper_is_not_treated_as_a_foreground_codex_process() {
 }
 
 #[test]
+fn pane_tree_finds_background_launcher_but_rejects_unrelated_supervisor() {
+    let root = TemporaryDirectory::new("proc-pane-tree");
+    let launcher = root.path().join("bin/launcher");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    fs::write(&launcher, b"fixture").unwrap();
+    // Pane shell; foreground supervisor is intentionally unrelated and the
+    // configured launcher stays in a background process group.
+    write_process(root.path(), 10, 10, 34816, 30, "/bin/sh", &["/bin/sh"]);
+    write_process_with_parent(
+        root.path(),
+        20,
+        10,
+        34816,
+        10,
+        10,
+        launcher.to_str().unwrap(),
+        &[launcher.to_str().unwrap()],
+    );
+    write_process_with_parent(
+        root.path(),
+        30,
+        30,
+        34816,
+        10,
+        10,
+        "/usr/bin/cat",
+        &["supervisor"],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root_and_matcher(
+        vec![CodexExecutable::new(&launcher).unwrap()],
+        MatchScope::PaneTree,
+        &[],
+        root.path(),
+    )
+    .unwrap();
+    assert!(
+        inspector
+            .pane_process_matches(&PaneProcess {
+                pid: 10,
+                tty: PathBuf::new()
+            })
+            .unwrap()
+    );
+}
+
+#[test]
+fn pane_tty_finds_non_descendant_launcher_and_command_regex_matches_normalized_argv() {
+    let root = TemporaryDirectory::new("proc-pane-tty");
+    let configured = root.path().join("bin/configured-launcher");
+    fs::create_dir_all(configured.parent().unwrap()).unwrap();
+    fs::write(&configured, b"fixture").unwrap();
+    let rdev = fs::metadata("/dev/null").unwrap().rdev();
+    let major = ((rdev >> 8) & 0x0fff) | ((rdev >> 32) & !0x0fff);
+    let minor = (rdev & 0x00ff) | ((rdev >> 12) & !0x00ff);
+    let tty_nr = (((major & 0x0fff) << 8)
+        | (minor & 0x00ff)
+        | ((minor & !0x00ff) << 12)
+        | ((major & !0x0fff) << 32)) as i64;
+    write_process(root.path(), 10, 10, tty_nr, 10, "/bin/sh", &["/bin/sh"]);
+    write_process_with_parent(
+        root.path(),
+        20,
+        20,
+        tty_nr,
+        20,
+        999,
+        "/usr/bin/cat",
+        &["/dynamic/launcher-v17", "--attached"],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root_and_matcher(
+        vec![CodexExecutable::new(&configured).unwrap()],
+        MatchScope::PaneTty,
+        &[r"^/dynamic/launcher-v[0-9]+ --attached$".to_owned()],
+        root.path(),
+    )
+    .unwrap();
+
+    assert!(
+        inspector
+            .pane_process_matches(&PaneProcess {
+                pid: 10,
+                tty: PathBuf::from("/dev/null"),
+            })
+            .unwrap()
+    );
+}
+
+#[test]
+fn interpreter_option_operands_are_never_treated_as_launcher_scripts() {
+    let root = TemporaryDirectory::new("proc-interpreter-options");
+    let configured = root.path().join("launcher");
+    fs::write(&configured, b"fixture").unwrap();
+    for (pid, executable, arguments) in [
+        (
+            10,
+            "/bin/bash",
+            vec!["bash", "--rcfile", configured.to_str().unwrap(), "-i"],
+        ),
+        (
+            20,
+            "/usr/bin/python3",
+            vec!["python3", "-c", configured.to_str().unwrap()],
+        ),
+        (
+            30,
+            "/usr/bin/python3",
+            vec!["python3", "-X", "dev", configured.to_str().unwrap()],
+        ),
+    ] {
+        write_process(
+            root.path(),
+            pid,
+            pid as i64,
+            34816,
+            pid as i64,
+            executable,
+            &arguments,
+        );
+        let inspector = LinuxProcessInspector::with_proc_root(
+            CodexExecutable::new(&configured).unwrap(),
+            root.path(),
+        );
+        assert!(!inspector.foreground_process_matches(pid).unwrap());
+    }
+}
+
+#[test]
 fn forged_argv_zero_does_not_override_unrelated_executable_identity() {
     let root = TemporaryDirectory::new("proc-forged-argv-zero");
     let configured = root.path().join("bin/codex-custom");
@@ -881,7 +1009,14 @@ fn real_tmux_recognizes_foreground_script_and_spawned_underlying_binary() {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            DirectCodexInspector::is_direct_codex(&inspector, pane_pid).unwrap(),
+            DirectCodexInspector::is_direct_codex(
+                &inspector,
+                &PaneProcess {
+                    pid: pane_pid,
+                    tty: PathBuf::new()
+                },
+            )
+            .unwrap(),
             "Smart Left process boundary rejected a wrapper accepted by inventory"
         );
         let inventory = PaneInventory::with_executables(
@@ -895,6 +1030,106 @@ fn real_tmux_recognizes_foreground_script_and_spawned_underlying_binary() {
         assert_eq!(inventory.discover().unwrap().len(), 1);
         drop(server);
     }
+}
+
+#[test]
+fn real_tmux_pane_tree_recognizes_background_launcher_behind_supervisor() {
+    if Command::new("tmux").arg("-V").output().is_err() || !Path::new("/usr/bin/python3").is_file()
+    {
+        eprintln!("tmux or python3 unavailable; skipping real pane-tree integration test");
+        return;
+    }
+    let root = TemporaryDirectory::new("real-pane-tree-wrapper");
+    let launcher = root.path().join("codex-launcher.sh");
+    fs::write(&launcher, b"#!/bin/sh\nsleep 30\n").unwrap();
+    let supervisor = root.path().join("supervisor.py");
+    fs::write(
+        &supervisor,
+        format!(
+            "#!/usr/bin/python3\nimport os\npid=os.fork()\nif pid==0:\n os.setpgid(0,0)\n os.execl('{}','{}')\nos.waitpid(pid,0)\n",
+            launcher.display(),
+            launcher.display()
+        ),
+    ).unwrap();
+    let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&launcher, permissions).unwrap();
+    let mut permissions = fs::metadata(&supervisor).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&supervisor, permissions).unwrap();
+    let socket = format!(
+        "codex-mux-pane-tree-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let server = TmuxServer::start_command(&socket, &format!("exec '{}'", supervisor.display()));
+    let output = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_pid}\x1f#{pane_tty}\x1f#{pane_current_command}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let row = String::from_utf8(output.stdout).unwrap();
+    let fields = row.trim().split('\x1f').collect::<Vec<_>>();
+    let pane = PaneProcess {
+        pid: fields[0].parse().unwrap(),
+        tty: PathBuf::from(fields[1]),
+    };
+    let executable = CodexExecutable::new(&launcher).unwrap();
+    let inspector =
+        LinuxProcessInspector::with_matcher(vec![executable.clone()], MatchScope::PaneTree, &[])
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !inspector.pane_process_matches(&pane).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "background launcher never matched"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let stat = fs::read_to_string(format!("/proc/{}/stat", pane.pid)).unwrap();
+    let fields = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    let foreground_pid = fields[5].parse::<u32>().unwrap();
+    assert!(
+        fs::read_link(format!("/proc/{foreground_pid}/exe"))
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("python3")
+    );
+    assert!(
+        DirectCodexInspector::is_direct_codex(&inspector, &pane).unwrap(),
+        "Smart Left process boundary rejected the background launcher"
+    );
+    let inventory = PaneInventory::with_executables(
+        PrefixedRunner {
+            inner: SystemTmuxRunner::default(),
+            socket: socket.clone(),
+        },
+        inspector,
+        vec![executable],
+    );
+    assert_eq!(inventory.discover().unwrap().len(), 1);
+    drop(server);
 }
 
 struct PrefixedRunner {
@@ -985,12 +1220,28 @@ fn write_process(
     executable: &str,
     arguments: &[&str],
 ) {
+    write_process_with_parent(
+        proc_root, pid, pgrp, tty_nr, tpgid, 1, executable, arguments,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_process_with_parent(
+    proc_root: &Path,
+    pid: u32,
+    pgrp: i64,
+    tty_nr: i64,
+    tpgid: i64,
+    parent_pid: u32,
+    executable: &str,
+    arguments: &[&str],
+) {
     let directory = proc_root.join(pid.to_string());
     fs::create_dir(&directory).unwrap();
     fs::write(
         directory.join("stat"),
         format!(
-            "{pid} (fixture process) S 1 {pgrp} 1 {tty_nr} {tpgid} \
+            "{pid} (fixture process) S {parent_pid} {pgrp} 1 {tty_nr} {tpgid} \
              0 0 0 0 0 0 0 0 0 0 0 0 0 {}",
             u64::from(pid) * 1_000
         ),

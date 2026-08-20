@@ -9,6 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -98,6 +99,55 @@ pub struct ProcessSettings {
     pub match_executables: Vec<PathBuf>,
     /// Exact tmux `pane_current_command` values accepted by Smart Left.
     pub pane_commands: Vec<String>,
+    /// Candidate scope used for executable and command matching.
+    #[serde(default)]
+    pub match_scope: MatchScope,
+    /// Regexes matched against a shell-free normalized process argv.
+    #[serde(default)]
+    pub match_command_regexes: Vec<String>,
+    /// Regexes matched against tmux pane_current_command.
+    #[serde(default)]
+    pub pane_command_regexes: Vec<String>,
+}
+
+/// Candidate process scope used for wrapper-aware detection.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MatchScope {
+    /// Preserve the pane foreground process-group behavior.
+    #[default]
+    Foreground,
+    /// Search readable descendants of the pane process.
+    PaneTree,
+    /// Search readable processes attached to the pane TTY.
+    PaneTty,
+}
+
+impl std::str::FromStr for MatchScope {
+    type Err = MuxError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "foreground" => Ok(Self::Foreground),
+            "pane-tree" => Ok(Self::PaneTree),
+            "pane-tty" => Ok(Self::PaneTty),
+            _ => Err(MuxError::InvalidValue {
+                field: "process match scope",
+                message: "must be foreground, pane-tree, or pane-tty".to_owned(),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for MatchScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Foreground => "foreground",
+            Self::PaneTree => "pane-tree",
+            Self::PaneTty => "pane-tty",
+        }
+        .fmt(formatter)
+    }
 }
 
 impl ThemePreference {
@@ -459,7 +509,7 @@ pub fn validate_process_settings(settings: &ProcessSettings) -> Result<()> {
     for path in &settings.match_executables {
         validate_executable_path(path, "process match executable")?;
     }
-    if settings.pane_commands.is_empty() {
+    if settings.pane_commands.is_empty() && settings.pane_command_regexes.is_empty() {
         return Err(MuxError::InvalidValue {
             field: "process pane commands",
             message: "must contain at least one command".to_owned(),
@@ -474,6 +524,33 @@ pub fn validate_process_settings(settings: &ProcessSettings) -> Result<()> {
             return Err(MuxError::InvalidValue {
                 field: "process pane command",
                 message: format!("{command:?} must be one exact safe command name"),
+            });
+        }
+    }
+    validate_regexes(
+        &settings.match_command_regexes,
+        "process match command regex",
+    )?;
+    validate_regexes(&settings.pane_command_regexes, "process pane command regex")?;
+    Ok(())
+}
+
+fn validate_regexes(regexes: &[String], field: &'static str) -> Result<()> {
+    for expression in regexes {
+        if expression.is_empty() || expression.chars().any(char::is_control) {
+            return Err(MuxError::InvalidValue {
+                field,
+                message: "must not be empty or contain control characters".to_owned(),
+            });
+        }
+        let regex = Regex::new(expression).map_err(|error| MuxError::InvalidValue {
+            field,
+            message: format!("invalid regex {expression:?}: {error}"),
+        })?;
+        if regex.is_match("") {
+            return Err(MuxError::InvalidValue {
+                field,
+                message: format!("{expression:?} must not match an empty command"),
             });
         }
     }

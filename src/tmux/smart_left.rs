@@ -2,9 +2,11 @@
 
 use std::{ffi::OsString, path::Path, thread, time::Duration};
 
+use regex::Regex;
+
 use crate::{
     MuxError, Result,
-    domain::{CodexExecutable, CommandOutput, InvocationContext, TmuxCommandRunner},
+    domain::{CodexExecutable, CommandOutput, InvocationContext, PaneProcess, TmuxCommandRunner},
     linux_process::LinuxProcessInspector,
 };
 
@@ -25,7 +27,7 @@ pub enum SmartLeftOutcome {
 pub trait DirectCodexInspector {
     /// Returns true only when the pane foreground includes the configured Codex
     /// executable itself, never merely an allowlisted wrapper.
-    fn is_direct_codex(&self, pid: u32) -> Result<bool>;
+    fn is_direct_codex(&self, pane: &PaneProcess) -> Result<bool>;
 
     /// Returns true only for an interactive Bash or Zsh process that is the
     /// pane's exact foreground process.
@@ -33,8 +35,8 @@ pub trait DirectCodexInspector {
 }
 
 impl DirectCodexInspector for LinuxProcessInspector {
-    fn is_direct_codex(&self, pid: u32) -> Result<bool> {
-        self.foreground_process_matches(pid)
+    fn is_direct_codex(&self, pane: &PaneProcess) -> Result<bool> {
+        self.pane_process_matches(pane)
     }
 
     fn is_direct_shell(&self, pid: u32, command: &str) -> Result<bool> {
@@ -91,6 +93,23 @@ pub struct SmartLeftProbe<'a, Runner, Inspector, Sleeper> {
     codex: &'a CodexExecutable,
     pane_commands: &'a [String],
     match_executables: &'a [CodexExecutable],
+    pane_command_regexes: &'a [String],
+    match_scope: &'a str,
+    match_command_regexes: &'a [String],
+}
+
+/// Shared launch and detection values propagated by the Smart Left probe.
+pub struct SmartLeftMatcher<'a> {
+    /// Exact pane-command prefilters.
+    pub pane_commands: &'a [String],
+    /// Exact executable/script identities.
+    pub match_executables: &'a [CodexExecutable],
+    /// Regex pane-command prefilters.
+    pub pane_command_regexes: &'a [String],
+    /// Candidate process scope.
+    pub match_scope: &'a str,
+    /// Regex fallbacks for normalized process argv.
+    pub match_command_regexes: &'a [String],
 }
 
 impl<'a, Runner, Inspector, Sleeper> SmartLeftProbe<'a, Runner, Inspector, Sleeper>
@@ -116,6 +135,9 @@ where
             codex,
             pane_commands: &[],
             match_executables: &[],
+            pane_command_regexes: &[],
+            match_scope: "foreground",
+            match_command_regexes: &[],
         }
     }
 
@@ -138,6 +160,33 @@ where
             codex,
             pane_commands,
             match_executables,
+            pane_command_regexes: &[],
+            match_scope: "foreground",
+            match_command_regexes: &[],
+        }
+    }
+
+    /// Adds regex pane-command prefilters to the shared process probe.
+    #[must_use]
+    pub const fn with_process_matcher(
+        runner: &'a Runner,
+        inspector: &'a Inspector,
+        sleeper: &'a Sleeper,
+        mux: &'a Path,
+        codex: &'a CodexExecutable,
+        matcher: SmartLeftMatcher<'a>,
+    ) -> Self {
+        Self {
+            runner,
+            inspector,
+            sleeper,
+            mux,
+            codex,
+            pane_commands: matcher.pane_commands,
+            match_executables: matcher.match_executables,
+            pane_command_regexes: matcher.pane_command_regexes,
+            match_scope: matcher.match_scope,
+            match_command_regexes: matcher.match_command_regexes,
         }
     }
 
@@ -149,11 +198,18 @@ where
                     || self
                         .pane_commands
                         .iter()
-                        .any(|command| command == &state.pane_command);
+                        .any(|command| command == &state.pane_command)
+                    || self.pane_command_regexes.iter().any(|expression| {
+                        Regex::new(expression)
+                            .is_ok_and(|regex| regex.is_match(&state.pane_command))
+                    });
                 let target = if pane_command_allowed
                     && self
                         .inspector
-                        .is_direct_codex(state.pane_pid)
+                        .is_direct_codex(&PaneProcess {
+                            pid: state.pane_pid,
+                            tty: state.pane_tty.clone(),
+                        })
                         .unwrap_or(false)
                 {
                     Some(SmartLeftTarget::Codex)
@@ -206,7 +262,10 @@ where
         }
 
         let still_exact = match target {
-            SmartLeftTarget::Codex => self.inspector.is_direct_codex(current.pane_pid),
+            SmartLeftTarget::Codex => self.inspector.is_direct_codex(&PaneProcess {
+                pid: current.pane_pid,
+                tty: current.pane_tty.clone(),
+            }),
             SmartLeftTarget::Shell => self
                 .inspector
                 .is_direct_shell(current.pane_pid, &current.pane_command),
@@ -233,7 +292,7 @@ where
 
     fn state_format(&self) -> String {
         format!(
-            "#{{pane_pid}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}{FIELD_SEPARATOR}#{{pane_current_command}}{FIELD_SEPARATOR}#{{@codex_mux_shell_prompt}}"
+            "#{{pane_pid}}{FIELD_SEPARATOR}#{{pane_tty}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}{FIELD_SEPARATOR}#{{pane_current_command}}{FIELD_SEPARATOR}#{{@codex_mux_shell_prompt}}"
         )
     }
 
@@ -317,6 +376,16 @@ where
                 command.push("--pane-command".to_owned());
                 command.push(shell_literal(pane_command));
             }
+            command.push("--match-scope".to_owned());
+            command.push(shell_literal(self.match_scope));
+            for expression in self.match_command_regexes {
+                command.push("--match-command-regex".to_owned());
+                command.push(shell_literal(expression));
+            }
+            for expression in self.pane_command_regexes {
+                command.push("--pane-command-regex".to_owned());
+                command.push(shell_literal(expression));
+            }
         }
         command.extend([
             "--client".to_owned(),
@@ -361,6 +430,7 @@ where
 
 fn state_is_unchanged(initial: &PaneState, observed: &PaneState) -> bool {
     observed.pane_pid == initial.pane_pid
+        && observed.pane_tty == initial.pane_tty
         && observed.cursor_x == initial.cursor_x
         && observed.cursor_y == initial.cursor_y
         && observed.cursor_visible
@@ -372,6 +442,7 @@ fn state_is_unchanged(initial: &PaneState, observed: &PaneState) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneState {
     pane_pid: u32,
+    pane_tty: std::path::PathBuf,
     cursor_x: u16,
     cursor_y: u16,
     cursor_visible: bool,
@@ -383,19 +454,25 @@ struct PaneState {
 impl PaneState {
     fn parse(output: &[u8]) -> Result<Self> {
         let fields = split_fields(output)?;
-        if fields.len() != 7 {
+        if fields.len() != 7 && fields.len() != 8 {
             return Err(MuxError::Command(
                 "tmux returned malformed Smart Left pane state".to_owned(),
             ));
         }
+        let offset = usize::from(fields.len() == 8);
         Ok(Self {
             pane_pid: parse_u32(fields[0], "pane PID")?,
-            cursor_x: parse_u16(fields[1], "cursor x")?,
-            cursor_y: parse_u16(fields[2], "cursor y")?,
-            cursor_visible: parse_flag(fields[3], "cursor flag")?,
-            pane_in_mode: parse_flag(fields[4], "pane mode")?,
-            pane_command: fields[5].to_owned(),
-            shell_prompt: match fields[6] {
+            pane_tty: if offset == 1 {
+                std::path::PathBuf::from(fields[1])
+            } else {
+                std::path::PathBuf::new()
+            },
+            cursor_x: parse_u16(fields[1 + offset], "cursor x")?,
+            cursor_y: parse_u16(fields[2 + offset], "cursor y")?,
+            cursor_visible: parse_flag(fields[3 + offset], "cursor flag")?,
+            pane_in_mode: parse_flag(fields[4 + offset], "pane mode")?,
+            pane_command: fields[5 + offset].to_owned(),
+            shell_prompt: match fields[6 + offset] {
                 "" | "0" => false,
                 "1" => true,
                 value => {
@@ -466,14 +543,14 @@ mod tests {
     use crate::{
         Result,
         domain::{
-            ClientId, CodexExecutable, CommandOutput, InvocationContext, PaneId, SessionId,
-            TmuxCommandRunner,
+            ClientId, CodexExecutable, CommandOutput, InvocationContext, PaneId, PaneProcess,
+            SessionId, TmuxCommandRunner,
         },
     };
 
     use super::{
-        DirectCodexInspector, PaneState, ProbeSleeper, SmartLeftOutcome, SmartLeftProbe,
-        shell_literal, split_fields,
+        DirectCodexInspector, PaneState, ProbeSleeper, SmartLeftMatcher, SmartLeftOutcome,
+        SmartLeftProbe, shell_literal, split_fields,
     };
 
     #[derive(Default)]
@@ -504,7 +581,7 @@ mod tests {
     }
 
     impl DirectCodexInspector for Inspector {
-        fn is_direct_codex(&self, _pid: u32) -> Result<bool> {
+        fn is_direct_codex(&self, _pane: &PaneProcess) -> Result<bool> {
             Ok(self.codex)
         }
 
@@ -875,6 +952,44 @@ mod tests {
             );
             assert_eq!(probe.run(&context()).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn pane_command_regex_prefilter_accepts_versioned_supervisor() {
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+        let mut screen = [""; 11];
+        screen[10] = "› draft";
+        let runner = Runner::with([
+            output(b"42\x1f2\x1f10\x1f1\x1f0\x1fsupervisor-v17\x1f0\n".to_vec()),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output([]),
+            output(b"42\x1f2\x1f10\x1f1\x1f0\x1fsupervisor-v17\x1f0\n".to_vec()),
+            output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let matches = vec![codex.clone()];
+        let pane_regexes = vec![r"^supervisor-v[0-9]+$".to_owned()];
+        let inspector = Inspector {
+            codex: true,
+            shell: false,
+        };
+        let probe = SmartLeftProbe::with_process_matcher(
+            &runner,
+            &inspector,
+            &sleeper,
+            std::path::Path::new("/opt/codex-mux"),
+            &codex,
+            SmartLeftMatcher {
+                pane_commands: &[],
+                match_executables: &matches,
+                pane_command_regexes: &pane_regexes,
+                match_scope: "pane-tree",
+                match_command_regexes: &[],
+            },
+        );
+
+        assert_eq!(probe.run(&context()).unwrap(), SmartLeftOutcome::Opened);
     }
 
     #[test]

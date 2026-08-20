@@ -32,11 +32,17 @@ match_executables = [
   "/opt/codex/runtime/codex",
 ]
 pane_commands = ["codex"]
+# Defaults to "foreground" for existing configurations.
+match_scope = "pane-tree"
+match_command_regexes = ['(^|/)codex-launcher(\s|$)']
+pane_command_regexes = ['^supervisor(-[a-z0-9]+)?$']
 ```
 
-The table belongs in `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml`. Every path must be absolute and executable. `launch_executable` alone starts new sessions and the Smart Naming app-server; matching an underlying binary never changes what is launched. Discovery accepts exact native executable paths and exact interpreted-script paths found in process arguments, including foreground descendants. Smart Left uses the same matcher after its exact `pane_current_command` prefilter.
+The table belongs in `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml`. Every path must be absolute and executable. `launch_executable` alone starts new sessions and the Smart Naming app-server; matching an underlying binary never changes what is launched. `foreground` preserves the original foreground-process-group behavior, `pane-tree` searches readable descendants of the pane process, and `pane-tty` searches readable processes attached to tmux's exact pane TTY. Inaccessible or racing `/proc` entries are skipped.
 
-The equivalent one-shot overrides are `--launch-executable PATH`, repeatable `--match-executable PATH`, and repeatable `--pane-command COMMAND`. `--codex PATH` remains the compatible shorthand for all three legacy values: launch and match use `PATH`, while the pane command is derived from its file name.
+Exact native executable and interpreted-script identities remain preferred. `match_command_regexes` are a controlled fallback for versioned or generated launchers: each readable argv argument must be valid UTF-8, arguments are joined with one ASCII space, and regexes operate on that normalized full command only. No shell parsing, expansion, or quoting occurs. If any argument is invalid UTF-8, only exact identity matching is considered. Codex Mux never logs matched command lines because arguments can contain secrets. Smart Left uses this same matcher after its exact-or-regex `pane_current_command` prefilter.
+
+The equivalent one-shot overrides are `--launch-executable PATH`, repeatable `--match-executable PATH`, `--match-scope foreground|pane-tree|pane-tty`, repeatable `--match-command-regex REGEX`, repeatable `--pane-command COMMAND`, and repeatable `--pane-command-regex REGEX`. `--codex PATH` remains the compatible shorthand for all three legacy values: launch and match use `PATH`, while the pane command is derived from its file name.
 
 ## Requirements
 

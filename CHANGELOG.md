@@ -4,6 +4,12 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-20
+
+### Added
+
+- Add shared foreground, pane-tree, and pane-TTY wrapper matching with command and pane-command regex configuration.
+
 ## [0.5.0] - 2026-08-20
 
 ### Added

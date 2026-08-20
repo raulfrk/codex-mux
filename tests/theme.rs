@@ -93,6 +93,9 @@ fn process_configuration_requires_executable_absolute_paths_and_exact_commands()
         launch_executable: launcher,
         match_executables: vec![underlying],
         pane_commands: vec!["codex".to_owned()],
+        match_scope: Default::default(),
+        match_command_regexes: Vec::new(),
+        pane_command_regexes: Vec::new(),
     };
     validate_process_settings(&valid).unwrap();
     let mut invalid = valid.clone();
@@ -101,6 +104,13 @@ fn process_configuration_requires_executable_absolute_paths_and_exact_commands()
     invalid = valid.clone();
     invalid.pane_commands = vec!["codex; echo injected".to_owned()];
     assert!(validate_process_settings(&invalid).is_err());
+    invalid = valid.clone();
+    invalid.match_command_regexes = vec!["[".to_owned()];
+    assert!(validate_process_settings(&invalid).is_err());
+    invalid = valid.clone();
+    invalid.pane_commands.clear();
+    invalid.pane_command_regexes = vec!["^supervisor$".to_owned()];
+    assert!(validate_process_settings(&invalid).is_ok());
     fs::remove_dir_all(root.parent().unwrap()).unwrap();
 }
 
