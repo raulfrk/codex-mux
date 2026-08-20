@@ -16,6 +16,7 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
         title: Some(title.to_owned()),
         generated_title: None,
         generated_at_unix: None,
+        immediate_naming: false,
         current_path: PathBuf::from(path),
     }
 }

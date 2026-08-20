@@ -842,9 +842,15 @@ fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
             .unwrap()
             .clone();
         if names != applied_names || last_name_reconcile.elapsed() >= Duration::from_secs(2) {
-            owned_names.reconcile(&names);
+            let immediate_pending = owned_names.reconcile(&names);
             applied_names = names;
             last_name_reconcile = Instant::now();
+            if immediate_pending {
+                worker
+                    .as_ref()
+                    .expect("worker exists while daemon loop runs")
+                    .trigger();
+            }
         }
         if worker.as_ref().is_some_and(NamingWorker::is_finished) {
             worker.take().expect("finished worker exists").stop();

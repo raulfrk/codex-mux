@@ -18,7 +18,7 @@ use crate::{
 
 const FIELD_SEPARATOR: u8 = 0x1f;
 const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
 pub struct PaneInventory<R, I> {
@@ -130,6 +130,7 @@ where
                 title: nonempty_title(record.title),
                 generated_title,
                 generated_at_unix,
+                immediate_naming: record.immediate_naming,
                 current_path: record.current_path,
             });
         }
@@ -193,6 +194,7 @@ struct TmuxPaneRecord {
     generated_name: String,
     generated_thread: String,
     generated_at: String,
+    immediate_naming: bool,
 }
 
 impl TmuxPaneRecord {
@@ -201,7 +203,7 @@ impl TmuxPaneRecord {
             return None;
         }
         let fields = split_fields(line);
-        if !matches!(fields.len(), 11 | 12) {
+        if !matches!(fields.len(), 11..=13) {
             return None;
         }
 
@@ -238,6 +240,7 @@ impl TmuxPaneRecord {
             generated_at: fields.get(11).map_or_else(String::new, |field| {
                 String::from_utf8_lossy(field).into_owned()
             }),
+            immediate_naming: fields.get(12).is_some_and(|field| *field == b"1"),
         })
     }
 

@@ -1187,6 +1187,18 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
             launched_pane,
             "clients attached to one tmux session must reflect its shared active window"
         );
+        let marker = fixture.server.checked(&[
+            "display-message",
+            "-p",
+            "-t",
+            &launched_pane,
+            "#{@codex_mux_name_now}",
+        ]);
+        assert_eq!(
+            marker.trim(),
+            if label.starts_with("resume") { "1" } else { "" },
+            "only the exact pane created by Resume receives an immediate naming marker"
+        );
         client.send(b"\x02d");
         shared_client.send(b"\x02d");
     }

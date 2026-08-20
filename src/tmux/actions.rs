@@ -6,6 +6,7 @@ use crate::{
     MuxError, Result,
     domain::{CodexExecutable, CommandOutput, InvocationContext, Pane, PaneId, TmuxCommandRunner},
     launch::{LaunchKind, new_window_arguments, new_window_arguments_with_permissions},
+    tmux::owned_names::IMMEDIATE_NAMING_OPTION,
 };
 
 /// Executes interactive actions through an injectable tmux command boundary.
@@ -81,7 +82,9 @@ where
         context: &InvocationContext,
         selected: Option<&Pane>,
     ) -> Result<PaneId> {
-        self.launch(context, selected, LaunchKind::ResumeAll)
+        let pane_id = self.launch(context, selected, LaunchKind::ResumeAll)?;
+        self.mark_for_immediate_naming(&pane_id);
+        Ok(pane_id)
     }
 
     /// Opens `codex resume --all` with a profile-selected executable and permissions.
@@ -102,6 +105,7 @@ where
         let output = self.run_checked(&arguments)?;
         let pane_id = parse_pane_id(&output.stdout)?;
         self.switch_client(context, &pane_id, false)?;
+        self.mark_for_immediate_naming(&pane_id);
         Ok(pane_id)
     }
 
@@ -122,6 +126,19 @@ where
         let pane_id = parse_pane_id(&output.stdout)?;
         self.switch_client(context, &pane_id, false)?;
         Ok(pane_id)
+    }
+
+    fn mark_for_immediate_naming(&self, pane_id: &PaneId) {
+        // Resume itself has succeeded by this point. Marker failure is harmless:
+        // normal immediate discovery still names the pane once it is visible.
+        let _ = self.run_checked(&os_strings([
+            "set-option",
+            "-p",
+            "-t",
+            pane_id.as_str(),
+            IMMEDIATE_NAMING_OPTION,
+            "1",
+        ]));
     }
 
     fn switch_client(

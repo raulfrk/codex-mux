@@ -98,6 +98,9 @@ pub struct Pane {
     pub generated_title: Option<String>,
     /// Unix timestamp of the last successful smart-title generation.
     pub generated_at_unix: Option<u64>,
+    /// A pane-local request to refresh its smart title without waiting for the
+    /// normal refresh interval.
+    pub immediate_naming: bool,
     /// Current working directory exposed by tmux.
     pub current_path: PathBuf,
 }
@@ -302,6 +305,7 @@ mod tests {
             title: None,
             generated_title: None,
             generated_at_unix: None,
+            immediate_naming: false,
             current_path: PathBuf::from("/work/codex-mux"),
         };
 

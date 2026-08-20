@@ -167,6 +167,7 @@ fn unzoomed_switch_uses_two_exact_tmux_requests() {
         title: Some("target".to_owned()),
         generated_title: None,
         generated_at_unix: None,
+        immediate_naming: false,
         current_path: PathBuf::from("/work/target"),
     };
 

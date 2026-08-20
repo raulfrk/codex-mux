@@ -4,6 +4,13 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-20
+
+### Changed
+
+- Name eligible new and resumed Codex conversations as soon as completed content is available, and wake Smart Naming immediately after Resume without blocking the popup.
+- Preserve exact thread identity and pane-local tmux metadata while applying the generated name to every matching pane across the tmux server.
+
 ## [0.6.0] - 2026-08-20
 
 ### Added

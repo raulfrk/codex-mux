@@ -30,12 +30,12 @@ pub const MAX_NAME_CHARS: usize = 48;
 const THREAD_LIST_PAGE_SIZE: u32 = 100;
 const MAX_THREAD_LIST_PAGES: usize = 20;
 const MAX_APP_SERVER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
-/// Minimum age of a new Codex thread before its first smart title.
-pub const INITIAL_NAMING_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Interval between reconsidering an existing smart title.
 pub const NAMING_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Cooldown before retrying a failed naming attempt or restarting an unhealthy provider.
 const NAMING_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Short retry while a resumed thread is still exposing its first completed turn.
+const PENDING_NAMING_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 type AppServerMessage = std::result::Result<Value, String>;
 
 /// Lazily constructs naming infrastructure only after an explicit opt-in.
@@ -359,6 +359,8 @@ pub struct NamingTarget {
     pub generated_name: Option<String>,
     /// Unix timestamp of the last successful title generation.
     pub generated_at_unix: Option<u64>,
+    /// A pane-local Resume request that should bypass a prior successful refresh cooldown.
+    pub immediate_naming: bool,
 }
 
 impl NamingTarget {
@@ -374,6 +376,7 @@ impl NamingTarget {
             cwd: pane.current_path.clone(),
             generated_name: pane.generated_title.clone(),
             generated_at_unix: pane.generated_at_unix,
+            immediate_naming: pane.immediate_naming,
         })
     }
 }
@@ -448,10 +451,15 @@ pub type GeneratedNames = Arc<Mutex<HashMap<PaneId, GeneratedName>>>;
 
 /// One bounded serial background naming lane with clean stop/join semantics.
 pub struct NamingWorker {
-    stop: Option<Sender<()>>,
+    commands: Option<Sender<NamingCommand>>,
     thread: Option<JoinHandle<()>>,
     names: GeneratedNames,
     cancelled: Arc<AtomicBool>,
+}
+
+enum NamingCommand {
+    Stop,
+    Wake,
 }
 
 impl NamingWorker {
@@ -473,7 +481,7 @@ impl NamingWorker {
 
     fn spawn_with_intervals<N, F, D>(
         start_namer: F,
-        mut discover: D,
+        discover: D,
         poll_interval: Duration,
         refresh_interval: Duration,
         retry_interval: Duration,
@@ -483,7 +491,30 @@ impl NamingWorker {
         F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
     {
-        let (stop, stopped) = mpsc::channel();
+        Self::spawn_with_retry_intervals(
+            start_namer,
+            discover,
+            poll_interval,
+            refresh_interval,
+            retry_interval,
+            PENDING_NAMING_RETRY_INTERVAL,
+        )
+    }
+
+    fn spawn_with_retry_intervals<N, F, D>(
+        start_namer: F,
+        mut discover: D,
+        poll_interval: Duration,
+        refresh_interval: Duration,
+        retry_interval: Duration,
+        pending_retry_interval: Duration,
+    ) -> Self
+    where
+        N: ConversationNamer,
+        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
+    {
+        let (commands, command_receiver) = mpsc::channel();
         let names: GeneratedNames = Arc::new(Mutex::new(HashMap::new()));
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
@@ -494,13 +525,14 @@ impl NamingWorker {
             };
             let mut cache = HashMap::<String, (u64, String)>::new();
             let mut last_attempt =
-                HashMap::<(String, PathBuf), (std::time::Instant, Duration)>::new();
-            loop {
-                if stopped.try_recv().is_ok() {
-                    break;
+                HashMap::<AttemptIdentity, (std::time::Instant, Duration)>::new();
+            'worker: loop {
+                match drain_commands(&command_receiver) {
+                    CommandSignal::Stop => break,
+                    CommandSignal::Wake | CommandSignal::None => {}
                 }
                 let Ok(targets) = discover() else {
-                    if stopped.recv_timeout(poll_interval).is_ok() {
+                    if wait_for_stop(&command_receiver, poll_interval) {
                         break;
                     }
                     continue;
@@ -519,29 +551,37 @@ impl NamingWorker {
                         .or_default()
                         .push(target);
                 }
+                let active_attempts = by_thread
+                    .iter()
+                    .map(|(identity, targets)| attempt_identity(identity, targets))
+                    .collect::<std::collections::HashSet<_>>();
+                last_attempt.retain(|identity, _| active_attempts.contains(identity));
                 for (identity, targets) in by_thread {
-                    if stopped.try_recv().is_ok() {
-                        return;
+                    match drain_commands(&command_receiver) {
+                        CommandSignal::Stop => return,
+                        CommandSignal::Wake => continue 'worker,
+                        CommandSignal::None => {}
                     }
                     let now = unix_seconds(SystemTime::now());
                     let Some(due_target) = targets.iter().find(|target| naming_is_due(target, now))
                     else {
                         continue;
                     };
+                    let attempt_key = attempt_identity(&identity, &targets);
                     if last_attempt
-                        .get(&identity)
+                        .get(&attempt_key)
                         .is_some_and(|(attempted, cooldown)| attempted.elapsed() < *cooldown)
                     {
                         continue;
                     }
                     last_attempt.insert(
-                        identity.clone(),
+                        attempt_key.clone(),
                         (std::time::Instant::now(), retry_interval),
                     );
                     let conversation = match namer.read(due_target) {
                         Ok(conversation) => conversation,
                         Err(_) if !namer.is_healthy() => {
-                            let _ = stopped.recv_timeout(retry_interval);
+                            let _ = wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
                             return;
                         }
                         Err(_) => continue,
@@ -549,8 +589,19 @@ impl NamingWorker {
                     if conversation.transcript.trim().is_empty() {
                         // A running first turn is pending, not a provider failure. Keeping the
                         // failure cooldown here would hide text completed just after this read.
-                        last_attempt.remove(&identity);
+                        last_attempt.insert(
+                            attempt_key,
+                            (
+                                std::time::Instant::now(),
+                                retry_interval.min(pending_retry_interval),
+                            ),
+                        );
                         continue;
+                    }
+                    match drain_commands(&command_receiver) {
+                        CommandSignal::Stop => return,
+                        CommandSignal::Wake => continue 'worker,
+                        CommandSignal::None => {}
                     }
                     let thread_id = conversation.thread_id.clone();
                     let fingerprint = transcript_fingerprint(&conversation.transcript);
@@ -561,7 +612,10 @@ impl NamingWorker {
                             let name = match namer.name(&conversation) {
                                 Ok(name) => name,
                                 Err(_) if !namer.is_healthy() => {
-                                    let _ = stopped.recv_timeout(retry_interval);
+                                    let _ = wait_for_stop_ignoring_wakes(
+                                        &command_receiver,
+                                        retry_interval,
+                                    );
                                     return;
                                 }
                                 Err(_) => continue,
@@ -573,7 +627,8 @@ impl NamingWorker {
                         let name = match namer.name(&conversation) {
                             Ok(name) => name,
                             Err(_) if !namer.is_healthy() => {
-                                let _ = stopped.recv_timeout(retry_interval);
+                                let _ =
+                                    wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
                                 return;
                             }
                             Err(_) => continue,
@@ -584,7 +639,7 @@ impl NamingWorker {
                     let still_resolved = match namer.resolve(due_target) {
                         Ok(thread_id) => thread_id,
                         Err(_) if !namer.is_healthy() => {
-                            let _ = stopped.recv_timeout(retry_interval);
+                            let _ = wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
                             return;
                         }
                         Err(_) => continue,
@@ -592,38 +647,67 @@ impl NamingWorker {
                     if still_resolved != thread_id {
                         continue;
                     }
+                    match drain_commands(&command_receiver) {
+                        CommandSignal::Stop => return,
+                        CommandSignal::Wake => continue 'worker,
+                        CommandSignal::None => {}
+                    }
                     let Ok(current) = discover() else {
                         continue;
                     };
+                    let mut matching_groups =
+                        HashMap::<(String, PathBuf), Vec<NamingTarget>>::new();
+                    for target in current {
+                        let matches_thread = target.thread_hint == thread_id
+                            || namer
+                                .resolve(&target)
+                                .is_ok_and(|resolved| resolved == thread_id);
+                        if !matches_thread {
+                            continue;
+                        }
+                        matching_groups
+                            .entry((target.thread_hint.clone(), target.cwd.clone()))
+                            .or_default()
+                            .push(target.clone());
+                    }
                     let mut published = published.lock().unwrap();
                     let mut published_any = false;
-                    for target in targets {
-                        if current.contains(&target) {
-                            published_any = true;
+                    for targets in matching_groups.values() {
+                        for target in targets {
                             published.insert(
-                                target.pane_id,
+                                target.pane_id.clone(),
                                 GeneratedName {
                                     thread_id: thread_id.clone(),
-                                    source_title: target.pane_title,
-                                    source_cwd: target.cwd,
+                                    source_title: target.pane_title.clone(),
+                                    source_cwd: target.cwd.clone(),
                                     name: name.clone(),
                                     generated_at_unix: now,
                                 },
                             );
+                            published_any = true;
                         }
                     }
                     if published_any {
-                        last_attempt
-                            .insert(identity, (std::time::Instant::now(), refresh_interval));
+                        last_attempt.insert(
+                            attempt_key.clone(),
+                            (std::time::Instant::now(), refresh_interval),
+                        );
+                        for (identity, targets) in matching_groups {
+                            last_attempt.insert(
+                                attempt_identity(&identity, &targets),
+                                (std::time::Instant::now(), refresh_interval),
+                            );
+                        }
                     }
                 }
-                if stopped.recv_timeout(poll_interval).is_ok() {
-                    break;
+                match command_receiver.recv_timeout(poll_interval) {
+                    Ok(NamingCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(NamingCommand::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
         });
         Self {
-            stop: Some(stop),
+            commands: Some(commands),
             thread: Some(thread),
             names,
             cancelled,
@@ -634,6 +718,13 @@ impl NamingWorker {
     #[must_use]
     pub fn names(&self) -> GeneratedNames {
         self.names.clone()
+    }
+
+    /// Wakes discovery early after a pane acquires an exact resumed thread.
+    pub fn trigger(&self) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(NamingCommand::Wake);
+        }
     }
 
     /// Reports whether the worker lane ended, including provider startup failure.
@@ -649,8 +740,8 @@ impl NamingWorker {
 
     fn shutdown(&mut self) {
         self.cancelled.store(true, Ordering::Release);
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(NamingCommand::Stop);
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -663,26 +754,78 @@ fn unix_seconds(now: SystemTime) -> u64 {
 }
 
 fn naming_is_due(target: &NamingTarget, now_unix: u64) -> bool {
+    if target.immediate_naming {
+        return true;
+    }
     if target.generated_name.is_some() {
         return target.generated_at_unix.is_none_or(|generated_at| {
             now_unix.saturating_sub(generated_at) >= NAMING_REFRESH_INTERVAL.as_secs()
         });
     }
-    thread_created_at_unix(&target.thread_hint).is_some_and(|created_at| {
-        now_unix.saturating_sub(created_at) >= INITIAL_NAMING_DELAY.as_secs()
-    })
+    let _ = now_unix;
+    true
 }
 
-fn thread_created_at_unix(thread_hint: &str) -> Option<u64> {
-    let timestamp = thread_hint
-        .chars()
-        .filter(|character| *character != '-')
-        .take(12)
-        .collect::<String>();
-    (timestamp.len() == 12)
-        .then(|| u64::from_str_radix(&timestamp, 16).ok())
-        .flatten()
-        .map(|milliseconds| milliseconds / 1000)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandSignal {
+    None,
+    Stop,
+    Wake,
+}
+
+type AttemptIdentity = (String, PathBuf, Vec<(PaneId, String, bool)>);
+
+fn attempt_identity(identity: &(String, PathBuf), targets: &[NamingTarget]) -> AttemptIdentity {
+    let mut panes = targets
+        .iter()
+        .map(|target| {
+            (
+                target.pane_id.clone(),
+                target.pane_title.clone(),
+                target.immediate_naming,
+            )
+        })
+        .collect::<Vec<_>>();
+    panes.sort_unstable();
+    (identity.0.clone(), identity.1.clone(), panes)
+}
+
+fn drain_commands(commands: &mpsc::Receiver<NamingCommand>) -> CommandSignal {
+    let mut signal = CommandSignal::None;
+    while let Ok(command) = commands.try_recv() {
+        if matches!(command, NamingCommand::Stop) {
+            return CommandSignal::Stop;
+        }
+        signal = CommandSignal::Wake;
+    }
+    signal
+}
+
+fn wait_for_stop(commands: &mpsc::Receiver<NamingCommand>, duration: Duration) -> bool {
+    matches!(
+        commands.recv_timeout(duration),
+        Ok(NamingCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)
+    )
+}
+
+/// Waits through provider backoff without letting a pane-local wake amplify a
+/// persistent transport or model failure into rapid app-server restarts.
+fn wait_for_stop_ignoring_wakes(
+    commands: &mpsc::Receiver<NamingCommand>,
+    duration: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match commands.recv_timeout(remaining) {
+            Ok(NamingCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+            Ok(NamingCommand::Wake) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => return false,
+        }
+    }
 }
 
 impl Drop for NamingWorker {
@@ -990,6 +1133,19 @@ mod transport_tests {
     }
 
     #[test]
+    fn wake_does_not_shorten_an_unhealthy_provider_cooldown() {
+        let (sender, receiver) = mpsc::channel();
+        let retry_interval = Duration::from_millis(120);
+        let started = std::time::Instant::now();
+        let waiter = thread::spawn(move || wait_for_stop_ignoring_wakes(&receiver, retry_interval));
+        thread::sleep(Duration::from_millis(20));
+        sender.send(NamingCommand::Wake).unwrap();
+
+        assert!(!waiter.join().unwrap());
+        assert!(started.elapsed() >= retry_interval);
+    }
+
+    #[test]
     fn transient_failures_wait_for_the_retry_interval() {
         struct FailingNamer(Arc<Mutex<Vec<std::time::Instant>>>);
         impl ConversationNamer for FailingNamer {
@@ -1008,12 +1164,13 @@ mod transport_tests {
         let observed = attempts.clone();
         let target = target_created_at(0);
         let retry_interval = Duration::from_millis(40);
-        let worker = NamingWorker::spawn_with_intervals(
+        let worker = NamingWorker::spawn_with_retry_intervals(
             move |_| Ok(FailingNamer(observed)),
             move || Ok(vec![target.clone()]),
             Duration::from_millis(1),
             Duration::from_millis(10),
             retry_interval,
+            Duration::from_millis(10),
         );
         let retry_deadline = std::time::Instant::now() + Duration::from_secs(1);
         while attempts.lock().unwrap().len() < 2 && std::time::Instant::now() < retry_deadline {
@@ -1052,14 +1209,15 @@ mod transport_tests {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = attempts.clone();
         let target = target_created_at(0);
-        let worker = NamingWorker::spawn_with_intervals(
+        let worker = NamingWorker::spawn_with_retry_intervals(
             move |_| Ok(PendingNamer(observed)),
             move || Ok(vec![target.clone()]),
             Duration::from_millis(1),
             Duration::from_millis(10),
-            Duration::from_secs(2),
+            Duration::from_millis(40),
+            Duration::from_millis(10),
         );
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while worker.names().lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
             thread::yield_now();
         }
@@ -1076,6 +1234,45 @@ mod transport_tests {
                 .map(|name| name.name.as_str()),
             Some("Generated title")
         );
+    }
+
+    #[test]
+    fn trigger_discovers_a_resumed_thread_without_waiting_for_the_normal_poll() {
+        struct ReadyNamer;
+        impl ConversationNamer for ReadyNamer {
+            fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+                Ok(NamingConversation {
+                    thread_id: target.thread_hint.clone(),
+                    transcript: "completed resumed chat".to_owned(),
+                })
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                Ok("Resumed work".to_owned())
+            }
+        }
+
+        let target = Arc::new(Mutex::new(None));
+        let discovered = target.clone();
+        let worker = NamingWorker::spawn_with_intervals(
+            move |_| Ok(ReadyNamer),
+            move || Ok(discovered.lock().unwrap().clone().into_iter().collect()),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        *target.lock().unwrap() = Some(target_created_at(0));
+        worker.trigger();
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while worker.names().lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            !worker.names().lock().unwrap().is_empty(),
+            "wake did not bypass the sixty-second discovery interval"
+        );
+        worker.stop();
     }
 
     #[test]
@@ -1228,14 +1425,14 @@ mod transport_tests {
             cwd: "/work/project".into(),
             generated_name: None,
             generated_at_unix: None,
+            immediate_naming: false,
         }
     }
 
     #[test]
-    fn new_titles_wait_five_minutes_and_existing_titles_refresh_every_thirty_minutes() {
+    fn new_titles_are_due_immediately_and_existing_titles_refresh_every_thirty_minutes() {
         let now = 1_800_000_000;
-        assert!(!naming_is_due(&target_created_at(now - 299), now));
-        assert!(naming_is_due(&target_created_at(now - 300), now));
+        assert!(naming_is_due(&target_created_at(now), now));
 
         let mut existing = target_created_at(now);
         existing.generated_name = Some("Existing title".to_owned());

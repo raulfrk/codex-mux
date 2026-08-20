@@ -112,6 +112,7 @@ fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
         cwd: "/work/project".into(),
         generated_name: None,
         generated_at_unix: None,
+        immediate_naming: false,
     };
 
     let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
@@ -143,6 +144,7 @@ fn ambiguous_truncated_thread_fails_closed() {
         cwd: "/work/project".into(),
         generated_name: None,
         generated_at_unix: None,
+        immediate_naming: false,
     };
 
     assert!(
@@ -161,6 +163,7 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
         title: Some("01a01001-2dbb-74e2-86ab-996b3...".to_owned()),
         generated_title: Some("Existing entry title".to_owned()),
         generated_at_unix: Some(1_700_000_000),
+        immediate_naming: false,
         current_path: "/work/project".into(),
     };
 
@@ -183,6 +186,7 @@ fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
         title: Some("12345678...".to_owned()),
         generated_title: None,
         generated_at_unix: None,
+        immediate_naming: false,
         current_path: "/work/project".into(),
     };
 
@@ -265,6 +269,7 @@ fn target(pane: &str, thread: &str) -> NamingTarget {
         cwd: "/work/project".into(),
         generated_name: None,
         generated_at_unix: None,
+        immediate_naming: false,
     }
 }
 
@@ -350,7 +355,7 @@ fn worker_is_non_blocking_deduplicates_and_joins_on_stop() {
 }
 
 #[test]
-fn worker_schedules_reads_only_at_initial_and_thirty_minute_deadlines() {
+fn worker_reads_new_threads_immediately_and_existing_titles_at_refresh_deadlines() {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -385,7 +390,7 @@ fn worker_schedules_reads_only_at_initial_and_thirty_minute_deadlines() {
     wait_until("provider startup and repeated discovery", || {
         started.load(Ordering::Acquire) && discoveries.load(Ordering::SeqCst) >= 3
     });
-    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
     worker.stop();
 
     let reads = Arc::new(AtomicUsize::new(0));
@@ -442,6 +447,204 @@ fn duplicate_panes_run_when_any_member_is_due() {
     });
     worker.stop();
     assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn one_naming_cycle_fans_out_to_same_thread_in_different_working_directories() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let thread_id = thread_created_at(now - 90, "f00d");
+    let first = target("%1", &thread_id);
+    let mut second = target("%2", &thread_id);
+    second.cwd = "/other/project".into();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let names = Arc::new(AtomicUsize::new(0));
+    let observed_reads = reads.clone();
+    let observed_names = names.clone();
+    let worker = NamingWorker::spawn(
+        move |_| {
+            Ok(CountingNamer {
+                reads: observed_reads,
+                names: observed_names,
+                delay: Duration::ZERO,
+            })
+        },
+        move || Ok(vec![first.clone(), second.clone()]),
+        Duration::from_millis(10),
+    );
+
+    wait_until("both panes for one thread to be named", || {
+        worker.names().lock().unwrap().len() == 2
+    });
+    worker.stop();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert_eq!(names.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn immediate_resume_marker_bypasses_a_fresh_generated_title_cooldown() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed_reads = reads.clone();
+    let mut resumed = target("%1", &thread_created_at(now - 90, "a11ce"));
+    resumed.generated_name = Some("Earlier generated title".to_owned());
+    resumed.generated_at_unix = Some(now);
+    resumed.immediate_naming = true;
+    let worker = NamingWorker::spawn(
+        move |_| {
+            Ok(CountingNamer {
+                reads: observed_reads,
+                names: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
+            })
+        },
+        move || Ok(vec![resumed.clone()]),
+        Duration::from_millis(10),
+    );
+
+    wait_until("the resumed pane to bypass the refresh cooldown", || {
+        reads.load(Ordering::SeqCst) == 1
+    });
+    worker.stop();
+}
+
+#[test]
+fn wake_arriving_during_naming_restarts_discovery_without_waiting_for_polling() {
+    use std::sync::atomic::AtomicBool;
+
+    struct GatedNamer {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl ConversationNamer for GatedNamer {
+        fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+            Ok(NamingConversation {
+                thread_id: target.thread_hint.clone(),
+                transcript: "completed chat".to_owned(),
+            })
+        }
+
+        fn name(&mut self, _: &NamingConversation) -> Result<String> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            Ok("Useful generated name".to_owned())
+        }
+    }
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let current = Arc::new(Mutex::new(vec![target(
+        "%1",
+        "01999999-1111-7777-8888-123456789abc",
+    )]));
+    let discovered = current.clone();
+    let worker = NamingWorker::spawn(
+        {
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_| Ok(GatedNamer { entered, release })
+        },
+        move || Ok(discovered.lock().unwrap().clone()),
+        Duration::from_secs(60),
+    );
+
+    wait_until("the initial naming call", || {
+        entered.load(Ordering::Acquire)
+    });
+    *current.lock().unwrap() = vec![target("%2", "01999999-2222-7777-8888-123456789abc")];
+    worker.trigger();
+    release.store(true, Ordering::Release);
+
+    wait_until("the wake to rediscover the resumed pane", || {
+        worker
+            .names()
+            .lock()
+            .unwrap()
+            .contains_key(&PaneId::new("%2").unwrap())
+    });
+    worker.stop();
+}
+
+#[test]
+fn fanout_resolution_does_not_hold_the_generated_names_lock() {
+    use std::sync::atomic::AtomicBool;
+
+    let thread_id = "01999999-1111-7777-8888-123456789abc";
+    struct BlockingResolver {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+    impl ConversationNamer for BlockingResolver {
+        fn resolve(&mut self, target: &NamingTarget) -> Result<String> {
+            if target.pane_id.as_str() == "%2" {
+                self.entered.store(true, Ordering::Release);
+                while !self.release.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+            }
+            Ok("01999999-1111-7777-8888-123456789abc".to_owned())
+        }
+
+        fn read(&mut self, _: &NamingTarget) -> Result<NamingConversation> {
+            Ok(NamingConversation {
+                thread_id: "01999999-1111-7777-8888-123456789abc".to_owned(),
+                transcript: "completed chat".to_owned(),
+            })
+        }
+
+        fn name(&mut self, _: &NamingConversation) -> Result<String> {
+            Ok("Useful generated name".to_owned())
+        }
+    }
+
+    let source = target("%1", thread_id);
+    let mut resolved_elsewhere = target("%2", "01999999-1111-7777-8888-12345...");
+    resolved_elsewhere.pane_title = resolved_elsewhere.thread_hint.clone();
+    let discoveries = Arc::new(AtomicUsize::new(0));
+    let observed_discoveries = discoveries.clone();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let worker = NamingWorker::spawn(
+        {
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_| Ok(BlockingResolver { entered, release })
+        },
+        move || {
+            let call = observed_discoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(if call == 0 {
+                vec![source.clone()]
+            } else {
+                vec![source.clone(), resolved_elsewhere.clone()]
+            })
+        },
+        Duration::from_secs(60),
+    );
+
+    wait_until("fanout resolution to block", || {
+        entered.load(Ordering::Acquire)
+    });
+    let names = worker.names();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let lock_attempt = thread::spawn(move || {
+        let _guard = names.lock().unwrap();
+        sender.send(()).unwrap();
+    });
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(100)).is_ok(),
+        "fanout resolution held the shared generated-name lock"
+    );
+    release.store(true, Ordering::Release);
+    lock_attempt.join().unwrap();
+    worker.stop();
 }
 
 #[test]

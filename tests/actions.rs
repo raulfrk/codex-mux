@@ -71,6 +71,7 @@ fn pane(id: &str, path: &str) -> Pane {
         title: Some("thread".to_owned()),
         generated_title: None,
         generated_at_unix: None,
+        immediate_naming: false,
         current_path: PathBuf::from(path),
     }
 }
@@ -267,6 +268,10 @@ fn resume_uses_invoking_cwd_fallback_and_resume_all_exactly() {
             "--all",
         ])
     );
+    assert_eq!(
+        runner.commands().last().unwrap(),
+        &args(&["set-option", "-p", "-t", "%92", "@codex_mux_name_now", "1",])
+    );
 }
 
 #[test]
@@ -323,6 +328,7 @@ fn yolo_resume_profile_uses_custom_executable_and_global_permission_flag() {
                 "-t",
                 "%95",
             ]),
+            args(&["set-option", "-p", "-t", "%95", "@codex_mux_name_now", "1",]),
         ]
     );
 }
