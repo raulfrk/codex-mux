@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque, hash_map::DefaultHasher},
+    env, fs,
     hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -37,6 +38,169 @@ const NAMING_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Short retry while a resumed thread is still exposing its first completed turn.
 const PENDING_NAMING_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 type AppServerMessage = std::result::Result<Value, String>;
+const NAMING_LOG_MAX_BYTES: u64 = 256 * 1024;
+const DIAGNOSTIC_CODES: &[&str] = &[
+    "worker_start",
+    "provider_start_failed",
+    "provider_ready",
+    "discovery_failed",
+    "read_provider_unhealthy",
+    "read_failed",
+    "conversation_pending",
+    "naming_provider_unhealthy",
+    "naming_failed",
+    "resolve_provider_unhealthy",
+    "resolve_failed",
+    "identity_changed",
+    "name_published",
+    "process_rejected",
+    "pane_command_rejected",
+    "pane_mode_active",
+    "cursor_hidden",
+    "state_read_failed",
+    "composer_shape_rejected",
+    "state_recheck_failed",
+    "state_changed_after_left",
+    "process_changed_after_left",
+    "popup_opened",
+];
+
+/// Privacy-safe, bounded operational diagnostics for Smart Naming.
+#[derive(Clone, Debug)]
+pub struct NamingDiagnostics {
+    path: PathBuf,
+}
+
+impl NamingDiagnostics {
+    /// Discovers the standard XDG state log path without creating it.
+    pub fn discover() -> Result<Self> {
+        let root = env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+            .ok_or_else(|| MuxError::Command("HOME and XDG_STATE_HOME are unset".to_owned()))?;
+        Ok(Self {
+            path: root.join("codex-mux/smart-naming.log"),
+        })
+    }
+
+    /// Discovers the Smart Left decision log alongside Smart Naming diagnostics.
+    pub fn smart_left() -> Result<Self> {
+        let mut diagnostics = Self::discover()?;
+        diagnostics.path.set_file_name("smart-left.log");
+        Ok(diagnostics)
+    }
+
+    /// Uses an explicit diagnostics path, primarily for embedding and tests.
+    #[must_use]
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Exact diagnostics file displayed by status.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Appends a fixed reason code. Session and provider content cannot enter this API.
+    pub fn event(&self, code: &'static str) {
+        if !DIAGNOSTIC_CODES.contains(&code) {
+            return;
+        }
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        if fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() >= NAMING_LOG_MAX_BYTES)
+            && fs::rename(&self.path, self.path.with_extension("log.1")).is_err()
+        {
+            return;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            options.custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            );
+        }
+        if let Ok(mut file) = options.open(&self.path) {
+            if !file
+                .metadata()
+                .is_ok_and(|metadata| safe_diagnostics_metadata(&metadata))
+            {
+                return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+            }
+            let _ = writeln!(file, "{} {code}", unix_seconds(SystemTime::now()));
+        }
+    }
+
+    /// Reads the most recent sanitized event.
+    #[must_use]
+    pub fn latest(&self) -> Option<String> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            );
+        }
+        let file = options.open(&self.path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !safe_diagnostics_metadata(&metadata) || metadata.len() > NAMING_LOG_MAX_BYTES {
+            return None;
+        }
+        let mut contents = String::new();
+        file.take(NAMING_LOG_MAX_BYTES + 1)
+            .read_to_string(&mut contents)
+            .ok()?;
+        let line = contents.lines().next_back()?;
+        let mut fields = line.split(' ');
+        let timestamp = fields.next()?;
+        let code = fields.next()?;
+        if fields.next().is_some()
+            || timestamp.is_empty()
+            || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+            || !DIAGNOSTIC_CODES.contains(&code)
+        {
+            return None;
+        }
+        Some(format!("{timestamp} {code}"))
+    }
+}
+
+fn safe_diagnostics_metadata(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid() == rustix::process::geteuid().as_raw() && metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn log_diagnostic(diagnostics: &Option<NamingDiagnostics>, code: &'static str) {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.event(code);
+    }
+}
 
 /// Lazily constructs naming infrastructure only after an explicit opt-in.
 ///
@@ -384,7 +548,7 @@ impl NamingTarget {
     }
 }
 
-fn thread_hint(title: &str) -> Option<&str> {
+pub(crate) fn thread_hint(title: &str) -> Option<&str> {
     if looks_like_thread_id(title) {
         return Some(title);
     }
@@ -482,6 +646,29 @@ impl NamingWorker {
         )
     }
 
+    /// Starts a worker with privacy-safe operational event logging.
+    pub fn spawn_logged<N, F, D>(
+        start_namer: F,
+        discover: D,
+        poll_interval: Duration,
+        diagnostics: Option<NamingDiagnostics>,
+    ) -> Self
+    where
+        N: ConversationNamer,
+        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
+    {
+        Self::spawn_with_retry_intervals(
+            start_namer,
+            discover,
+            poll_interval,
+            NAMING_REFRESH_INTERVAL,
+            NAMING_RETRY_INTERVAL,
+            PENDING_NAMING_RETRY_INTERVAL,
+            diagnostics,
+        )
+    }
+
     fn spawn_with_intervals<N, F, D>(
         start_namer: F,
         discover: D,
@@ -501,6 +688,7 @@ impl NamingWorker {
             refresh_interval,
             retry_interval,
             PENDING_NAMING_RETRY_INTERVAL,
+            None,
         )
     }
 
@@ -511,6 +699,7 @@ impl NamingWorker {
         refresh_interval: Duration,
         retry_interval: Duration,
         pending_retry_interval: Duration,
+        diagnostics: Option<NamingDiagnostics>,
     ) -> Self
     where
         N: ConversationNamer,
@@ -523,9 +712,12 @@ impl NamingWorker {
         let worker_cancelled = cancelled.clone();
         let published = names.clone();
         let thread = thread::spawn(move || {
+            log_diagnostic(&diagnostics, "worker_start");
             let Ok(mut namer) = start_namer(worker_cancelled.clone()) else {
+                log_diagnostic(&diagnostics, "provider_start_failed");
                 return;
             };
+            log_diagnostic(&diagnostics, "provider_ready");
             let mut cache = HashMap::<String, (u64, String)>::new();
             let mut last_attempt =
                 HashMap::<AttemptIdentity, (std::time::Instant, Duration)>::new();
@@ -535,6 +727,7 @@ impl NamingWorker {
                     CommandSignal::Wake | CommandSignal::None => {}
                 }
                 let Ok(targets) = discover() else {
+                    log_diagnostic(&diagnostics, "discovery_failed");
                     if wait_for_stop(&command_receiver, poll_interval) {
                         break;
                     }
@@ -584,12 +777,17 @@ impl NamingWorker {
                     let conversation = match namer.read(due_target) {
                         Ok(conversation) => conversation,
                         Err(_) if !namer.is_healthy() => {
+                            log_diagnostic(&diagnostics, "read_provider_unhealthy");
                             let _ = wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
                             return;
                         }
-                        Err(_) => continue,
+                        Err(_) => {
+                            log_diagnostic(&diagnostics, "read_failed");
+                            continue;
+                        }
                     };
                     if conversation.transcript.trim().is_empty() {
+                        log_diagnostic(&diagnostics, "conversation_pending");
                         // A running first turn is pending, not a provider failure. Keeping the
                         // failure cooldown here would hide text completed just after this read.
                         last_attempt.insert(
@@ -615,13 +813,17 @@ impl NamingWorker {
                             let name = match namer.name(&conversation) {
                                 Ok(name) => name,
                                 Err(_) if !namer.is_healthy() => {
+                                    log_diagnostic(&diagnostics, "naming_provider_unhealthy");
                                     let _ = wait_for_stop_ignoring_wakes(
                                         &command_receiver,
                                         retry_interval,
                                     );
                                     return;
                                 }
-                                Err(_) => continue,
+                                Err(_) => {
+                                    log_diagnostic(&diagnostics, "naming_failed");
+                                    continue;
+                                }
                             };
                             cache.insert(thread_id.clone(), (fingerprint, name.clone()));
                             name
@@ -630,11 +832,15 @@ impl NamingWorker {
                         let name = match namer.name(&conversation) {
                             Ok(name) => name,
                             Err(_) if !namer.is_healthy() => {
+                                log_diagnostic(&diagnostics, "naming_provider_unhealthy");
                                 let _ =
                                     wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
                                 return;
                             }
-                            Err(_) => continue,
+                            Err(_) => {
+                                log_diagnostic(&diagnostics, "naming_failed");
+                                continue;
+                            }
                         };
                         cache.insert(thread_id.clone(), (fingerprint, name.clone()));
                         name
@@ -642,12 +848,17 @@ impl NamingWorker {
                     let still_resolved = match namer.resolve(due_target) {
                         Ok(thread_id) => thread_id,
                         Err(_) if !namer.is_healthy() => {
+                            log_diagnostic(&diagnostics, "resolve_provider_unhealthy");
                             let _ = wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
                             return;
                         }
-                        Err(_) => continue,
+                        Err(_) => {
+                            log_diagnostic(&diagnostics, "resolve_failed");
+                            continue;
+                        }
                     };
                     if still_resolved != thread_id {
+                        log_diagnostic(&diagnostics, "identity_changed");
                         continue;
                     }
                     match drain_commands(&command_receiver) {
@@ -691,6 +902,7 @@ impl NamingWorker {
                         }
                     }
                     if published_any {
+                        log_diagnostic(&diagnostics, "name_published");
                         last_attempt.insert(
                             attempt_key.clone(),
                             (std::time::Instant::now(), refresh_interval),
@@ -843,7 +1055,7 @@ fn transcript_fingerprint(transcript: &str) -> u64 {
     hasher.finish()
 }
 
-fn looks_like_thread_id(value: &str) -> bool {
+pub(crate) fn looks_like_thread_id(value: &str) -> bool {
     value.len() == 36
         && value.chars().enumerate().all(|(index, character)| {
             if matches!(index, 8 | 13 | 18 | 23) {
@@ -1070,6 +1282,62 @@ fn protocol(message: &str) -> MuxError {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_are_private_bounded_and_contain_only_reason_codes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("codex-mux-naming-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let log = NamingDiagnostics::at(root.join("smart-naming.log"));
+        log.event("provider_ready");
+        assert_eq!(
+            log.latest().unwrap().split_whitespace().last(),
+            Some("provider_ready")
+        );
+        assert_eq!(
+            fs::metadata(log.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!fs::read_to_string(log.path()).unwrap().contains("thread"));
+        fs::write(log.path(), vec![b'x'; NAMING_LOG_MAX_BYTES as usize]).unwrap();
+        log.event("provider_ready");
+        assert!(log.path().with_extension("log.1").exists());
+        assert!(fs::metadata(log.path()).unwrap().len() < 100);
+
+        fs::remove_file(log.path()).unwrap();
+        fs::remove_file(log.path().with_extension("log.1")).unwrap();
+        fs::create_dir(log.path().with_extension("log.1")).unwrap();
+        fs::write(log.path(), vec![b'x'; NAMING_LOG_MAX_BYTES as usize]).unwrap();
+        log.event("provider_ready");
+        assert_eq!(
+            fs::metadata(log.path()).unwrap().len(),
+            NAMING_LOG_MAX_BYTES
+        );
+
+        fs::remove_file(log.path()).unwrap();
+        let secret = root.join("secret");
+        fs::write(&secret, "sensitive-last-line\n").unwrap();
+        std::os::unix::fs::symlink(&secret, log.path()).unwrap();
+        assert_eq!(log.latest(), None);
+        log.event("provider_ready");
+        assert_eq!(fs::read_to_string(secret).unwrap(), "sensitive-last-line\n");
+
+        fs::remove_file(log.path()).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(log.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        log.event("provider_ready");
+        assert_eq!(log.latest(), None);
+        fs::remove_file(log.path()).unwrap();
+        fs::write(log.path(), "123 provider_ready\x1b[2J\n").unwrap();
+        assert_eq!(log.latest(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
     use std::{ffi::OsStr, io::Cursor};
 
     #[test]
@@ -1174,6 +1442,7 @@ mod transport_tests {
             Duration::from_millis(10),
             retry_interval,
             Duration::from_millis(10),
+            None,
         );
         let retry_deadline = std::time::Instant::now() + Duration::from_secs(1);
         while attempts.lock().unwrap().len() < 2 && std::time::Instant::now() < retry_deadline {
@@ -1219,6 +1488,7 @@ mod transport_tests {
             Duration::from_millis(10),
             Duration::from_millis(40),
             Duration::from_millis(10),
+            None,
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while worker.names().lock().unwrap().is_empty() && std::time::Instant::now() < deadline {

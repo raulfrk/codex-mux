@@ -18,6 +18,18 @@ const GENERATED_AT_OPTION: &str = "@codex_mux_generated_at";
 pub const IMMEDIATE_NAMING_OPTION: &str = "@codex_mux_name_now";
 /// Pane-local marker preserving a title explicitly saved by the user.
 pub const MANUAL_NAME_OPTION: &str = "@codex_mux_manual_name";
+/// Pane-local original thread title used to safely resume Smart Naming.
+pub const MANUAL_NAME_SOURCE_OPTION: &str = "@codex_mux_manual_name_source";
+/// Pane leader identity retained with a manual name.
+pub const MANUAL_NAME_PID_OPTION: &str = "@codex_mux_manual_name_pid";
+/// Tmux session retained with a manual name.
+pub const MANUAL_NAME_SESSION_OPTION: &str = "@codex_mux_manual_name_session";
+/// Transient marker proving that an unpin title restore completed.
+pub const UNPIN_READY_OPTION: &str = "@codex_mux_unpin_ready";
+/// Transient marker proving a guarded unpin completed.
+pub const UNPIN_COMPLETE_OPTION: &str = "@codex_mux_unpin_complete";
+/// Transient marker proving a guarded rename completed.
+pub const RENAME_COMPLETE_OPTION: &str = "@codex_mux_rename_complete";
 const STATE_FORMAT: &str = "#{pane_id}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_cwd}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}";
 const LEGACY_STATE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{pane_title}\x1f#{window_name}\x1f#{automatic-rename}\x1f#{window_panes}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_cwd}\x1f#{@codex_mux_generated_at}\x1f#{pane_current_path}";
 

@@ -103,6 +103,14 @@ pub struct Pane {
     pub immediate_naming: bool,
     /// A user-owned pane title that Smart Naming must never replace.
     pub manual_name: bool,
+    /// Original Codex thread title retained while a pane is manually named.
+    pub manual_name_source: Option<String>,
+    /// Pane leader PID captured when the manual name was saved.
+    pub manual_name_pid: Option<u32>,
+    /// Tmux session captured when the manual name was saved.
+    pub manual_name_session: Option<SessionId>,
+    /// Live pane leader PID used to reject stale rename/unpin actions.
+    pub pane_pid: u32,
     /// Current working directory exposed by tmux.
     pub current_path: PathBuf,
 }
@@ -309,6 +317,14 @@ mod tests {
             generated_at_unix: None,
             immediate_naming: false,
             manual_name: false,
+
+            manual_name_source: None,
+
+            manual_name_pid: None,
+
+            manual_name_session: None,
+
+            pane_pid: 100,
             current_path: PathBuf::from("/work/codex-mux"),
         };
 

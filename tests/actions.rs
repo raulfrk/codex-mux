@@ -32,7 +32,30 @@ impl RecordingRunner {
 impl TmuxCommandRunner for RecordingRunner {
     fn run(&self, arguments: &[OsString]) -> Result<CommandOutput> {
         self.commands.borrow_mut().push(arguments.to_vec());
-        Ok(self.outputs.borrow_mut().pop_front().unwrap_or_else(ok))
+        let mut output = self.outputs.borrow_mut().pop_front().unwrap_or_else(ok);
+        if output.stdout == b"<operation-token>\n" {
+            let token = self
+                .commands
+                .borrow()
+                .iter()
+                .rev()
+                .flat_map(|call| call.iter().rev())
+                .find_map(|argument| {
+                    let value = argument.to_string_lossy();
+                    let start = value.find("op-")?;
+                    Some(
+                        value[start..]
+                            .chars()
+                            .take_while(|character| {
+                                character.is_ascii_alphanumeric() || *character == '-'
+                            })
+                            .collect::<String>(),
+                    )
+                })
+                .expect("guarded mutation omitted operation token");
+            output.stdout = format!("{token}\n").into_bytes();
+        }
+        Ok(output)
     }
 }
 
@@ -49,6 +72,10 @@ fn stdout(value: &str) -> CommandOutput {
         stdout: value.as_bytes().to_vec(),
         ..ok()
     }
+}
+
+fn operation_marker() -> CommandOutput {
+    stdout("<operation-token>\n")
 }
 
 fn args(values: &[&str]) -> Vec<OsString> {
@@ -73,6 +100,14 @@ fn pane(id: &str, path: &str) -> Pane {
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
+
+        manual_name_source: None,
+
+        manual_name_pid: None,
+
+        manual_name_session: None,
+
+        pane_pid: 100,
         current_path: PathBuf::from(path),
     }
 }
@@ -347,7 +382,7 @@ fn close_kills_only_the_explicit_selected_pane() {
 
 #[test]
 fn manual_rename_clears_generated_metadata_and_passes_title_as_literal_argument() {
-    let runner = RecordingRunner::default();
+    let runner = RecordingRunner::with_outputs([ok(), operation_marker(), ok()]);
     let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
     let actions = TmuxActions::new(&runner, &executable);
     let selected = pane("%104", "/work/project");
@@ -355,64 +390,40 @@ fn manual_rename_clears_generated_metadata_and_passes_title_as_literal_argument(
 
     actions.rename_pane(&selected, title).unwrap();
 
-    assert_eq!(
-        runner.commands(),
-        vec![args(&[
-            "set-option",
-            "-pu",
-            "-t",
-            "%104",
-            "@codex_mux_generated_thread",
-            ";",
-            "set-option",
-            "-pu",
-            "-t",
-            "%104",
-            "@codex_mux_generated_name",
-            ";",
-            "set-option",
-            "-pu",
-            "-t",
-            "%104",
-            "@codex_mux_generated_source_title",
-            ";",
-            "set-option",
-            "-pu",
-            "-t",
-            "%104",
-            "@codex_mux_generated_source_cwd",
-            ";",
-            "set-option",
-            "-pu",
-            "-t",
-            "%104",
-            "@codex_mux_generated_at",
-            ";",
-            "set-option",
-            "-pu",
-            "-t",
-            "%104",
-            "@codex_mux_name_now",
-            ";",
-            "set-option",
-            "-p",
-            "-t",
-            "%104",
-            "@codex_mux_manual_name",
-            "1",
-            ";",
-            "select-pane",
-            "-t",
-            "%104",
-            "-T",
-            title,
-        ])]
+    let commands = runner.commands();
+    assert_eq!(commands.len(), 3);
+    assert!(
+        commands[0]
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .contains(title)
     );
+    assert!(
+        commands[0]
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .contains("@codex_mux_manual_name")
+    );
+    for option in [
+        "@codex_mux_generated_thread",
+        "@codex_mux_manual_name_source",
+        "@codex_mux_unpin_ready",
+    ] {
+        assert!(
+            commands[0]
+                .last()
+                .unwrap()
+                .to_string_lossy()
+                .contains(option)
+        );
+    }
 }
 
 #[test]
 fn manual_rename_escapes_tmux_format_interpolation() {
-    let runner = RecordingRunner::default();
+    let runner = RecordingRunner::with_outputs([ok(), operation_marker(), ok()]);
     let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
     let actions = TmuxActions::new(&runner, &executable);
 
@@ -423,12 +434,96 @@ fn manual_rename_escapes_tmux_format_interpolation() {
         )
         .unwrap();
 
-    assert_eq!(
-        runner.commands()[0].last().unwrap(),
-        &OsString::from(
-            "a##{pane_id}b #[fg=red] ##[bg=blue] ###[none] plain##hash ##(hostname) ####",
-        )
+    assert!(
+        runner.commands()[0]
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .contains(
+                "a##{pane_id}b #[fg=red] ##[bg=blue] ###[none] plain##hash ##(hostname) ####"
+            )
     );
+}
+
+#[test]
+fn manual_rename_preserves_a_title_that_is_exactly_a_semicolon() {
+    let runner = RecordingRunner::with_outputs([ok(), operation_marker(), ok()]);
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    TmuxActions::new(&runner, &executable)
+        .rename_pane(&pane("%110", "/work/project"), ";")
+        .unwrap();
+    let commands = runner.commands();
+    let mutation = commands[0].last().unwrap().to_string_lossy();
+    assert!(mutation.contains("'-T' ';' ; 'set-option'"));
+}
+
+#[test]
+fn unpin_restores_retained_thread_and_requests_immediate_naming() {
+    let runner =
+        RecordingRunner::with_outputs([ok(), operation_marker(), ok(), operation_marker(), ok()]);
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+    let mut selected = pane("%106", "/work/project");
+    selected.manual_name = true;
+    selected.manual_name_source = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned());
+    selected.manual_name_pid = Some(selected.pane_pid);
+    selected.manual_name_session = Some(selected.session_id.clone());
+    actions.unpin_pane(&selected).unwrap();
+    let commands = runner.commands();
+    assert_eq!(commands.len(), 5);
+    assert!(
+        commands[0]
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("select-pane"))
+    );
+    assert!(
+        commands[2]
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("@codex_mux_name_now"))
+    );
+}
+
+#[test]
+fn legacy_manual_uuid_is_never_inferred_as_a_retained_thread() {
+    let runner = RecordingRunner::with_outputs([ok(), operation_marker(), ok()]);
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+    let mut selected = pane("%107", "/work/project");
+    selected.manual_name = true;
+    selected.title = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned());
+    actions.rename_pane(&selected, "Still manual").unwrap();
+    assert_eq!(
+        runner.commands()[0]
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .matches("@codex_mux_manual_name_source")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn guarded_rename_and_unpin_surface_stale_pane_races() {
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let rename_runner = RecordingRunner::with_outputs([ok(), stdout("\n")]);
+    let error = TmuxActions::new(&rename_runner, &executable)
+        .rename_pane(&pane("%108", "/work/project"), "Manual")
+        .unwrap_err();
+    assert!(error.to_string().contains("pane changed"));
+
+    let unpin_runner =
+        RecordingRunner::with_outputs([ok(), operation_marker(), ok(), stdout("1\n")]);
+    let mut selected = pane("%109", "/work/project");
+    selected.manual_name = true;
+    selected.title = Some("Pinned".to_owned());
+    selected.manual_name_source = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned());
+    selected.manual_name_pid = Some(selected.pane_pid);
+    selected.manual_name_session = Some(selected.session_id.clone());
+    let error = TmuxActions::new(&unpin_runner, &executable)
+        .unpin_pane(&selected)
+        .unwrap_err();
+    assert!(error.to_string().contains("while its manual name"));
 }
 
 #[test]

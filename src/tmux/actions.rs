@@ -1,12 +1,21 @@
 //! Exact-target tmux actions used by the interactive application.
 
-use std::{ffi::OsString, str};
+use std::{
+    ffi::OsString,
+    str,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     MuxError, Result,
     domain::{CodexExecutable, CommandOutput, InvocationContext, Pane, PaneId, TmuxCommandRunner},
     launch::{LaunchKind, new_window_arguments, new_window_arguments_with_permissions},
-    tmux::owned_names::{IMMEDIATE_NAMING_OPTION, MANUAL_NAME_OPTION, clear_marker_arguments},
+    tmux::owned_names::{
+        IMMEDIATE_NAMING_OPTION, MANUAL_NAME_OPTION, MANUAL_NAME_PID_OPTION,
+        MANUAL_NAME_SESSION_OPTION, MANUAL_NAME_SOURCE_OPTION, RENAME_COMPLETE_OPTION,
+        UNPIN_COMPLETE_OPTION, UNPIN_READY_OPTION, clear_marker_arguments,
+    },
 };
 
 /// Executes interactive actions through an injectable tmux command boundary.
@@ -122,7 +131,34 @@ where
     /// set first: a partial tmux failure may leave an unchanged title opted out, but it can
     /// never leave a saved title eligible for a later generated-name overwrite.
     pub fn rename_pane(&self, pane: &Pane, title: &str) -> Result<()> {
+        let source = if pane.manual_name {
+            pane.manual_name_source.as_deref().filter(|value| {
+                crate::smart_naming::thread_hint(value).is_some()
+                    && pane.manual_name_pid == Some(pane.pane_pid)
+                    && pane.manual_name_session.as_ref() == Some(&pane.session_id)
+            })
+        } else {
+            pane.title
+                .as_deref()
+                .filter(|value| crate::smart_naming::thread_hint(value).is_some())
+        };
         let mut arguments = clear_marker_arguments(pane.id.as_str());
+        for option in [
+            MANUAL_NAME_SOURCE_OPTION,
+            MANUAL_NAME_PID_OPTION,
+            MANUAL_NAME_SESSION_OPTION,
+            UNPIN_READY_OPTION,
+            RENAME_COMPLETE_OPTION,
+        ] {
+            arguments.push(OsString::from(";"));
+            arguments.extend(os_strings([
+                "set-option",
+                "-pu",
+                "-t",
+                pane.id.as_str(),
+                option,
+            ]));
+        }
         arguments.push(OsString::from(";"));
         arguments.extend(os_strings([
             "set-option",
@@ -132,11 +168,176 @@ where
             MANUAL_NAME_OPTION,
             "1",
         ]));
+        if let Some(source) = source {
+            arguments.push(OsString::from(";"));
+            arguments.extend(os_strings([
+                "set-option",
+                "-p",
+                "-t",
+                pane.id.as_str(),
+                MANUAL_NAME_SOURCE_OPTION,
+            ]));
+            arguments.push(OsString::from(source));
+            arguments.push(OsString::from(";"));
+            arguments.extend(os_strings([
+                "set-option",
+                "-p",
+                "-t",
+                pane.id.as_str(),
+                MANUAL_NAME_PID_OPTION,
+            ]));
+            arguments.push(OsString::from(pane.pane_pid.to_string()));
+            arguments.push(OsString::from(";"));
+            arguments.extend(os_strings([
+                "set-option",
+                "-p",
+                "-t",
+                pane.id.as_str(),
+                MANUAL_NAME_SESSION_OPTION,
+            ]));
+            arguments.push(OsString::from(pane.session_id.as_str()));
+        }
         arguments.push(OsString::from(";"));
         arguments.extend(os_strings(["select-pane", "-t", pane.id.as_str(), "-T"]));
         arguments.push(OsString::from(tmux_title_literal(title)));
-        self.run_checked(&arguments)?;
+        let title_index = arguments.len() - 1;
+        let token = operation_token();
+        arguments.push(OsString::from(";"));
+        arguments.extend(os_strings([
+            "set-option",
+            "-p",
+            "-t",
+            pane.id.as_str(),
+            RENAME_COMPLETE_OPTION,
+        ]));
+        arguments.push(OsString::from(&token));
+        let condition = rename_condition(pane);
+        let mutation = tmux_command(&arguments, Some(title_index));
+        self.run_checked(&os_strings([
+            "if-shell",
+            "-F",
+            "-t",
+            pane.id.as_str(),
+            &condition,
+            &mutation,
+        ]))?;
+        self.require_marker(
+            pane,
+            RENAME_COMPLETE_OPTION,
+            &token,
+            "pane changed before it could be renamed",
+        )?;
+        self.run_checked(&os_strings([
+            "set-option",
+            "-pu",
+            "-t",
+            pane.id.as_str(),
+            RENAME_COMPLETE_OPTION,
+        ]))?;
         Ok(())
+    }
+
+    /// Restores the retained Codex thread title and makes the pane immediately nameable.
+    pub fn unpin_pane(&self, pane: &Pane) -> Result<()> {
+        let source = pane.manual_name_source.as_deref().ok_or_else(|| {
+            MuxError::Command(
+                "this manual name predates unpin support and has no retained conversation identity"
+                    .to_owned(),
+            )
+        })?;
+        if crate::smart_naming::thread_hint(source).is_none() {
+            return Err(MuxError::Command(
+                "manual name has an invalid retained conversation identity".to_owned(),
+            ));
+        }
+        if pane.manual_name_pid != Some(pane.pane_pid)
+            || pane.manual_name_session.as_ref() != Some(&pane.session_id)
+        {
+            return Err(MuxError::Command(
+                "manual name belongs to an earlier pane process or session".to_owned(),
+            ));
+        }
+        let title = pane.title.as_deref().unwrap_or_default();
+        let token = operation_token();
+        let condition = unpin_condition(pane, source, title, None);
+        let restore = format!(
+            "select-pane -t {} -T {}; set-option -p -t {} {} {}",
+            tmux_quote(pane.id.as_str()),
+            tmux_quote(&tmux_title_literal(source)),
+            tmux_quote(pane.id.as_str()),
+            UNPIN_READY_OPTION,
+            tmux_quote(&token),
+        );
+        self.run_checked(&os_strings([
+            "if-shell",
+            "-F",
+            "-t",
+            pane.id.as_str(),
+            &condition,
+            &restore,
+        ]))?;
+        self.require_marker(
+            pane,
+            UNPIN_READY_OPTION,
+            &token,
+            "pane changed before its manual name could be unpinned",
+        )?;
+        let condition = unpin_condition(pane, source, source, Some(&token));
+        let clear = format!(
+            "set-option -pu -t {p} {manual}; set-option -pu -t {p} {source_option}; set-option -pu -t {p} {pid_option}; set-option -pu -t {p} {session_option}; set-option -pu -t {p} {ready}; set-option -p -t {p} {immediate} 1; set-option -p -t {p} {complete} {token}",
+            p = tmux_quote(pane.id.as_str()),
+            manual = MANUAL_NAME_OPTION,
+            source_option = MANUAL_NAME_SOURCE_OPTION,
+            pid_option = MANUAL_NAME_PID_OPTION,
+            session_option = MANUAL_NAME_SESSION_OPTION,
+            ready = UNPIN_READY_OPTION,
+            immediate = IMMEDIATE_NAMING_OPTION,
+            complete = UNPIN_COMPLETE_OPTION,
+            token = tmux_quote(&token),
+        );
+        self.run_checked(&os_strings([
+            "if-shell",
+            "-F",
+            "-t",
+            pane.id.as_str(),
+            &condition,
+            &clear,
+        ]))?;
+        self.require_marker(
+            pane,
+            UNPIN_COMPLETE_OPTION,
+            &token,
+            "pane changed while its manual name was being unpinned",
+        )?;
+        self.run_checked(&os_strings([
+            "set-option",
+            "-pu",
+            "-t",
+            pane.id.as_str(),
+            UNPIN_COMPLETE_OPTION,
+        ]))?;
+        Ok(())
+    }
+
+    fn require_marker(
+        &self,
+        pane: &Pane,
+        option: &str,
+        expected: &str,
+        message: &str,
+    ) -> Result<()> {
+        let output = self.run_checked(&os_strings([
+            "show-options",
+            "-pv",
+            "-t",
+            pane.id.as_str(),
+            option,
+        ]))?;
+        if String::from_utf8_lossy(&output.stdout).trim() == expected {
+            Ok(())
+        } else {
+            Err(MuxError::Command(message.to_owned()))
+        }
     }
 
     fn launch(
@@ -235,6 +436,127 @@ fn tmux_title_literal(title: &str) -> String {
         }
     }
     literal
+}
+
+fn unpin_condition(
+    pane: &Pane,
+    source: &str,
+    expected_title: &str,
+    ready_token: Option<&str>,
+) -> String {
+    let mut clauses = vec![
+        format!("#{{==:#{{{MANUAL_NAME_OPTION}}},1}}"),
+        format!(
+            "#{{==:#{{{MANUAL_NAME_SOURCE_OPTION}}},{}}}",
+            tmux_format_literal(source)
+        ),
+        format!("#{{==:#{{{MANUAL_NAME_PID_OPTION}}},{}}}", pane.pane_pid),
+        format!(
+            "#{{==:#{{{MANUAL_NAME_SESSION_OPTION}}},{}}}",
+            tmux_format_literal(pane.session_id.as_str())
+        ),
+        format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid),
+        format!(
+            "#{{==:#{{session_id}},{}}}",
+            tmux_format_literal(pane.session_id.as_str())
+        ),
+        format!(
+            "#{{==:#{{pane_title}},{}}}",
+            tmux_format_literal(expected_title)
+        ),
+    ];
+    if let Some(token) = ready_token {
+        clauses.push(format!(
+            "#{{==:#{{{UNPIN_READY_OPTION}}},{}}}",
+            tmux_format_literal(token)
+        ));
+    }
+    clauses
+        .into_iter()
+        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+        .unwrap()
+}
+
+fn rename_condition(pane: &Pane) -> String {
+    let mut clauses = vec![
+        format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid),
+        format!(
+            "#{{==:#{{session_id}},{}}}",
+            tmux_format_literal(pane.session_id.as_str())
+        ),
+        format!(
+            "#{{==:#{{pane_title}},{}}}",
+            tmux_format_literal(pane.title.as_deref().unwrap_or_default())
+        ),
+    ];
+    if pane.manual_name {
+        clauses.push(format!("#{{==:#{{{MANUAL_NAME_OPTION}}},1}}"));
+        clauses.push(format!(
+            "#{{==:#{{{MANUAL_NAME_SOURCE_OPTION}}},{}}}",
+            pane.manual_name_source
+                .as_deref()
+                .map(tmux_format_literal)
+                .unwrap_or_default()
+        ));
+        clauses.push(format!(
+            "#{{==:#{{{MANUAL_NAME_PID_OPTION}}},{}}}",
+            pane.manual_name_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_default()
+        ));
+        clauses.push(format!(
+            "#{{==:#{{{MANUAL_NAME_SESSION_OPTION}}},{}}}",
+            pane.manual_name_session
+                .as_ref()
+                .map(|session| tmux_format_literal(session.as_str()))
+                .unwrap_or_default()
+        ));
+    } else {
+        clauses.push(format!("#{{==:#{{{MANUAL_NAME_OPTION}}},}}"));
+    }
+    clauses
+        .into_iter()
+        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+        .unwrap()
+}
+
+fn tmux_command(arguments: &[OsString], literal_index: Option<usize>) -> String {
+    arguments
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            if argument == ";" && literal_index != Some(index) {
+                ";".to_owned()
+            } else {
+                tmux_quote(argument.to_string_lossy().as_ref())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn operation_token() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "op-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn tmux_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn tmux_format_literal(value: &str) -> String {
+    value
+        .replace('#', "##")
+        .replace(',', "#,")
+        .replace('}', "#}")
 }
 
 fn parse_zoomed(stdout: &[u8]) -> Result<bool> {

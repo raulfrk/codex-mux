@@ -469,21 +469,21 @@ fn installed_smart_left_moves_then_opens_the_extracted_binary_at_the_boundary() 
         .unwrap();
     assert_success(&output, "start packaged Smart Left composer fixture");
     fixture.server.wait("Smart Left composer cursor", || {
-        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 5
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 9
     });
 
     let capture = fixture.scratch.join("smart-left-client.log");
     let (mut client, _tty) = fixture.client("origin", (100, 32), "smart-left-client");
     client.send(b"\x1b[D");
     fixture.server.wait("ordinary packaged Left", || {
-        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 4
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 8
     });
     fixture.server.wait("ordinary packaged probe cleanup", || {
         smart_left_inactive(&fixture.server, &fixture.origin_pane)
     });
     assert!(!fs::read_to_string(&capture).unwrap().contains("sessions"));
 
-    for expected_x in [3, 2] {
+    for expected_x in [7, 6] {
         client.send(b"\x1b[D");
         fixture
             .server
@@ -496,7 +496,7 @@ fn installed_smart_left_moves_then_opens_the_extracted_binary_at_the_boundary() 
     }
     client.send(b"\x1b[D");
     client.wait_text("sessions");
-    assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 2);
+    assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 6);
     client.send(b"q");
     fixture.server.wait("packaged Smart Left cleanup", || {
         smart_left_inactive(&fixture.server, &fixture.origin_pane)
@@ -1008,7 +1008,7 @@ fn run_smart_left_fixture() {
     let mut output = std::io::stdout().lock();
     let mut input = std::io::stdin().lock();
     let mut cursor = 3usize;
-    write!(output, "\x1b[2J\x1b[H› abc\x1b[1;{}H", cursor + 3).unwrap();
+    write!(output, "\x1b[2J\x1b[H    › abc\x1b[1;{}H", cursor + 7).unwrap();
     output.flush().unwrap();
     let mut byte = [0_u8; 1];
     loop {
@@ -1018,7 +1018,7 @@ fn run_smart_left_fixture() {
         input.read_exact(&mut tail).unwrap();
         if tail == *b"[D" {
             cursor = cursor.saturating_sub(1);
-            write!(output, "\x1b[1;{}H", cursor + 3).unwrap();
+            write!(output, "\x1b[1;{}H", cursor + 7).unwrap();
             output.flush().unwrap();
         }
     }

@@ -170,15 +170,32 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
         .trim()
         .to_owned();
     let thread_id = "12345678-1234-1234-1234-123456789abc";
+    let pane_pid = server
+        .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_pid}"])
+        .trim()
+        .parse()
+        .unwrap();
+    let session_id = server
+        .checked(&["display-message", "-p", "-t", &pane_id, "#{session_id}"])
+        .trim()
+        .to_owned();
     server.checked(&["select-pane", "-t", &pane_id, "-T", thread_id]);
     let pane = Pane {
         id: PaneId::new(&pane_id).unwrap(),
-        session_id: SessionId::new("$1").unwrap(),
+        session_id: SessionId::new(session_id).unwrap(),
         title: Some(thread_id.to_owned()),
         generated_title: Some("Generated name".to_owned()),
         generated_at_unix: Some(1_700_000_000),
         immediate_naming: true,
         manual_name: false,
+
+        manual_name_source: None,
+
+        manual_name_pid: None,
+
+        manual_name_session: None,
+
+        pane_pid,
         current_path: scratch.path().to_owned(),
     };
     let names = HashMap::from([(
@@ -235,6 +252,51 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
             .trim(),
         "1"
     );
+    assert_eq!(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_manual_name_source"
+            ])
+            .trim(),
+        thread_id
+    );
+    let mut pinned = pane.clone();
+    pinned.manual_name = true;
+    pinned.title = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned());
+    pinned.manual_name_source = Some(thread_id.to_owned());
+    pinned.manual_name_pid = Some(pane_pid);
+    pinned.manual_name_session = Some(pinned.session_id.clone());
+    TmuxActions::new(&runner, &executable)
+        .unpin_pane(&pinned)
+        .unwrap();
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_title}"])
+            .trim(),
+        thread_id
+    );
+    assert_eq!(
+        server
+            .checked(&["show-options", "-pv", "-t", &pane_id, "@codex_mux_name_now"])
+            .trim(),
+        "1"
+    );
+    assert!(
+        !server
+            .run(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_manual_name"
+            ])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -251,14 +313,32 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
         .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
         .trim()
         .to_owned();
+    server.checked(&["select-pane", "-t", &pane_id, "-T", "thread"]);
+    let pane_pid = server
+        .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_pid}"])
+        .trim()
+        .parse()
+        .unwrap();
+    let session_id = server
+        .checked(&["display-message", "-p", "-t", &pane_id, "#{session_id}"])
+        .trim()
+        .to_owned();
     let pane = Pane {
         id: PaneId::new(&pane_id).unwrap(),
-        session_id: SessionId::new("$1").unwrap(),
+        session_id: SessionId::new(session_id).unwrap(),
         title: Some("thread".to_owned()),
         generated_title: None,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
+
+        manual_name_source: None,
+
+        manual_name_pid: None,
+
+        manual_name_session: None,
+
+        pane_pid,
         current_path: scratch.path().to_owned(),
     };
     let executable = CodexExecutable::new("/bin/true").unwrap();
@@ -273,6 +353,62 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
             .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_title}"])
             .trim(),
         title
+    );
+
+    let literal_pane_id = server
+        .checked(&[
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &pane_id,
+            "sleep",
+            "30",
+        ])
+        .trim()
+        .to_owned();
+    server.checked(&["select-pane", "-t", &literal_pane_id, "-T", "thread"]);
+    let literal_pid = server
+        .checked(&[
+            "display-message",
+            "-p",
+            "-t",
+            &literal_pane_id,
+            "#{pane_pid}",
+        ])
+        .trim()
+        .parse()
+        .unwrap();
+    let literal_pane = Pane {
+        id: PaneId::new(&literal_pane_id).unwrap(),
+        session_id: pane.session_id.clone(),
+        title: Some("thread".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+        manual_name: false,
+        manual_name_source: None,
+        manual_name_pid: None,
+        manual_name_session: None,
+        pane_pid: literal_pid,
+        current_path: scratch.path().to_owned(),
+    };
+    TmuxActions::new(&SocketRunner(server.socket().to_owned()), &executable)
+        .rename_pane(&literal_pane, ";")
+        .unwrap();
+    assert_eq!(
+        server
+            .checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                &literal_pane_id,
+                "#{pane_title}"
+            ])
+            .trim(),
+        ";"
     );
 }
 

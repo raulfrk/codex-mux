@@ -29,6 +29,7 @@ fn worker(root: &Path, codex: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_codex-mux"))
         .args(["--codex", codex.to_str().unwrap(), "smart-naming-worker"])
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env(
             "TMUX",
@@ -178,6 +179,7 @@ fn tmux_owned_launcher_cleans_provider_on_disable_and_server_death() {
             "30",
         ])
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("CODEX_MUX_TEST_PROVIDER_PID", &provider_pid)
         .status()
@@ -201,6 +203,7 @@ fn tmux_owned_launcher_cleans_provider_on_disable_and_server_death() {
         Command::new(env!("CARGO_BIN_EXE_codex-mux"))
             .args(["--codex", codex.to_str().unwrap(), "smart-naming-start"])
             .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"))
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
             .env("TMUX", &tmux_value)
             .output()
@@ -272,6 +275,7 @@ fn disable_interrupts_late_provider_retry_backoff() {
                 "30"
             ])
             .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"))
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
             .env("CODEX_MUX_TEST_ATTEMPTS", &attempts)
             .status()
@@ -297,6 +301,7 @@ fn disable_interrupts_late_provider_retry_backoff() {
     let launched = Command::new(env!("CARGO_BIN_EXE_codex-mux"))
         .args(["--codex", codex.to_str().unwrap(), "smart-naming-start"])
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("TMUX", &tmux_value)
         .output()

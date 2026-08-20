@@ -4,6 +4,17 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-20
+
+### Added
+
+- Add persistent manual-name unpin from the capital-`R` prompt and bounded privacy-safe Smart Naming diagnostics in XDG state.
+
+### Fixed
+
+- Recognize indented Codex composer boundaries used by Ultra/Max reasoning modes without weakening the unchanged-state Smart Left fence.
+- Let initial `c` clear the rename prefill and preserve the original thread identity so Smart Naming can resume immediately after unpin.
+
 ## [0.8.0] - 2026-08-20
 
 ### Added

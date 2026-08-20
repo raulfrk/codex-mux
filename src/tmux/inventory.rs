@@ -18,7 +18,7 @@ use crate::{
 
 const FIELD_SEPARATOR: u8 = 0x1f;
 const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_manual_name_source}\x1f#{@codex_mux_manual_name_pid}\x1f#{@codex_mux_manual_name_session}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
 pub struct PaneInventory<R, I> {
@@ -132,6 +132,12 @@ where
                 generated_at_unix,
                 immediate_naming: record.immediate_naming,
                 manual_name: record.manual_name,
+                manual_name_source: nonempty_title(record.manual_name_source),
+                manual_name_pid: record.manual_name_pid,
+                manual_name_session: record
+                    .manual_name_session
+                    .and_then(|value| SessionId::new(value).ok()),
+                pane_pid: record.pane_pid,
                 current_path: record.current_path,
             });
         }
@@ -197,6 +203,9 @@ struct TmuxPaneRecord {
     generated_at: String,
     immediate_naming: bool,
     manual_name: bool,
+    manual_name_source: String,
+    manual_name_pid: Option<u32>,
+    manual_name_session: Option<String>,
 }
 
 impl TmuxPaneRecord {
@@ -205,7 +214,7 @@ impl TmuxPaneRecord {
             return None;
         }
         let fields = split_fields(line);
-        if !matches!(fields.len(), 11..=14) {
+        if !matches!(fields.len(), 11..=17) {
             return None;
         }
 
@@ -244,6 +253,15 @@ impl TmuxPaneRecord {
             }),
             immediate_naming: fields.get(12).is_some_and(|field| *field == b"1"),
             manual_name: fields.get(13).is_some_and(|field| *field == b"1"),
+            manual_name_source: fields.get(14).map_or_else(String::new, |field| {
+                String::from_utf8_lossy(field).into_owned()
+            }),
+            manual_name_pid: fields
+                .get(15)
+                .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok()),
+            manual_name_session: fields
+                .get(16)
+                .map(|field| String::from_utf8_lossy(field).into_owned()),
         })
     }
 

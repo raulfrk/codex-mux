@@ -18,6 +18,14 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
+
+        manual_name_source: None,
+
+        manual_name_pid: None,
+
+        manual_name_session: None,
+
+        pane_pid: 100,
         current_path: PathBuf::from(path),
     }
 }
@@ -146,6 +154,32 @@ fn capital_r_renames_only_the_selected_pane_and_cancel_or_invalid_input_do_not_e
             "Manual; $(literal)".to_owned()
         ))
     );
+}
+
+#[test]
+fn rename_prompt_initial_c_clears_and_empty_enter_unpins_without_a_global_key() {
+    let mut selected = pane("%19", "Pinned", "/work/shipping");
+    selected.manual_name = true;
+    selected.manual_name_source = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned());
+    selected.manual_name_pid = Some(selected.pane_pid);
+    selected.manual_name_session = Some(selected.session_id.clone());
+    let mut app = App::new(vec![selected], ThemeId::AdaptiveCyan, None);
+    app.handle_key(key(KeyCode::Char('R')));
+    app.handle_key(key(KeyCode::Char('c')));
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(Action::Unpin(PaneId::new("%19").unwrap()))
+    );
+
+    let mut app = App::new(
+        vec![pane("%20", "Original", "/work/other")],
+        ThemeId::AdaptiveCyan,
+        None,
+    );
+    app.handle_key(key(KeyCode::Char('R')));
+    app.handle_key(key(KeyCode::Char('c')));
+    app.handle_key(key(KeyCode::Char('c')));
+    assert!(rendered_app(&app, 100, 30).contains("Name  c"));
 }
 
 #[test]

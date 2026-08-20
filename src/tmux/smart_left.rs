@@ -8,6 +8,7 @@ use crate::{
     MuxError, Result,
     domain::{CodexExecutable, CommandOutput, InvocationContext, PaneProcess, TmuxCommandRunner},
     linux_process::LinuxProcessInspector,
+    smart_naming::NamingDiagnostics,
 };
 
 const FIELD_SEPARATOR: char = '\u{1f}';
@@ -96,6 +97,7 @@ pub struct SmartLeftProbe<'a, Runner, Inspector, Sleeper> {
     pane_command_regexes: &'a [String],
     match_scope: &'a str,
     match_command_regexes: &'a [String],
+    diagnostics: Option<NamingDiagnostics>,
 }
 
 /// Shared launch and detection values propagated by the Smart Left probe.
@@ -138,6 +140,7 @@ where
             pane_command_regexes: &[],
             match_scope: "foreground",
             match_command_regexes: &[],
+            diagnostics: None,
         }
     }
 
@@ -163,6 +166,7 @@ where
             pane_command_regexes: &[],
             match_scope: "foreground",
             match_command_regexes: &[],
+            diagnostics: None,
         }
     }
 
@@ -187,6 +191,20 @@ where
             pane_command_regexes: matcher.pane_command_regexes,
             match_scope: matcher.match_scope,
             match_command_regexes: matcher.match_command_regexes,
+            diagnostics: None,
+        }
+    }
+
+    /// Enables privacy-safe decision reason logging for the runtime probe.
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: NamingDiagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    fn event(&self, code: &'static str) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.event(code);
         }
     }
 
@@ -223,9 +241,27 @@ where
                 } else {
                     None
                 };
+                if target.is_none() {
+                    self.event(if pane_command_allowed {
+                        "process_rejected"
+                    } else {
+                        "pane_command_rejected"
+                    });
+                }
                 target.map(|target| (state, target))
             }
-            Ok(_) | Err(_) => None,
+            Ok(state) => {
+                self.event(if state.pane_in_mode {
+                    "pane_mode_active"
+                } else {
+                    "cursor_hidden"
+                });
+                None
+            }
+            Err(_) => {
+                self.event("state_read_failed");
+                None
+            }
         };
 
         let Some((initial, target)) = initial else {
@@ -235,8 +271,7 @@ where
 
         let boundary_is_exact = match target {
             SmartLeftTarget::Codex => {
-                initial.cursor_x == 2
-                    && self.cursor_is_on_composer_prompt(context, initial.cursor_y)
+                self.cursor_is_on_composer_prompt(context, initial.cursor_x, initial.cursor_y)
             }
             // Shell prompts may occupy any number of columns. An unchanged
             // immediate post-key observation proves the editing boundary.
@@ -244,6 +279,7 @@ where
         };
         self.send_left(context)?;
         if !boundary_is_exact {
+            self.event("composer_shape_rejected");
             return Ok(SmartLeftOutcome::Forwarded);
         }
 
@@ -255,9 +291,11 @@ where
         }
 
         let Ok(current) = self.read_state(context) else {
+            self.event("state_recheck_failed");
             return Ok(SmartLeftOutcome::Forwarded);
         };
         if !state_is_unchanged(&initial, &current) {
+            self.event("state_changed_after_left");
             return Ok(SmartLeftOutcome::Forwarded);
         }
 
@@ -272,9 +310,11 @@ where
         }
         .unwrap_or(false);
         if !still_exact {
+            self.event("process_changed_after_left");
             return Ok(SmartLeftOutcome::Forwarded);
         }
         self.open_popup(context)?;
+        self.event("popup_opened");
         Ok(SmartLeftOutcome::Opened)
     }
 
@@ -306,7 +346,12 @@ where
         Ok(())
     }
 
-    fn cursor_is_on_composer_prompt(&self, context: &InvocationContext, cursor_y: u16) -> bool {
+    fn cursor_is_on_composer_prompt(
+        &self,
+        context: &InvocationContext,
+        cursor_x: u16,
+        cursor_y: u16,
+    ) -> bool {
         let output = self.run_checked(os_strings([
             "capture-pane",
             "-p",
@@ -322,7 +367,18 @@ where
         screen
             .lines()
             .nth(usize::from(cursor_y))
-            .is_some_and(|line| line == "›" || line.starts_with("› "))
+            .is_some_and(|line| {
+                let indentation = line.len() - line.trim_start_matches(' ').len();
+                let line = &line[indentation..];
+                let prompt_width = if line == "›" {
+                    1
+                } else if line.starts_with("› ") {
+                    2
+                } else {
+                    return false;
+                };
+                usize::from(cursor_x) == indentation + prompt_width
+            })
     }
 
     fn open_popup(&self, context: &InvocationContext) -> Result<()> {
@@ -679,7 +735,11 @@ mod tests {
 
     #[test]
     fn cursor_outside_exact_boundary_forwards_without_waiting() {
-        let runner = Runner::with([state(5, 10, true, false), output([])]);
+        let runner = Runner::with([
+            state(5, 10, true, false),
+            output(b"not a composer\n"),
+            output([]),
+        ]);
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
 
@@ -752,6 +812,65 @@ mod tests {
         assert!(popup.windows(2).any(|pair| pair == ["-w", "100%"]));
         let command = popup.last().unwrap().to_string_lossy();
         assert!(command.contains("'/work/project'\\''s'"));
+    }
+
+    #[test]
+    fn indented_composer_boundary_used_by_reasoning_modes_opens_popup() {
+        let mut screen = [""; 11];
+        screen[10] = "    › draft";
+        let runner = Runner::with([
+            state(6, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output([]),
+            state(6, 10, true, false),
+            output(b"/dev/pts/7\x1f120\x1f40\n"),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false
+                },
+                &sleeper,
+                &codex
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Opened
+        );
+    }
+
+    #[test]
+    fn indented_composer_row_at_the_wrong_cursor_column_forwards() {
+        let mut screen = [""; 11];
+        screen[10] = "    › draft";
+        for cursor_x in [0, 5, 7] {
+            let runner = Runner::with([
+                state(cursor_x, 10, true, false),
+                output(format!("{}\n", screen.join("\n")).into_bytes()),
+                output([]),
+            ]);
+            let sleeper = Sleeper::default();
+            let codex = CodexExecutable::new("/opt/codex").unwrap();
+            assert_eq!(
+                probe(
+                    &runner,
+                    &Inspector {
+                        codex: true,
+                        shell: false
+                    },
+                    &sleeper,
+                    &codex
+                )
+                .run(&context())
+                .unwrap(),
+                SmartLeftOutcome::Forwarded
+            );
+        }
     }
 
     #[test]

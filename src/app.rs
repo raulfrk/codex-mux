@@ -35,7 +35,9 @@ use crate::{
     },
     linux_process::LinuxProcessInspector,
     shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
-    smart_naming::{AppServerNamer, AppServerProcess, NamingTarget, NamingWorker},
+    smart_naming::{
+        AppServerNamer, AppServerProcess, NamingDiagnostics, NamingTarget, NamingWorker,
+    },
     tmux::{
         actions::TmuxActions,
         inventory::PaneInventory,
@@ -556,7 +558,7 @@ fn run_smart_left(cli: &Cli, process_arguments: &ProcessArguments) -> Result<()>
         process.match_scope,
         &process.match_command_regexes,
     )?;
-    SmartLeftProbe::with_process_matcher(
+    let probe = SmartLeftProbe::with_process_matcher(
         &runner,
         &inspector,
         &SystemSleeper,
@@ -573,8 +575,12 @@ fn run_smart_left(cli: &Cli, process_arguments: &ProcessArguments) -> Result<()>
             },
             match_command_regexes: &process.match_command_regexes,
         },
-    )
-    .run(&context)?;
+    );
+    let probe = match NamingDiagnostics::smart_left() {
+        Ok(diagnostics) => probe.with_diagnostics(diagnostics),
+        Err(_) => probe,
+    };
+    probe.run(&context)?;
     Ok(())
 }
 
@@ -779,6 +785,17 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
                     minimum_refresh_generation = minimum_refresh_generation.saturating_add(1);
                     refresh_worker.request(minimum_refresh_generation);
                 }
+                Action::Unpin(id) => {
+                    let pane = app
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.id == id)
+                        .cloned()
+                        .ok_or_else(|| MuxError::Command("selected pane disappeared".to_owned()))?;
+                    actions.unpin_pane(&pane)?;
+                    minimum_refresh_generation = minimum_refresh_generation.saturating_add(1);
+                    refresh_worker.request(minimum_refresh_generation);
+                }
                 Action::PersistTheme(theme) => theme_store.save(theme)?,
                 Action::Quit => return Ok(()),
             }
@@ -799,7 +816,7 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
         inspector,
         process.matches.clone(),
     );
-    NamingWorker::spawn(
+    NamingWorker::spawn_logged(
         move |cancelled| {
             AppServerProcess::spawn_with_cancel(&codex_path, cancelled).map(AppServerNamer::new)
         },
@@ -809,6 +826,7 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
                 .map(|panes| panes.iter().filter_map(NamingTarget::from_pane).collect())
         },
         Duration::from_secs(30),
+        NamingDiagnostics::discover().ok(),
     )
 }
 
@@ -1091,6 +1109,20 @@ fn show_status(arguments: ConfigPathArgs, process_arguments: &ProcessArguments) 
             "disabled"
         }
     );
+    if let Ok(diagnostics) = NamingDiagnostics::discover() {
+        println!("smart-naming-log: {}", diagnostics.path().display());
+        println!(
+            "smart-naming-last: {}",
+            diagnostics.latest().as_deref().unwrap_or("<none>")
+        );
+    }
+    if let Ok(diagnostics) = NamingDiagnostics::smart_left() {
+        println!("smart-left-log: {}", diagnostics.path().display());
+        println!(
+            "smart-left-last: {}",
+            diagnostics.latest().as_deref().unwrap_or("<none>")
+        );
+    }
     if report.drift.is_empty() {
         println!("drift: none");
     } else {

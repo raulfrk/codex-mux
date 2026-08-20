@@ -69,6 +69,8 @@ pub enum Action {
     Close(PaneId),
     /// Assign a user-owned title to one pane and relinquish Smart Naming ownership.
     Rename(PaneId, String),
+    /// Remove manual ownership and resume Smart Naming for the selected pane.
+    Unpin(PaneId),
     /// Persist a theme chosen in the live-preview picker.
     PersistTheme(ThemeId),
     /// Leave the popup without changing tmux state.
@@ -132,6 +134,8 @@ struct ManualRename {
     pane_id: PaneId,
     title: String,
     error: Option<String>,
+    untouched: bool,
+    can_unpin: bool,
 }
 
 impl ManualRename {
@@ -140,6 +144,11 @@ impl ManualRename {
             pane_id: pane.id.clone(),
             title: pane.display_title(),
             error: None,
+            untouched: true,
+            can_unpin: pane.manual_name
+                && pane.manual_name_source.is_some()
+                && pane.manual_name_pid == Some(pane.pane_pid)
+                && pane.manual_name_session.as_ref() == Some(&pane.session_id),
         }
     }
 }
@@ -510,8 +519,20 @@ impl App {
             }
             KeyCode::Backspace => {
                 editor.title.pop();
+                editor.untouched = false;
             }
-            KeyCode::Char(character) => editor.title.push(character),
+            KeyCode::Char('c') if editor.untouched => {
+                editor.title.clear();
+                editor.untouched = false;
+            }
+            KeyCode::Char(character) => {
+                editor.title.push(character);
+                editor.untouched = false;
+            }
+            KeyCode::Enter if editor.title.trim().is_empty() && editor.can_unpin => {
+                self.mode = Mode::Browse;
+                return Some(Action::Unpin(editor.pane_id));
+            }
             KeyCode::Enter => match validate_manual_title(&editor.title) {
                 Ok(title) => {
                     self.mode = Mode::Browse;
@@ -1048,7 +1069,12 @@ fn render_manual_rename(frame: &mut Frame<'_>, area: Rect, editor: &ManualRename
     if let Some(error) = &editor.error {
         lines.push(Line::styled(sanitized(error), palette.warning));
     } else {
-        lines.push(Line::styled("Enter save · Esc cancel", palette.muted));
+        let help = if editor.can_unpin {
+            "c clear · empty Enter unpin · Esc cancel"
+        } else {
+            "c clear · Enter save · Esc cancel"
+        };
+        lines.push(Line::styled(help, palette.muted));
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -1222,6 +1248,14 @@ mod tests {
             generated_at_unix: None,
             immediate_naming: false,
             manual_name: false,
+
+            manual_name_source: None,
+
+            manual_name_pid: None,
+
+            manual_name_session: None,
+
+            pane_pid: 100,
             current_path: PathBuf::from(format!("/work/{title}")),
         }
     }

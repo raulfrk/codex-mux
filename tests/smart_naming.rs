@@ -165,6 +165,14 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
         generated_at_unix: Some(1_700_000_000),
         immediate_naming: false,
         manual_name: false,
+
+        manual_name_source: None,
+
+        manual_name_pid: None,
+
+        manual_name_session: None,
+
+        pane_pid: 100,
         current_path: "/work/project".into(),
     };
 
@@ -189,6 +197,14 @@ fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
+
+        manual_name_source: None,
+
+        manual_name_pid: None,
+
+        manual_name_session: None,
+
+        pane_pid: 100,
         current_path: "/work/project".into(),
     };
 
@@ -211,6 +227,14 @@ fn pane_target_rejects_a_manual_uuid_shaped_title() {
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: true,
+
+        manual_name_source: None,
+
+        manual_name_pid: None,
+
+        manual_name_session: None,
+
+        pane_pid: 100,
         current_path: "/work/project".into(),
     };
 
