@@ -72,6 +72,7 @@ fn pane(id: &str, path: &str) -> Pane {
         generated_title: None,
         generated_at_unix: None,
         immediate_naming: false,
+        manual_name: false,
         current_path: PathBuf::from(path),
     }
 }
@@ -342,6 +343,92 @@ fn close_kills_only_the_explicit_selected_pane() {
     actions.close_pane(&pane("%104", "/work/project")).unwrap();
 
     assert_eq!(runner.commands(), vec![args(&["kill-pane", "-t", "%104"])]);
+}
+
+#[test]
+fn manual_rename_clears_generated_metadata_and_passes_title_as_literal_argument() {
+    let runner = RecordingRunner::default();
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+    let selected = pane("%104", "/work/project");
+    let title = "Manual; $(not a shell command)";
+
+    actions.rename_pane(&selected, title).unwrap();
+
+    assert_eq!(
+        runner.commands(),
+        vec![args(&[
+            "set-option",
+            "-pu",
+            "-t",
+            "%104",
+            "@codex_mux_generated_thread",
+            ";",
+            "set-option",
+            "-pu",
+            "-t",
+            "%104",
+            "@codex_mux_generated_name",
+            ";",
+            "set-option",
+            "-pu",
+            "-t",
+            "%104",
+            "@codex_mux_generated_source_title",
+            ";",
+            "set-option",
+            "-pu",
+            "-t",
+            "%104",
+            "@codex_mux_generated_source_cwd",
+            ";",
+            "set-option",
+            "-pu",
+            "-t",
+            "%104",
+            "@codex_mux_generated_at",
+            ";",
+            "set-option",
+            "-pu",
+            "-t",
+            "%104",
+            "@codex_mux_name_now",
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            "%104",
+            "@codex_mux_manual_name",
+            "1",
+            ";",
+            "select-pane",
+            "-t",
+            "%104",
+            "-T",
+            title,
+        ])]
+    );
+}
+
+#[test]
+fn manual_rename_escapes_tmux_format_interpolation() {
+    let runner = RecordingRunner::default();
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+
+    actions
+        .rename_pane(
+            &pane("%105", "/work/project"),
+            "a#{pane_id}b #[fg=red] ##[bg=blue] ###[none] plain#hash #(hostname) ##",
+        )
+        .unwrap();
+
+    assert_eq!(
+        runner.commands()[0].last().unwrap(),
+        &OsString::from(
+            "a##{pane_id}b #[fg=red] ##[bg=blue] ###[none] plain##hash ##(hostname) ####",
+        )
+    );
 }
 
 #[test]

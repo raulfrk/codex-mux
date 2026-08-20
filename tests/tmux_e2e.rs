@@ -13,13 +13,14 @@ use std::{
 
 use codex_mux::{
     Result,
-    domain::{CommandOutput, PaneId, TmuxCommandRunner},
+    domain::{CodexExecutable, CommandOutput, Pane, PaneId, SessionId, TmuxCommandRunner},
     smart_naming::GeneratedName,
-    tmux::owned_names::OwnedTmuxNames,
+    tmux::{actions::TmuxActions, owned_names::OwnedTmuxNames},
 };
 
 use support::{PtyProcess, Scratch, TmuxServer, assert_success, serial_tmux_test, tools_available};
 
+#[derive(Clone)]
 struct SocketRunner(String);
 
 impl TmuxCommandRunner for SocketRunner {
@@ -152,6 +153,127 @@ fn smart_naming_targets_a_background_pane_format_context() {
             "pane-local metadata mismatch for {option}"
         );
     }
+}
+
+#[test]
+fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("manual-pane-rename");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane_id = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    let thread_id = "12345678-1234-1234-1234-123456789abc";
+    server.checked(&["select-pane", "-t", &pane_id, "-T", thread_id]);
+    let pane = Pane {
+        id: PaneId::new(&pane_id).unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        title: Some(thread_id.to_owned()),
+        generated_title: Some("Generated name".to_owned()),
+        generated_at_unix: Some(1_700_000_000),
+        immediate_naming: true,
+        manual_name: false,
+        current_path: scratch.path().to_owned(),
+    };
+    let names = HashMap::from([(
+        pane.id.clone(),
+        GeneratedName {
+            thread_id: thread_id.to_owned(),
+            source_title: thread_id.to_owned(),
+            source_cwd: scratch.path().to_owned(),
+            name: "Generated name".to_owned(),
+            generated_at_unix: 1_700_000_000,
+        },
+    )]);
+    let runner = SocketRunner(server.socket().to_owned());
+    let owned = OwnedTmuxNames::new(runner.clone());
+    owned.reconcile(&names);
+
+    let executable = CodexExecutable::new("/bin/true").unwrap();
+    TmuxActions::new(&runner, &executable)
+        .rename_pane(&pane, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        .unwrap();
+    owned.reconcile(&names);
+
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_title}"])
+            .trim(),
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    );
+    for option in [
+        "@codex_mux_generated_thread",
+        "@codex_mux_generated_name",
+        "@codex_mux_generated_source_title",
+        "@codex_mux_generated_source_cwd",
+        "@codex_mux_generated_at",
+        "@codex_mux_name_now",
+    ] {
+        assert!(
+            !server
+                .run(&["show-options", "-pv", "-t", &pane_id, option])
+                .status
+                .success(),
+            "manual rename retained generated marker {option}"
+        );
+    }
+    assert_eq!(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_manual_name",
+            ])
+            .trim(),
+        "1"
+    );
+}
+
+#[test]
+fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("manual-pane-format-literal");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane_id = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    let pane = Pane {
+        id: PaneId::new(&pane_id).unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        title: Some("thread".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+        manual_name: false,
+        current_path: scratch.path().to_owned(),
+    };
+    let executable = CodexExecutable::new("/bin/true").unwrap();
+    let title = "plain#hash a#{pane_id}b #[fg=red] ##[bg=blue] ###[none] #(hostname) ##";
+
+    TmuxActions::new(&SocketRunner(server.socket().to_owned()), &executable)
+        .rename_pane(&pane, title)
+        .unwrap();
+
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_title}"])
+            .trim(),
+        title
+    );
 }
 
 #[test]

@@ -367,6 +367,9 @@ impl NamingTarget {
     /// Extracts a target only from the supported UUID thread-title shape.
     #[must_use]
     pub fn from_pane(pane: &Pane) -> Option<Self> {
+        if pane.manual_name {
+            return None;
+        }
         let pane_title = pane.title.as_deref()?.trim();
         let thread_hint = thread_hint(pane_title)?;
         Some(Self {

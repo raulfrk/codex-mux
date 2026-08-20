@@ -768,6 +768,17 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
                     minimum_refresh_generation = minimum_refresh_generation.saturating_add(1);
                     refresh_worker.request(minimum_refresh_generation);
                 }
+                Action::Rename(id, title) => {
+                    let pane = app
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.id == id)
+                        .cloned()
+                        .ok_or_else(|| MuxError::Command("selected pane disappeared".to_owned()))?;
+                    actions.rename_pane(&pane, &title)?;
+                    minimum_refresh_generation = minimum_refresh_generation.saturating_add(1);
+                    refresh_worker.request(minimum_refresh_generation);
+                }
                 Action::PersistTheme(theme) => theme_store.save(theme)?,
                 Action::Quit => return Ok(()),
             }

@@ -139,6 +139,7 @@ Press your normal tmux prefix, then the configured key. For example, with tmux's
 | `j` / `Down`, `k` / `Up`, then `Enter` in profile picker | Choose and start a profile |
 | `a` / `e` in profile picker | Add a profile or edit the selected profile |
 | `r` | Open the launch-profile picker, then start `codex resume --all` with the chosen profile and the same directory rule |
+| `R` | Edit the selected pane's manual title; saving it permanently prevents Smart Naming from changing that pane's title |
 | `x` | Ask to close the selected pane |
 | second fresh `x` or `Enter` | Confirm close |
 | `q` or `Esc` during confirmation | Cancel close |
@@ -169,7 +170,7 @@ Smart Naming is off by default. Open configuration with `c`, then press `n` to e
 
 When enabled, one tmux-owned background worker discovers eligible new, resumed, and already-running Codex threads across the tmux server. An eligible pane is named as soon as its thread has a completed, non-empty conversation; the Resume action wakes this work in the background as soon as its exact new pane is created. An existing generated title is reconsidered at most once every thirty minutes, with no conversation read or model request between deadlines. When due, the worker asks the configured local `codex app-server` for bounded, completed conversation content and sends that excerpt through Codex to the exact `gpt-5.6-luna` model for a short structured title. Naming is asynchronous and serial, so popup discovery and input do not wait for the model. This can use your Codex account's model allowance and has the same network/data handling implications as other Codex model requests.
 
-`codex-mux` keeps only a bounded conversation excerpt in worker memory for the request and does not write prompts or transcripts to disk. It stores the generated thread, title, source identity, and last-generation timestamp as pane-local tmux metadata so the Codex Mux entry survives a worker restart. This metadata is consumed only when rendering Codex Mux and never changes the tmux window name or its `automatic-rename` setting. Disabling joins the worker and removes the pane-local generated-title metadata.
+`codex-mux` keeps only a bounded conversation excerpt in worker memory for the request and does not write prompts or transcripts to disk. It stores the generated thread, title, source identity, and last-generation timestamp as pane-local tmux metadata so the Codex Mux entry survives a worker restart. This metadata is consumed only when rendering Codex Mux and never changes the tmux window name or its `automatic-rename` setting. Pressing capital `R` saves a user title, clears generated-title metadata, and writes a pane-local manual-ownership marker; Smart Naming therefore permanently relinquishes that pane, including after restarts. Disabling joins the worker and removes generated-title metadata while retaining user-owned titles and their ownership markers.
 
 Legacy titles created by older Smart Naming builds are migrated out of tmux window names when their ownership signature can be proven: normal tmux automatic naming is restored, while a still-matching title is retained only as Codex Mux pane metadata. If an eligible thread has no completed conversation content yet, the worker retries promptly without contacting the naming model. If app-server startup, protocol compatibility, model generation, or validation fails, existing panes and names continue working; failed refreshes are rate-limited and an unhealthy provider is restarted after its cooldown while the current/fallback entry title remains unchanged.
 
@@ -204,7 +205,7 @@ codex-mux tmux uninstall --config "$HOME/.tmux.conf"
 - **A phone shows a large layout:** make sure the binding was invoked by that phone's tmux client; the popup uses `client_width` and `client_height` from the invoking client.
 - **Colors are unreadable:** set `NO_COLOR=1` or select the monochrome theme.
 - **Another client saw the selected window change:** clients sharing one tmux session also share that session's active window and window zoom state. Attach the clients to separate sessions when independent views are required.
-- **Smart Naming stays off or a title does not update:** open configuration with `c` and confirm it shows `ON`. Completed conversation content is required. Provider or protocol failures leave the existing title unchanged and retry in the background; a manual tmux name is intentionally preserved.
+- **Smart Naming stays off or a title does not update:** open configuration with `c` and confirm it shows `ON`. Completed conversation content is required. Provider or protocol failures leave the existing title unchanged and retry in the background. A title saved through capital `R` is a permanent pane-local override.
 - **A command fails:** the popup restores the terminal before printing `codex-mux: ...` to standard error. No fallback action is attempted after an exact tmux command fails.
 
 ## Security and privacy

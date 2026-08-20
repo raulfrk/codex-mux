@@ -13,6 +13,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::config::valid_pane_command;
+
 /// First line of the uniquely owned tmux configuration block.
 pub const BEGIN_MARKER: &str = "# >>> codex-mux >>>";
 /// Last line of the uniquely owned tmux configuration block.
@@ -914,7 +916,7 @@ fn process_arguments(executables: &ExecutablePaths) -> Vec<String> {
     }
     for command in &executables.pane_commands {
         arguments.push("--pane-command".to_owned());
-        arguments.push(command.clone());
+        arguments.push(shell_literal(command));
     }
     arguments.push("--match-scope".to_owned());
     arguments.push(executables.match_scope.clone());
@@ -963,15 +965,14 @@ fn parse_smart_left(value: Option<&str>) -> InstallResult<bool> {
 }
 
 fn validate_smart_left_executable(executables: &ExecutablePaths) -> InstallResult<()> {
-    if executables.pane_commands.iter().any(|command| {
-        !command
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
-    }) {
+    if executables
+        .pane_commands
+        .iter()
+        .any(|command| !valid_pane_command(command))
+    {
         return Err(InstallError::InvalidValue {
             field: "Smart Left pane command",
-            reason: "must contain only ASCII letters, digits, dot, underscore, plus, or hyphen"
-                .to_owned(),
+            reason: "must be one exact safe pane command value".to_owned(),
         });
     }
     Ok(())
@@ -1324,7 +1325,7 @@ mod tests {
             PathBuf::from("/opt/launcher"),
             ProcessMetadata {
                 match_executables: vec![PathBuf::from("/opt/launcher")],
-                pane_commands: vec!["supervisor".to_owned()],
+                pane_commands: vec!["custom codex".to_owned()],
                 match_scope: "pane-tree".to_owned(),
                 match_command_regexes: vec!["x; touch /tmp/nope ' $(id) # space".to_owned()],
                 pane_command_regexes: vec!["^super visor$".to_owned()],
@@ -1335,6 +1336,7 @@ mod tests {
         let arguments = process_arguments(&paths).join(" ");
         assert!(arguments.contains("'x; touch /tmp/nope '\\'' $(id) # space'"));
         assert!(arguments.contains("'^super visor$'"));
+        assert!(arguments.contains("--pane-command 'custom codex'"));
         assert!(
             ExecutablePaths::with_process(
                 PathBuf::from("/opt/codex-mux"),

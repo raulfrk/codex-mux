@@ -101,6 +101,8 @@ pub struct Pane {
     /// A pane-local request to refresh its smart title without waiting for the
     /// normal refresh interval.
     pub immediate_naming: bool,
+    /// A user-owned pane title that Smart Naming must never replace.
+    pub manual_name: bool,
     /// Current working directory exposed by tmux.
     pub current_path: PathBuf,
 }
@@ -306,6 +308,7 @@ mod tests {
             generated_title: None,
             generated_at_unix: None,
             immediate_naming: false,
+            manual_name: false,
             current_path: PathBuf::from("/work/codex-mux"),
         };
 

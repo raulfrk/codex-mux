@@ -98,6 +98,9 @@ fn process_configuration_requires_executable_absolute_paths_and_exact_commands()
         pane_command_regexes: Vec::new(),
     };
     validate_process_settings(&valid).unwrap();
+    let mut spaced = valid.clone();
+    spaced.pane_commands = vec!["custom codex".to_owned()];
+    validate_process_settings(&spaced).unwrap();
     let mut invalid = valid.clone();
     invalid.match_executables.clear();
     assert!(validate_process_settings(&invalid).is_err());

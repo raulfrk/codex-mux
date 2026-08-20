@@ -6,7 +6,7 @@ use crate::{
     MuxError, Result,
     domain::{CodexExecutable, CommandOutput, InvocationContext, Pane, PaneId, TmuxCommandRunner},
     launch::{LaunchKind, new_window_arguments, new_window_arguments_with_permissions},
-    tmux::owned_names::IMMEDIATE_NAMING_OPTION,
+    tmux::owned_names::{IMMEDIATE_NAMING_OPTION, MANUAL_NAME_OPTION, clear_marker_arguments},
 };
 
 /// Executes interactive actions through an injectable tmux command boundary.
@@ -115,6 +115,30 @@ where
         Ok(())
     }
 
+    /// Sets an exact pane title and permanently relinquishes Smart Naming ownership of it.
+    ///
+    /// Generated metadata is removed and a durable manual-ownership marker is set before
+    /// the title changes, in the same tmux command invocation. The marker is deliberately
+    /// set first: a partial tmux failure may leave an unchanged title opted out, but it can
+    /// never leave a saved title eligible for a later generated-name overwrite.
+    pub fn rename_pane(&self, pane: &Pane, title: &str) -> Result<()> {
+        let mut arguments = clear_marker_arguments(pane.id.as_str());
+        arguments.push(OsString::from(";"));
+        arguments.extend(os_strings([
+            "set-option",
+            "-p",
+            "-t",
+            pane.id.as_str(),
+            MANUAL_NAME_OPTION,
+            "1",
+        ]));
+        arguments.push(OsString::from(";"));
+        arguments.extend(os_strings(["select-pane", "-t", pane.id.as_str(), "-T"]));
+        arguments.push(OsString::from(tmux_title_literal(title)));
+        self.run_checked(&arguments)?;
+        Ok(())
+    }
+
     fn launch(
         &self,
         context: &InvocationContext,
@@ -184,6 +208,33 @@ where
         };
         Err(MuxError::Command(detail))
     }
+}
+
+/// Encodes a title for tmux's `select-pane -T` format parser without changing its text.
+///
+/// `#{...}`, `#(...)`, plain `#`, and `##` are expanded or collapsed by that parser and
+/// therefore require doubled introducers. In contrast, tmux stores any contiguous hash
+/// run immediately before `[` literally for pane titles, so that complete run is retained.
+fn tmux_title_literal(title: &str) -> String {
+    let mut literal = String::with_capacity(title.len());
+    let mut characters = title.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '#' {
+            literal.push(character);
+            continue;
+        }
+
+        let mut hashes = 1;
+        while characters.next_if_eq(&'#').is_some() {
+            hashes += 1;
+        }
+        if characters.peek().is_some_and(|next| *next == '[') {
+            literal.extend(std::iter::repeat_n('#', hashes));
+        } else {
+            literal.extend(std::iter::repeat_n('#', hashes * 2));
+        }
+    }
+    literal
 }
 
 fn parse_zoomed(stdout: &[u8]) -> Result<bool> {

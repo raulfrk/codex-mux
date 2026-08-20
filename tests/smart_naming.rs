@@ -164,6 +164,7 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
         generated_title: Some("Existing entry title".to_owned()),
         generated_at_unix: Some(1_700_000_000),
         immediate_naming: false,
+        manual_name: false,
         current_path: "/work/project".into(),
     };
 
@@ -187,6 +188,7 @@ fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
         generated_title: None,
         generated_at_unix: None,
         immediate_naming: false,
+        manual_name: false,
         current_path: "/work/project".into(),
     };
 
@@ -197,6 +199,22 @@ fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
         ..pane
     };
     assert_eq!(NamingTarget::from_pane(&hyphenated), None);
+}
+
+#[test]
+fn pane_target_rejects_a_manual_uuid_shaped_title() {
+    let pane = Pane {
+        id: PaneId::new("%9").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        title: Some("12345678-1234-1234-1234-123456789abc".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+        manual_name: true,
+        current_path: "/work/project".into(),
+    };
+
+    assert_eq!(NamingTarget::from_pane(&pane), None);
 }
 
 #[test]

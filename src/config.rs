@@ -497,7 +497,7 @@ pub fn validate_profiles(profiles: &[LaunchProfile]) -> Result<()> {
     Ok(())
 }
 
-/// Validates persisted process paths and exact tmux command names.
+/// Validates persisted process paths and exact tmux command values.
 pub fn validate_process_settings(settings: &ProcessSettings) -> Result<()> {
     validate_executable_path(&settings.launch_executable, "process launch executable")?;
     if settings.match_executables.is_empty() {
@@ -516,14 +516,10 @@ pub fn validate_process_settings(settings: &ProcessSettings) -> Result<()> {
         });
     }
     for command in &settings.pane_commands {
-        if command.is_empty()
-            || !command
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
-        {
+        if !valid_pane_command(command) {
             return Err(MuxError::InvalidValue {
                 field: "process pane command",
-                message: format!("{command:?} must be one exact safe command name"),
+                message: format!("{command:?} must be one exact safe command value"),
             });
         }
     }
@@ -533,6 +529,15 @@ pub fn validate_process_settings(settings: &ProcessSettings) -> Result<()> {
     )?;
     validate_regexes(&settings.pane_command_regexes, "process pane command regex")?;
     Ok(())
+}
+
+/// Accepts one literal `pane_current_command` value without shell syntax.
+#[must_use]
+pub fn valid_pane_command(command: &str) -> bool {
+    !command.trim().is_empty()
+        && command
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || " ._+-".contains(character))
 }
 
 fn validate_regexes(regexes: &[String], field: &'static str) -> Result<()> {

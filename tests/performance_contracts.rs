@@ -168,6 +168,7 @@ fn unzoomed_switch_uses_two_exact_tmux_requests() {
         generated_title: None,
         generated_at_unix: None,
         immediate_naming: false,
+        manual_name: false,
         current_path: PathBuf::from("/work/target"),
     };
 

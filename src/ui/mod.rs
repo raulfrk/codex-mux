@@ -21,6 +21,8 @@ use crate::{
     theme::{Theme, theme},
 };
 
+const MAX_MANUAL_TITLE_CHARS: usize = 80;
+
 /// Responsive rendering profile selected from the terminal dimensions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutKind {
@@ -65,6 +67,8 @@ pub enum Action {
     Resume,
     /// Close the pane after explicit confirmation.
     Close(PaneId),
+    /// Assign a user-owned title to one pane and relinquish Smart Naming ownership.
+    Rename(PaneId, String),
     /// Persist a theme chosen in the live-preview picker.
     PersistTheme(ThemeId),
     /// Leave the popup without changing tmux state.
@@ -85,6 +89,7 @@ pub enum ColorPolicy {
 enum Mode {
     Browse,
     ConfirmClose(PaneId),
+    ManualRename(ManualRename),
     ThemePicker {
         original: ThemeId,
     },
@@ -120,6 +125,23 @@ struct ProfileEditor {
     field: EditorField,
     error: Option<String>,
     launch_kind: ProfileLaunchKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManualRename {
+    pane_id: PaneId,
+    title: String,
+    error: Option<String>,
+}
+
+impl ManualRename {
+    fn for_pane(pane: &Pane) -> Self {
+        Self {
+            pane_id: pane.id.clone(),
+            title: pane.display_title(),
+            error: None,
+        }
+    }
 }
 
 impl ProfileEditor {
@@ -375,6 +397,7 @@ impl App {
         match self.mode.clone() {
             Mode::Browse => self.handle_browse_key(key.code),
             Mode::ConfirmClose(id) => self.handle_confirmation_key(key, id),
+            Mode::ManualRename(editor) => self.handle_manual_rename_key(key.code, editor),
             Mode::ThemePicker { original } => self.handle_theme_key(key.code, original),
             Mode::ProfilePicker {
                 selected,
@@ -415,6 +438,16 @@ impl App {
             KeyCode::Char('x') => {
                 if let Some(id) = self.selected.clone() {
                     self.mode = Mode::ConfirmClose(id);
+                }
+                None
+            }
+            KeyCode::Char('R') => {
+                if let Some(pane) = self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.panes.iter().find(|pane| &pane.id == id))
+                {
+                    self.mode = Mode::ManualRename(ManualRename::for_pane(pane));
                 }
                 None
             }
@@ -462,6 +495,34 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    fn handle_manual_rename_key(
+        &mut self,
+        code: KeyCode,
+        mut editor: ManualRename,
+    ) -> Option<Action> {
+        editor.error = None;
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                return None;
+            }
+            KeyCode::Backspace => {
+                editor.title.pop();
+            }
+            KeyCode::Char(character) => editor.title.push(character),
+            KeyCode::Enter => match validate_manual_title(&editor.title) {
+                Ok(title) => {
+                    self.mode = Mode::Browse;
+                    return Some(Action::Rename(editor.pane_id, title));
+                }
+                Err(error) => editor.error = Some(error.to_owned()),
+            },
+            _ => {}
+        }
+        self.mode = Mode::ManualRename(editor);
+        None
     }
 
     fn handle_theme_key(&mut self, code: KeyCode, original: ThemeId) -> Option<Action> {
@@ -675,6 +736,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             render_profile_picker(frame, area, app, palette, *selected);
         }
         Mode::ProfileEditor(editor) => render_profile_editor(frame, area, editor, palette),
+        Mode::ManualRename(editor) => render_manual_rename(frame, area, editor, palette),
         Mode::Configuration => render_configuration(frame, area, app, palette),
         _ => {}
     }
@@ -711,6 +773,7 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
         Line::from("Enter  switch"),
         Line::from("n      new session"),
         Line::from("r      resume"),
+        Line::from("R      rename"),
         Line::from("x x    close"),
         Line::from("t      themes"),
         Line::from("c      config"),
@@ -749,11 +812,11 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, 
             .style(palette.warning)
             .wrap(Wrap { trim: true })
     } else if phone {
-        Paragraph::new("↕/jk move · Enter open · n new · r resume · x close · c config")
+        Paragraph::new("↕/jk move · Enter open · n new · r resume · R rename · x close · c config")
             .style(palette.muted)
     } else {
         Paragraph::new(
-            "jk/↕ move  Enter switch  n new  r resume  x close  t theme  c config  q quit",
+            "jk/↕ move  Enter switch  n new  r resume  R rename  x close  t theme  c config  q quit",
         )
         .style(palette.muted)
     };
@@ -776,7 +839,7 @@ fn render_tiny(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
         vec![
             Line::styled("codex-mux", palette.accent),
             Line::styled(title, palette.selected),
-            Line::styled("↕ open n r x t c q", palette.muted),
+            Line::styled("↕ open n r R x t c q", palette.muted),
         ]
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
@@ -975,6 +1038,57 @@ fn render_profile_editor(
     frame.render_widget(form, popup);
 }
 
+fn render_manual_rename(frame: &mut Frame<'_>, area: Rect, editor: &ManualRename, palette: Theme) {
+    let popup = centered_rect(area, if area.width <= 62 { 96 } else { 56 }, 7);
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![Line::styled(
+        format!(" Name  {}", sanitized(&editor.title)),
+        palette.selected,
+    )];
+    if let Some(error) = &editor.error {
+        lines.push(Line::styled(sanitized(error), palette.warning));
+    } else {
+        lines.push(Line::styled("Enter save · Esc cancel", palette.muted));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" rename session ")
+                    .borders(Borders::ALL)
+                    .border_style(palette.accent),
+            )
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn validate_manual_title(title: &str) -> std::result::Result<String, &'static str> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("Name must not be empty");
+    }
+    if title.chars().count() > MAX_MANUAL_TITLE_CHARS {
+        return Err("Name is too long");
+    }
+    if title
+        .chars()
+        .any(|character| character.is_control() || is_unsafe_format_character(character))
+    {
+        return Err("Name contains unsafe control characters");
+    }
+    Ok(title.to_owned())
+}
+
+fn is_unsafe_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{2028}' | '\u{2029}'
+            | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}' | '\u{feff}'
+    )
+}
+
 fn render_theme_picker(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
     let popup = centered_rect(area, if area.width <= 62 { 92 } else { 48 }, 9);
     frame.render_widget(Clear, popup);
@@ -1107,6 +1221,7 @@ mod tests {
             generated_title: None,
             generated_at_unix: None,
             immediate_naming: false,
+            manual_name: false,
             current_path: PathBuf::from(format!("/work/{title}")),
         }
     }

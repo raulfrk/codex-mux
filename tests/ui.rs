@@ -17,6 +17,7 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
         generated_title: None,
         generated_at_unix: None,
         immediate_naming: false,
+        manual_name: false,
         current_path: PathBuf::from(path),
     }
 }
@@ -106,6 +107,61 @@ fn documented_browse_keys_produce_their_actions() {
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Some(Action::Quit));
     assert_eq!(app.handle_key(key(KeyCode::Esc)), Some(Action::Quit));
+}
+
+#[test]
+fn capital_r_renames_only_the_selected_pane_and_cancel_or_invalid_input_do_not_emit_actions() {
+    let mut app = App::new(
+        vec![
+            pane("%19", "shipping feature", "/work/shipping"),
+            pane("%83", "review release", "/work/release"),
+        ],
+        ThemeId::AdaptiveCyan,
+        None,
+    );
+    app.handle_key(key(KeyCode::Char('R')));
+    assert!(rendered_app(&app, 100, 30).contains("rename session"));
+    for _ in 0..32 {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+    assert!(rendered_app(&app, 100, 30).contains("Name must not be empty"));
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(Action::Activate(PaneId::new("%19").unwrap()))
+    );
+
+    app.handle_key(key(KeyCode::Char('R')));
+    for _ in 0..32 {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    for character in "Manual; $(literal)".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(Action::Rename(
+            PaneId::new("%19").unwrap(),
+            "Manual; $(literal)".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn manual_rename_rejects_terminal_control_and_unsafe_format_characters() {
+    let mut app = App::new(
+        vec![pane("%19", "shipping feature", "/work/shipping")],
+        ThemeId::AdaptiveCyan,
+        None,
+    );
+    app.handle_key(key(KeyCode::Char('R')));
+    for _ in 0..32 {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    app.handle_key(key(KeyCode::Char('\u{202e}')));
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+    assert!(rendered_app(&app, 100, 30).contains("unsafe control characters"));
 }
 
 #[test]
@@ -383,7 +439,7 @@ fn tiny_layout_is_deterministic_and_keeps_primary_controls() {
     let second = rendered(32, 8);
     assert_eq!(first, second);
     assert!(first.contains("shipping feature"));
-    assert!(first.contains("n r x t c q"));
+    assert!(first.contains("n r R x t c q"));
 }
 
 #[test]

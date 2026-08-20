@@ -67,7 +67,7 @@ fn packaged_binary_renders_server_wide_rows_rebuilds_and_handles_navigation_size
         (120, 40, "Commands", "Enter open"),
         (89, 35, "Enter switch", "Commands"),
         (62, 35, "Enter open", "Commands"),
-        (32, 10, "n r x t c q", "Commands"),
+        (32, 10, "n r R x t c q", "Commands"),
     ]
     .into_iter()
     .enumerate()
@@ -190,6 +190,64 @@ fn packaged_adaptive_rows_keep_smart_titles_paths_and_selection_useful_at_approv
             "{size:?} activated the wrong selected pane"
         );
     }
+    client.send(b"\x02d");
+}
+
+#[test]
+fn packaged_popup_manual_rename_relinquishes_smart_naming_ownership() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("manual-rename");
+    let project = fixture.scratch.join("manual-project");
+    fs::create_dir(&project).unwrap();
+    let pane = fixture.agent("manual", &project, "manual");
+    fixture.smart_title(&pane, "Generated packaged title");
+    fixture
+        .server
+        .checked(&["set-option", "-p", "-t", &pane, "@codex_mux_name_now", "1"]);
+    let (mut client, tty) = fixture.client("origin", (120, 40), "manual-rename-client");
+    let capture = fixture.scratch.join("manual-rename.log");
+    let mut popup = fixture.popup(&binary, &tty, (120, 40), &capture, None);
+    popup.wait_text("Generated packaged title");
+    popup.send(b"R");
+    popup.wait_text("rename session");
+    let mut input = vec![0x7f; 64];
+    input.extend_from_slice(b"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\r");
+    popup.send(&input);
+    fixture.server.wait("manual pane title", || {
+        fixture
+            .server
+            .checked(&["display-message", "-p", "-t", &pane, "#{pane_title}"])
+            .trim()
+            == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    });
+    popup.send(b"q");
+    assert!(popup.wait_exit().success());
+    for option in [
+        "@codex_mux_generated_thread",
+        "@codex_mux_generated_name",
+        "@codex_mux_generated_source_title",
+        "@codex_mux_generated_source_cwd",
+        "@codex_mux_generated_at",
+        "@codex_mux_name_now",
+    ] {
+        assert!(
+            !fixture
+                .server
+                .run(&["show-options", "-pv", "-t", &pane, option])
+                .status
+                .success(),
+            "packaged manual rename retained generated marker {option}"
+        );
+    }
+    assert_eq!(
+        fixture
+            .server
+            .checked(&["show-options", "-pv", "-t", &pane, "@codex_mux_manual_name",])
+            .trim(),
+        "1"
+    );
     client.send(b"\x02d");
 }
 
