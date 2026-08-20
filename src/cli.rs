@@ -53,6 +53,8 @@ pub struct Cli {
 /// Top-level management commands.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum Command {
+    /// Download, verify, and atomically install a Codex Mux release.
+    Update(UpdateArgs),
     /// Configure tmux plus prompt-aware Bash and Zsh Smart Left.
     Setup(SetupArgs),
     /// Remove owned tmux, Bash, and Zsh configuration blocks.
@@ -68,6 +70,14 @@ pub enum Command {
     /// Internal launcher for the tmux-owned smart-naming daemon.
     #[command(hide = true)]
     SmartNamingStart,
+}
+
+/// Optional exact release selected by the self-update command.
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct UpdateArgs {
+    /// Stable release version; omit to install the latest stable release.
+    #[arg(value_name = "VERSION")]
+    pub version: Option<String>,
 }
 
 /// Standard and explicitly overridden configuration paths for setup.
@@ -214,6 +224,21 @@ mod tests {
         assert_eq!(remove.tmux_config, None);
         assert_eq!(remove.bash_config, None);
         assert_eq!(remove.zsh_config, None);
+    }
+
+    #[test]
+    fn parses_latest_and_exact_update_requests() {
+        let latest = Cli::try_parse_from(["codex-mux", "update"]).unwrap();
+        let Some(Command::Update(latest)) = latest.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(latest.version, None);
+
+        let exact = Cli::try_parse_from(["codex-mux", "update", "v0.5.0"]).unwrap();
+        let Some(Command::Update(exact)) = exact.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(exact.version.as_deref(), Some("v0.5.0"));
     }
 
     #[test]

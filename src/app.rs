@@ -44,6 +44,7 @@ use crate::{
         smart_left::{SmartLeftProbe, SystemSleeper},
     },
     ui::{self, Action, App, ColorPolicy},
+    update::{UpdateOutcome, update},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -150,6 +151,17 @@ pub fn run(cli: Cli) -> Result<()> {
         pane_commands: cli.pane_command.clone(),
     };
     match cli.command.clone() {
+        Some(Command::Update(arguments)) => {
+            match update(arguments.version.as_deref())? {
+                UpdateOutcome::AlreadyCurrent(version) => {
+                    println!("codex-mux {version} is already current");
+                }
+                UpdateOutcome::Installed(version) => {
+                    println!("updated codex-mux to {version}");
+                }
+            }
+            Ok(())
+        }
         Some(Command::Setup(arguments)) => run_setup(arguments, process_arguments),
         Some(Command::Remove(arguments)) => run_remove(arguments),
         Some(Command::Tmux(tmux)) => run_tmux_command(tmux.command, process_arguments),

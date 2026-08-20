@@ -4,6 +4,10 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+### Added
+
+- Add `codex-mux update [VERSION]` with official-release discovery, checksum verification, and atomic in-place replacement.
+
 ## [0.4.0] - 2026-08-20
 
 ### Added

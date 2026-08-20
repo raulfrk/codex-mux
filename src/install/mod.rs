@@ -1166,11 +1166,13 @@ pub(crate) fn atomic_replace_with(
         .as_nanos();
     let temporary = parent.join(format!(".{}.codex-mux.{nonce}.tmp", name.to_string_lossy()));
     let mut committed = false;
+    let mut created = false;
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
+        created = true;
         file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -1181,7 +1183,9 @@ pub(crate) fn atomic_replace_with(
         Ok::<(), io::Error>(())
     })();
     if let Err(source) = result {
-        let _ = fs::remove_file(&temporary);
+        if created {
+            let _ = fs::remove_file(&temporary);
+        }
         return Err(AtomicReplaceFailure {
             error: InstallError::Filesystem {
                 path: path.to_owned(),

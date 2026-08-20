@@ -20,5 +20,6 @@ pub mod smart_naming;
 pub mod theme;
 pub mod tmux;
 pub mod ui;
+pub mod update;
 
 pub use error::{MuxError, Result};

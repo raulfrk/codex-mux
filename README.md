@@ -63,7 +63,17 @@ tar -xzf codex-mux-VERSION-TARGET.tar.gz
 install -m 0755 codex-mux-VERSION-TARGET/codex-mux "$HOME/.local/bin/codex-mux"
 ```
 
-The checksum command must report the selected archive as `OK`. Stop if it fails. Releases currently target glibc-based Linux; building from source requires Rust 1.85 or newer:
+The checksum command must report the selected archive as `OK`. Stop if it fails. Releases currently target glibc-based Linux.
+
+Once Codex Mux is installed, update to the latest stable release with:
+
+```sh
+codex-mux update
+```
+
+Select an exact stable release, including an intentional reinstall or downgrade, with `codex-mux update VERSION`. The command accepts `0.5.0` or `v0.5.0`, downloads only the matching official GitHub release assets, verifies `SHA256SUMS`, and atomically replaces the currently running executable. Existing Codex Mux processes continue running their prior binary; later invocations use the replacement. The updater does not invoke `sudo`, so the containing directory must be writable by the current user.
+
+Building from source requires Rust 1.85 or newer:
 
 ```sh
 cargo build --locked --release
