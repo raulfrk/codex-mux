@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-20
+
 ### Added
 
 - Separate Codex launch, exact wrapper-aware process matching, and Smart Left pane-command configuration while retaining `--codex PATH` compatibility.
