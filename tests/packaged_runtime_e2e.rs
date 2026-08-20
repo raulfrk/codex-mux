@@ -248,6 +248,68 @@ fn packaged_popup_manual_rename_relinquishes_smart_naming_ownership() {
             .trim(),
         "1"
     );
+
+    let unpin_capture = fixture.scratch.join("manual-unpin.log");
+    let mut unpin_popup = fixture.popup(&binary, &tty, (120, 40), &unpin_capture, None);
+    unpin_popup.wait_text("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    unpin_popup.send(b"R");
+    unpin_popup.wait_text("rename session");
+    unpin_popup.send(b"c\r");
+    fixture.server.wait("manual pane unpinned", || {
+        fixture
+            .server
+            .checked(&["display-message", "-p", "-t", &pane, "#{pane_title}"])
+            .trim()
+            == "12345678-1234-1234-1234-123456789abc"
+    });
+    assert!(
+        !fixture
+            .server
+            .run(&["show-options", "-pv", "-t", &pane, "@codex_mux_manual_name"])
+            .status
+            .success(),
+        "unpin retained manual ownership"
+    );
+    unpin_popup.send(b"q");
+    assert!(unpin_popup.wait_exit().success());
+    client.send(b"\x02d");
+}
+
+#[test]
+fn packaged_popup_renames_an_outside_started_codex_session() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("outside-manual-rename");
+    let project = fixture.scratch.join("outside-manual-project");
+    fs::create_dir(&project).unwrap();
+    let pane = fixture.agent("outside", &project, "outside");
+    fixture.title(&pane, "Outside Codex session");
+    let (mut client, tty) = fixture.client("origin", (120, 40), "outside-manual-client");
+    let capture = fixture.scratch.join("outside-manual-rename.log");
+    let mut popup = fixture.popup(&binary, &tty, (120, 40), &capture, None);
+    popup.wait_text("Outside Codex session");
+    popup.send(b"R");
+    popup.wait_text("rename session");
+    let mut input = vec![0x7f; 64];
+    input.extend_from_slice(b"Pinned outside session\r");
+    popup.send(&input);
+    fixture.server.wait("outside manual pane title", || {
+        fixture
+            .server
+            .checked(&["display-message", "-p", "-t", &pane, "#{pane_title}"])
+            .trim()
+            == "Pinned outside session"
+    });
+    popup.send(b"q");
+    assert!(popup.wait_exit().success());
+    assert_eq!(
+        fixture
+            .server
+            .checked(&["show-options", "-pv", "-t", &pane, "@codex_mux_manual_name"])
+            .trim(),
+        "1"
+    );
     client.send(b"\x02d");
 }
 
@@ -499,6 +561,37 @@ fn installed_smart_left_moves_then_opens_the_extracted_binary_at_the_boundary() 
     assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 6);
     client.send(b"q");
     fixture.server.wait("packaged Smart Left cleanup", || {
+        smart_left_inactive(&fixture.server, &fixture.origin_pane)
+    });
+    client.send(b"\x02d");
+}
+
+#[test]
+fn installed_smart_left_opens_at_the_composer_prompt_glyph() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("smart-left-prompt-glyph");
+    fixture.install_smart_left(&binary);
+    let output = fixture
+        .server
+        .command()
+        .args(["respawn-pane", "-k", "-t", &fixture.origin_pane, "--"])
+        .arg(&fixture.codex)
+        .arg("smart-left-prompt")
+        .output()
+        .unwrap();
+    assert_success(&output, "start packaged prompt-glyph composer fixture");
+    fixture.server.wait("prompt glyph cursor", || {
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 4
+    });
+
+    let (mut client, _tty) = fixture.client("origin", (100, 32), "prompt-glyph-client");
+    client.send(b"\x1b[D");
+    client.wait_text("sessions");
+    assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 4);
+    client.send(b"q");
+    fixture.server.wait("prompt glyph Smart Left cleanup", || {
         smart_left_inactive(&fixture.server, &fixture.origin_pane)
     });
     client.send(b"\x02d");
@@ -1003,12 +1096,13 @@ fn fake_codex(scratch: &Scratch) -> PathBuf {
         r#"
 use std::{env, fs::OpenOptions, io::{Read, Write}, process::Command, thread, time::Duration};
 
-fn run_smart_left_fixture() {
+fn run_smart_left_fixture(prompt_glyph_cursor: bool) {
     assert!(Command::new("stty").args(["raw", "-echo"]).status().unwrap().success());
     let mut output = std::io::stdout().lock();
     let mut input = std::io::stdin().lock();
-    let mut cursor = 3usize;
-    write!(output, "\x1b[2J\x1b[H    › abc\x1b[1;{}H", cursor + 7).unwrap();
+    let mut cursor: u16 = if prompt_glyph_cursor { 0 } else { 3 };
+    let offset = if prompt_glyph_cursor { 5 } else { 7 };
+    write!(output, "\x1b[2J\x1b[H    › abc\x1b[1;{}H", cursor + offset).unwrap();
     output.flush().unwrap();
     let mut byte = [0_u8; 1];
     loop {
@@ -1018,7 +1112,7 @@ fn run_smart_left_fixture() {
         input.read_exact(&mut tail).unwrap();
         if tail == *b"[D" {
             cursor = cursor.saturating_sub(1);
-            write!(output, "\x1b[1;{}H", cursor + 7).unwrap();
+            write!(output, "\x1b[1;{}H", cursor + offset).unwrap();
             output.flush().unwrap();
         }
     }
@@ -1032,9 +1126,9 @@ fn main() {
         writeln!(log, "arg{index}={argument}").unwrap();
     }
     writeln!(log, "---").unwrap();
-    if env::args().nth(1).as_deref() == Some("smart-left") {
+    if matches!(env::args().nth(1).as_deref(), Some("smart-left") | Some("smart-left-prompt")) {
         drop(log);
-        run_smart_left_fixture();
+        run_smart_left_fixture(env::args().nth(1).as_deref() == Some("smart-left-prompt"));
     }
     thread::sleep(Duration::from_secs(300));
 }

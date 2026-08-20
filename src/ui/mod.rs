@@ -136,19 +136,33 @@ struct ManualRename {
     error: Option<String>,
     untouched: bool,
     can_unpin: bool,
+    unpin_unavailable_reason: Option<&'static str>,
 }
 
 impl ManualRename {
     fn for_pane(pane: &Pane) -> Self {
+        let unpin_unavailable_reason = if !pane.manual_name {
+            None
+        } else if pane
+            .manual_name_source
+            .as_deref()
+            .is_none_or(|source| crate::smart_naming::thread_hint(source).is_none())
+        {
+            Some("unpin unavailable: source not retained")
+        } else if pane.manual_name_pid != Some(pane.pane_pid)
+            || pane.manual_name_session.as_ref() != Some(&pane.session_id)
+        {
+            Some("unpin unavailable: the pane process or session changed")
+        } else {
+            None
+        };
         Self {
             pane_id: pane.id.clone(),
             title: pane.display_title(),
             error: None,
             untouched: true,
-            can_unpin: pane.manual_name
-                && pane.manual_name_source.is_some()
-                && pane.manual_name_pid == Some(pane.pane_pid)
-                && pane.manual_name_session.as_ref() == Some(&pane.session_id),
+            can_unpin: pane.manual_name && unpin_unavailable_reason.is_none(),
+            unpin_unavailable_reason,
         }
     }
 }
@@ -1060,7 +1074,15 @@ fn render_profile_editor(
 }
 
 fn render_manual_rename(frame: &mut Frame<'_>, area: Rect, editor: &ManualRename, palette: Theme) {
-    let popup = centered_rect(area, if area.width <= 62 { 96 } else { 56 }, 7);
+    let popup = centered_rect(
+        area,
+        if area.width <= 62 { 96 } else { 56 },
+        if editor.error.is_some() || editor.unpin_unavailable_reason.is_some() {
+            8
+        } else {
+            7
+        },
+    );
     frame.render_widget(Clear, popup);
     let mut lines = vec![Line::styled(
         format!(" Name  {}", sanitized(&editor.title)),
@@ -1075,6 +1097,9 @@ fn render_manual_rename(frame: &mut Frame<'_>, area: Rect, editor: &ManualRename
             "c clear · Enter save · Esc cancel"
         };
         lines.push(Line::styled(help, palette.muted));
+        if let Some(reason) = editor.unpin_unavailable_reason {
+            lines.push(Line::styled(reason, palette.warning));
+        }
     }
     frame.render_widget(
         Paragraph::new(lines)

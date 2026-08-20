@@ -300,6 +300,88 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
 }
 
 #[test]
+fn manual_pane_rename_accepts_an_outside_codex_title_refresh() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("manual-pane-external-title-refresh");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane_id = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    let pane_pid = server
+        .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_pid}"])
+        .trim()
+        .parse()
+        .unwrap();
+    let session_id = server
+        .checked(&["display-message", "-p", "-t", &pane_id, "#{session_id}"])
+        .trim()
+        .to_owned();
+    server.checked(&[
+        "select-pane",
+        "-t",
+        &pane_id,
+        "-T",
+        "12345678-1234-1234-1234-123456789abc",
+    ]);
+    let pane = Pane {
+        id: PaneId::new(&pane_id).unwrap(),
+        session_id: SessionId::new(session_id).unwrap(),
+        title: Some("12345678-1234-1234-1234-123456789abc".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+        manual_name: false,
+        manual_name_source: None,
+        manual_name_pid: None,
+        manual_name_session: None,
+        pane_pid,
+        current_path: scratch.path().to_owned(),
+    };
+
+    // Codex owns this terminal title. An outside-launched session may redraw it
+    // while the popup is open, without changing the pane process or session.
+    server.checked(&[
+        "select-pane",
+        "-t",
+        &pane_id,
+        "-T",
+        "Codex refreshed its terminal title",
+    ]);
+    TmuxActions::new(
+        &SocketRunner(server.socket().to_owned()),
+        &CodexExecutable::new("/bin/true").unwrap(),
+    )
+    .rename_pane(&pane, "Manual external session")
+    .unwrap();
+
+    assert_eq!(
+        server
+            .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_title}"])
+            .trim(),
+        "Manual external session"
+    );
+    assert!(
+        !server
+            .run(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_manual_name_source",
+            ])
+            .status
+            .success(),
+        "a title redraw must not retain a stale thread as an unpin source"
+    );
+}
+
+#[test]
 fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
     let _serial = serial_tmux_test();
     if !tools_available() {

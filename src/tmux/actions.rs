@@ -169,33 +169,26 @@ where
             "1",
         ]));
         if let Some(source) = source {
-            arguments.push(OsString::from(";"));
-            arguments.extend(os_strings([
-                "set-option",
-                "-p",
-                "-t",
-                pane.id.as_str(),
-                MANUAL_NAME_SOURCE_OPTION,
-            ]));
-            arguments.push(OsString::from(source));
-            arguments.push(OsString::from(";"));
-            arguments.extend(os_strings([
-                "set-option",
-                "-p",
-                "-t",
-                pane.id.as_str(),
-                MANUAL_NAME_PID_OPTION,
-            ]));
-            arguments.push(OsString::from(pane.pane_pid.to_string()));
-            arguments.push(OsString::from(";"));
-            arguments.extend(os_strings([
-                "set-option",
-                "-p",
-                "-t",
-                pane.id.as_str(),
-                MANUAL_NAME_SESSION_OPTION,
-            ]));
-            arguments.push(OsString::from(pane.session_id.as_str()));
+            let source_mutation = retained_source_mutation(pane, source);
+            if pane.manual_name {
+                arguments.push(OsString::from(";"));
+                arguments.extend(retained_source_arguments(pane, source));
+            } else {
+                // An external Codex instance can redraw its terminal title while the
+                // popup is open. Keep the manual rename, but retain an unpin source
+                // only when that live title still proves the original thread.
+                let source_condition =
+                    format!("#{{==:#{{pane_title}},{}}}", tmux_format_literal(source));
+                arguments.push(OsString::from(";"));
+                arguments.extend(os_strings([
+                    "if-shell",
+                    "-F",
+                    "-t",
+                    pane.id.as_str(),
+                    &source_condition,
+                    &source_mutation,
+                ]));
+            }
         }
         arguments.push(OsString::from(";"));
         arguments.extend(os_strings(["select-pane", "-t", pane.id.as_str(), "-T"]));
@@ -438,6 +431,47 @@ fn tmux_title_literal(title: &str) -> String {
     literal
 }
 
+fn retained_source_mutation(pane: &Pane, source: &str) -> String {
+    format!(
+        "set-option -p -t {pane} {source_option} {source}; set-option -p -t {pane} {pid_option} {pid}; set-option -p -t {pane} {session_option} {session}",
+        pane = tmux_quote(pane.id.as_str()),
+        source_option = MANUAL_NAME_SOURCE_OPTION,
+        source = tmux_quote(source),
+        pid_option = MANUAL_NAME_PID_OPTION,
+        pid = pane.pane_pid,
+        session_option = MANUAL_NAME_SESSION_OPTION,
+        session = tmux_quote(pane.session_id.as_str()),
+    )
+}
+
+fn retained_source_arguments(pane: &Pane, source: &str) -> Vec<OsString> {
+    let mut arguments = os_strings([
+        "set-option",
+        "-p",
+        "-t",
+        pane.id.as_str(),
+        MANUAL_NAME_SOURCE_OPTION,
+    ]);
+    arguments.push(OsString::from(source));
+    arguments.push(OsString::from(";"));
+    arguments.extend(os_strings([
+        "set-option",
+        "-p",
+        "-t",
+        pane.id.as_str(),
+        MANUAL_NAME_PID_OPTION,
+        &pane.pane_pid.to_string(),
+        ";",
+        "set-option",
+        "-p",
+        "-t",
+        pane.id.as_str(),
+        MANUAL_NAME_SESSION_OPTION,
+        pane.session_id.as_str(),
+    ]));
+    arguments
+}
+
 fn unpin_condition(
     pane: &Pane,
     source: &str,
@@ -483,10 +517,6 @@ fn rename_condition(pane: &Pane) -> String {
         format!(
             "#{{==:#{{session_id}},{}}}",
             tmux_format_literal(pane.session_id.as_str())
-        ),
-        format!(
-            "#{{==:#{{pane_title}},{}}}",
-            tmux_format_literal(pane.title.as_deref().unwrap_or_default())
         ),
     ];
     if pane.manual_name {

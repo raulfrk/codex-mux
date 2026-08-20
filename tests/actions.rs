@@ -419,6 +419,14 @@ fn manual_rename_clears_generated_metadata_and_passes_title_as_literal_argument(
                 .contains(option)
         );
     }
+    assert!(
+        !commands[0]
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .contains("pane_title"),
+        "a process-owned pane title must not reject an otherwise live pane"
+    );
 }
 
 #[test]

@@ -51,6 +51,13 @@ enum SmartLeftTarget {
     Shell,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerBoundary {
+    Exact,
+    RowRejected,
+    CursorRejected,
+}
+
 /// Injectable delay boundary for deterministic probe tests.
 pub trait ProbeSleeper {
     /// Waits between rendered-cursor observations.
@@ -271,7 +278,17 @@ where
 
         let boundary_is_exact = match target {
             SmartLeftTarget::Codex => {
-                self.cursor_is_on_composer_prompt(context, initial.cursor_x, initial.cursor_y)
+                match self.composer_boundary(context, initial.cursor_x, initial.cursor_y) {
+                    ComposerBoundary::Exact => true,
+                    ComposerBoundary::RowRejected => {
+                        self.event("composer_row_rejected");
+                        false
+                    }
+                    ComposerBoundary::CursorRejected => {
+                        self.event("composer_cursor_rejected");
+                        false
+                    }
+                }
             }
             // Shell prompts may occupy any number of columns. An unchanged
             // immediate post-key observation proves the editing boundary.
@@ -279,7 +296,6 @@ where
         };
         self.send_left(context)?;
         if !boundary_is_exact {
-            self.event("composer_shape_rejected");
             return Ok(SmartLeftOutcome::Forwarded);
         }
 
@@ -346,12 +362,12 @@ where
         Ok(())
     }
 
-    fn cursor_is_on_composer_prompt(
+    fn composer_boundary(
         &self,
         context: &InvocationContext,
         cursor_x: u16,
         cursor_y: u16,
-    ) -> bool {
+    ) -> ComposerBoundary {
         let output = self.run_checked(os_strings([
             "capture-pane",
             "-p",
@@ -359,15 +375,15 @@ where
             context.pane_id.as_str(),
         ]));
         let Ok(output) = output else {
-            return false;
+            return ComposerBoundary::RowRejected;
         };
         let Ok(screen) = std::str::from_utf8(&output.stdout) else {
-            return false;
+            return ComposerBoundary::RowRejected;
         };
         screen
             .lines()
             .nth(usize::from(cursor_y))
-            .is_some_and(|line| {
+            .map_or(ComposerBoundary::RowRejected, |line| {
                 let indentation = line.len() - line.trim_start_matches(' ').len();
                 let line = &line[indentation..];
                 let prompt_width = if line == "›" {
@@ -375,9 +391,14 @@ where
                 } else if line.starts_with("› ") {
                     2
                 } else {
-                    return false;
+                    return ComposerBoundary::RowRejected;
                 };
-                usize::from(cursor_x) == indentation + prompt_width
+                let cursor_x = usize::from(cursor_x);
+                if cursor_x == indentation || cursor_x == indentation + prompt_width {
+                    ComposerBoundary::Exact
+                } else {
+                    ComposerBoundary::CursorRejected
+                }
             })
     }
 
@@ -828,6 +849,37 @@ mod tests {
         ]);
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false
+                },
+                &sleeper,
+                &codex
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Opened
+        );
+    }
+
+    #[test]
+    fn indented_composer_prompt_glyph_boundary_opens_popup() {
+        let mut screen = [""; 11];
+        screen[10] = "    › draft";
+        let runner = Runner::with([
+            state(4, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output([]),
+            state(4, 10, true, false),
+            output(b"/dev/pts/7\x1f120\x1f40\n"),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
         assert_eq!(
             probe(
                 &runner,

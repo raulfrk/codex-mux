@@ -183,6 +183,38 @@ fn rename_prompt_initial_c_clears_and_empty_enter_unpins_without_a_global_key() 
 }
 
 #[test]
+fn rename_prompt_explains_when_an_older_manual_name_cannot_be_safely_unpinned() {
+    let mut selected = pane("%21", "Pinned", "/work/legacy");
+    selected.manual_name = true;
+    let mut app = App::new(vec![selected], ThemeId::AdaptiveCyan, None);
+    app.handle_key(key(KeyCode::Char('R')));
+    let rendered = rendered_app(&app, 100, 30);
+    assert!(rendered.contains("unpin unavailable: source not retained"));
+    app.handle_key(key(KeyCode::Char('c')));
+    assert_ne!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(Action::Unpin(PaneId::new("%21").unwrap()))
+    );
+}
+
+#[test]
+fn rename_prompt_refuses_to_offer_unpin_for_an_invalid_retained_source() {
+    let mut selected = pane("%22", "Pinned", "/work/corrupt");
+    selected.manual_name = true;
+    selected.manual_name_source = Some("not a Codex thread".to_owned());
+    selected.manual_name_pid = Some(selected.pane_pid);
+    selected.manual_name_session = Some(selected.session_id.clone());
+    let mut app = App::new(vec![selected], ThemeId::AdaptiveCyan, None);
+    app.handle_key(key(KeyCode::Char('R')));
+    assert!(rendered_app(&app, 100, 30).contains("unpin unavailable: source not retained"));
+    app.handle_key(key(KeyCode::Char('c')));
+    assert_ne!(
+        app.handle_key(key(KeyCode::Enter)),
+        Some(Action::Unpin(PaneId::new("%22").unwrap()))
+    );
+}
+
+#[test]
 fn manual_rename_rejects_terminal_control_and_unsafe_format_characters() {
     let mut app = App::new(
         vec![pane("%19", "shipping feature", "/work/shipping")],

@@ -4,6 +4,13 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-20
+
+### Fixed
+
+- Let Manual Rename save sessions whose Codex-owned terminal title redraws while the popup is open; retain an unpin source only when that thread identity is still proven, and explain when unpin is unavailable.
+- Recognize both no-op Codex composer boundaries used by Ultra/Max reasoning layouts while keeping Smart Left's exact process and post-Left safety fences.
+
 ## [0.9.0] - 2026-08-20
 
 ### Added
