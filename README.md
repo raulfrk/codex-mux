@@ -20,6 +20,24 @@ codex-mux remove
 
 The zero-argument commands discover one safe tmux entrypoint and use `$HOME/.bashrc` plus `${ZDOTDIR:-$HOME}/.zshrc`. Use `--tmux-config`, `--bash-config`, or `--zsh-config` when those locations differ, and global `--codex /absolute/path` when Codex is not discoverable on `PATH`.
 
+### Launcher wrappers
+
+When the command used to start Codex differs from the foreground process that tmux exposes, configure the identities separately:
+
+```toml
+[process]
+launch_executable = "/opt/codex/bin/codex-launcher"
+match_executables = [
+  "/opt/codex/bin/codex-launcher",
+  "/opt/codex/runtime/codex",
+]
+pane_commands = ["codex"]
+```
+
+The table belongs in `${XDG_CONFIG_HOME:-$HOME/.config}/codex-mux/config.toml`. Every path must be absolute and executable. `launch_executable` alone starts new sessions and the Smart Naming app-server; matching an underlying binary never changes what is launched. Discovery accepts exact native executable paths and exact interpreted-script paths found in process arguments, including foreground descendants. Smart Left uses the same matcher after its exact `pane_current_command` prefilter.
+
+The equivalent one-shot overrides are `--launch-executable PATH`, repeatable `--match-executable PATH`, and repeatable `--pane-command COMMAND`. `--codex PATH` remains the compatible shorthand for all three legacy values: launch and match use `PATH`, while the pane command is derived from its file name.
+
 ## Requirements
 
 - Linux on `x86_64` or `aarch64`
@@ -158,15 +176,15 @@ codex-mux --codex "$(command -v codex)" tmux status --config "$HOME/.tmux.conf"
 codex-mux tmux uninstall --config "$HOME/.tmux.conf"
 ```
 
-`status` is read-only and reports the configured key, Smart Left state, both executable paths, and drift. `uninstall` removes only the marked block and unbinds the recorded prefix key and owned Smart Left key from a running server; it does not delete the host tmux file or theme preference.
+`status` is read-only and reports the configured key, Smart Left state, launch executable, every match executable and pane command, and drift. `uninstall` removes only the marked block and unbinds the recorded prefix key and owned Smart Left key from a running server; it does not delete the host tmux file or theme preference.
 
 ## Troubleshooting
 
-- **No panes appear:** confirm Codex is running in tmux, and pass the exact absolute Codex executable used by those processes. Wrapper scripts must retain an identity that can be verified through `/proc`.
+- **No panes appear:** confirm Codex is running in tmux and list the exact absolute launcher script and/or underlying executable in `match_executables`. Interpreted scripts must remain visible as an exact command-line path in `/proc`.
 - **Configuration discovery is ambiguous:** pass `--config` with the exact host-owned tmux entrypoint. `codex-mux` intentionally does not guess among multiple files.
 - **Status reports drift:** re-run `tmux install` with the intended `--codex`, binary location, key, and config path.
 - **The key does nothing:** run `tmux list-keys -T prefix KEY`, inspect `tmux status`, and verify the configured binary still exists and is executable.
-- **Smart Left stays an ordinary Left:** run `tmux list-keys -T root Left`, confirm `tmux status` reports `smart-left: enabled`, and use the directly configured Codex executable rather than a wrapper. The feature intentionally fails through when process or cursor identity is uncertain.
+- **Smart Left stays an ordinary Left:** run `tmux list-keys -T root Left`, confirm `tmux status` reports `smart-left: enabled`, and verify both the exact process path and `pane_current_command` are configured. The feature intentionally fails through when process or cursor identity is uncertain.
 - **A phone shows a large layout:** make sure the binding was invoked by that phone's tmux client; the popup uses `client_width` and `client_height` from the invoking client.
 - **Colors are unreadable:** set `NO_COLOR=1` or select the monochrome theme.
 - **Another client saw the selected window change:** clients sharing one tmux session also share that session's active window and window zoom state. Attach the clients to separate sessions when independent views are required.

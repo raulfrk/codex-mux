@@ -8,7 +8,10 @@ use std::{
 };
 
 use codex_mux::{
-    config::{LaunchProfile, PermissionPreset, XdgThemeStore, validate_profiles},
+    config::{
+        LaunchProfile, PermissionPreset, ProcessSettings, XdgThemeStore, validate_process_settings,
+        validate_profiles,
+    },
     domain::{ThemeId, ThemeStore},
     theme::theme,
 };
@@ -69,8 +72,36 @@ fn legacy_theme_only_config_receives_default_profiles() {
     );
     assert!(preference.warning.is_none());
     assert!(!preference.smart_naming);
+    assert!(preference.process.is_none());
 
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn process_configuration_requires_executable_absolute_paths_and_exact_commands() {
+    let root = temporary_config("process-validation");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    let launcher = root.parent().unwrap().join("launcher");
+    let underlying = root.parent().unwrap().join("codex");
+    for executable in [&launcher, &underlying] {
+        fs::write(executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+    let valid = ProcessSettings {
+        launch_executable: launcher,
+        match_executables: vec![underlying],
+        pane_commands: vec!["codex".to_owned()],
+    };
+    validate_process_settings(&valid).unwrap();
+    let mut invalid = valid.clone();
+    invalid.match_executables.clear();
+    assert!(validate_process_settings(&invalid).is_err());
+    invalid = valid.clone();
+    invalid.pane_commands = vec!["codex; echo injected".to_owned()];
+    assert!(validate_process_settings(&invalid).is_err());
+    fs::remove_dir_all(root.parent().unwrap()).unwrap();
 }
 
 #[test]

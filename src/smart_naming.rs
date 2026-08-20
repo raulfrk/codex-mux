@@ -68,8 +68,7 @@ impl AppServerProcess {
 
     /// Starts app-server with a cancellation flag owned by its worker.
     pub fn spawn_with_cancel(codex: &Path, cancelled: Arc<AtomicBool>) -> Result<Self> {
-        let mut child = Command::new(codex)
-            .args(["app-server", "--listen", "stdio://"])
+        let mut child = app_server_command(codex)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -210,6 +209,12 @@ impl AppServerProcess {
             }
         }
     }
+}
+
+fn app_server_command(codex: &Path) -> Command {
+    let mut command = Command::new(codex);
+    command.args(["app-server", "--listen", "stdio://"]);
+    command
 }
 
 fn forward_app_server_message(
@@ -919,7 +924,23 @@ fn protocol(message: &str) -> MuxError {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
-    use std::io::Cursor;
+    use std::{ffi::OsStr, io::Cursor};
+
+    #[test]
+    fn app_server_uses_the_configured_launch_executable() {
+        let launcher = Path::new("/opt/codex/bin/codex-launcher");
+        let command = app_server_command(launcher);
+
+        assert_eq!(command.get_program(), launcher.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("app-server"),
+                OsStr::new("--listen"),
+                OsStr::new("stdio://"),
+            ]
+        );
+    }
 
     #[test]
     fn fatal_frame_marks_transport_unhealthy_before_delivery() {

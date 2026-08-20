@@ -21,6 +21,9 @@ pub const END_MARKER: &str = "# <<< codex-mux <<<";
 const KEY_FIELD: &str = "# codex-mux-key: ";
 const BINARY_FIELD: &str = "# codex-mux-binary: ";
 const CODEX_FIELD: &str = "# codex-executable: ";
+const LAUNCH_FIELD: &str = "# codex-launch-executable: ";
+const MATCH_FIELD: &str = "# codex-match-executable: ";
+const PANE_COMMAND_FIELD: &str = "# codex-pane-command: ";
 const SMART_LEFT_FIELD: &str = "# codex-mux-smart-left: ";
 const LEADING_NEWLINE_FIELD: &str = "# codex-mux-owned-leading-newline: ";
 
@@ -183,12 +186,47 @@ pub struct ExecutablePaths {
     pub mux: PathBuf,
     /// Configured Codex executable.
     pub codex: PathBuf,
+    /// Exact executable or script paths recognized during discovery.
+    pub match_executables: Vec<PathBuf>,
+    /// Exact tmux pane commands accepted by Smart Left.
+    pub pane_commands: Vec<String>,
+    /// Whether generated invocations retain the legacy `--codex` shorthand.
+    pub legacy_shorthand: bool,
 }
 
 impl ExecutablePaths {
     /// Validates that both executable references are absolute, non-empty paths.
     pub fn new(mux: PathBuf, codex: PathBuf) -> InstallResult<Self> {
-        for (field, path) in [("codex-mux executable", &mux), ("Codex executable", &codex)] {
+        let pane_command = codex
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        Self::with_process(mux, codex.clone(), vec![codex], vec![pane_command], true)
+    }
+
+    /// Validates complete launch and process-detection metadata.
+    pub fn with_process(
+        mux: PathBuf,
+        codex: PathBuf,
+        match_executables: Vec<PathBuf>,
+        pane_commands: Vec<String>,
+        legacy_shorthand: bool,
+    ) -> InstallResult<Self> {
+        if match_executables.is_empty() || pane_commands.is_empty() {
+            return Err(InstallError::InvalidValue {
+                field: "process configuration",
+                reason: "match executables and pane commands must be non-empty".to_owned(),
+            });
+        }
+        for (field, path) in std::iter::once(("codex-mux executable", &mux))
+            .chain(std::iter::once(("Codex launch executable", &codex)))
+            .chain(
+                match_executables
+                    .iter()
+                    .map(|path| ("Codex match executable", path)),
+            )
+        {
             if path.as_os_str().is_empty() || !path.is_absolute() {
                 return Err(InstallError::InvalidValue {
                     field,
@@ -220,7 +258,21 @@ impl ExecutablePaths {
                 });
             }
         }
-        Ok(Self { mux, codex })
+        for command in &pane_commands {
+            if command.is_empty() || command.chars().any(char::is_control) {
+                return Err(InstallError::InvalidValue {
+                    field: "Codex pane command",
+                    reason: "must be non-empty and contain no control characters".to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            mux,
+            codex,
+            match_executables,
+            pane_commands,
+            legacy_shorthand,
+        })
     }
 }
 
@@ -426,6 +478,10 @@ pub struct InstallStatus {
     pub mux: Option<PathBuf>,
     /// Recorded Codex executable path.
     pub codex: Option<PathBuf>,
+    /// Installed exact process match paths.
+    pub match_executables: Vec<PathBuf>,
+    /// Installed exact Smart Left prefilter commands.
+    pub pane_commands: Vec<String>,
     /// Whether the owned root-table Smart Left binding is enabled.
     pub smart_left: bool,
     /// Human-readable path mismatches.
@@ -443,6 +499,8 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
             key: None,
             mux: None,
             codex: None,
+            match_executables: Vec::new(),
+            pane_commands: Vec::new(),
             smart_left: false,
             drift: Vec::new(),
         });
@@ -451,7 +509,27 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
         .map_err(|_| InstallError::Markers("owned block is not valid UTF-8".to_owned()))?;
     let key = field(block, KEY_FIELD).map(ToOwned::to_owned);
     let mux = field(block, BINARY_FIELD).map(PathBuf::from);
-    let codex = field(block, CODEX_FIELD).map(PathBuf::from);
+    let legacy_codex = field(block, CODEX_FIELD).map(PathBuf::from);
+    let codex = field(block, LAUNCH_FIELD)
+        .map(PathBuf::from)
+        .or_else(|| legacy_codex.clone());
+    let mut match_executables = fields(block, MATCH_FIELD)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if match_executables.is_empty() {
+        match_executables.extend(legacy_codex.clone());
+    }
+    let mut pane_commands = fields(block, PANE_COMMAND_FIELD);
+    if pane_commands.is_empty() {
+        pane_commands.extend(
+            legacy_codex
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned),
+        );
+    }
     let smart_left = parse_smart_left(field(block, SMART_LEFT_FIELD))?;
     let mut drift = Vec::new();
     if mux.as_deref() != Some(expected.mux.as_path()) {
@@ -471,12 +549,28 @@ pub fn status(path: &Path, expected: &ExecutablePaths) -> InstallResult<InstallS
             expected.codex.display()
         ));
     }
+    if match_executables != expected.match_executables {
+        drift.push(format!(
+            "Codex match executables: installed={} resolved={}",
+            display_paths(&match_executables),
+            display_paths(&expected.match_executables)
+        ));
+    }
+    if pane_commands != expected.pane_commands {
+        drift.push(format!(
+            "Codex pane commands: installed={} resolved={}",
+            pane_commands.join(","),
+            expected.pane_commands.join(",")
+        ));
+    }
     Ok(InstallStatus {
         path: path.to_owned(),
         installed: true,
         key,
         mux,
         codex,
+        match_executables,
+        pane_commands,
         smart_left,
         drift,
     })
@@ -620,10 +714,9 @@ fn render_block(
     executables: &ExecutablePaths,
     owned_leading_newline: bool,
 ) -> String {
-    let command = [
-        shell_word(&executables.mux),
-        "--codex".to_owned(),
-        shell_word(&executables.codex),
+    let mut command = vec![shell_word(&executables.mux)];
+    command.extend(process_arguments(executables));
+    command.extend([
         "--client".to_owned(),
         shell_format("client_tty"),
         "--invoking-pane".to_owned(),
@@ -632,8 +725,8 @@ fn render_block(
         shell_format("session_id"),
         "--invoking-path".to_owned(),
         shell_format("pane_current_path"),
-    ]
-    .join(" ");
+    ]);
+    let command = command.join(" ");
     let command = tmux_word(&command);
     let compact = "#{||:#{<:#{client_width},90},#{<:#{client_height},28}}";
     let width = format!("#{{?{compact},100%,80%}}");
@@ -646,23 +739,28 @@ fn render_block(
     } else {
         String::new()
     };
+    let matches = executables
+        .match_executables
+        .iter()
+        .map(|path| format!("{MATCH_FIELD}{}\n", path.display()))
+        .collect::<String>();
+    let pane_commands = executables
+        .pane_commands
+        .iter()
+        .map(|command| format!("{PANE_COMMAND_FIELD}{command}\n"))
+        .collect::<String>();
     format!(
-        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{SMART_LEFT_FIELD}{smart_left}\nbind-key {key} run-shell -C {popup}\n{smart_binding}{END_MARKER}\n",
+        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{LAUNCH_FIELD}{}\n{matches}{pane_commands}{SMART_LEFT_FIELD}{smart_left}\nbind-key {key} run-shell -C {popup}\n{smart_binding}{END_MARKER}\n",
         executables.mux.display(),
+        executables.codex.display(),
         executables.codex.display(),
     )
 }
 
 fn render_smart_left_binding(executables: &ExecutablePaths) -> String {
-    let command_name = executables
-        .codex
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("validated Smart Left executable name");
-    let probe = [
-        shell_word(&executables.mux),
-        "--codex".to_owned(),
-        shell_word(&executables.codex),
+    let mut probe = vec![shell_word(&executables.mux)];
+    probe.extend(process_arguments(executables));
+    probe.extend([
         "--client".to_owned(),
         shell_format("client_tty"),
         "--invoking-pane".to_owned(),
@@ -672,8 +770,8 @@ fn render_smart_left_binding(executables: &ExecutablePaths) -> String {
         "--invoking-path".to_owned(),
         shell_format("pane_current_path"),
         "smart-left".to_owned(),
-    ]
-    .join(" ");
+    ]);
+    let probe = probe.join(" ");
     let fallback = format!("tmux send-keys -t {} Left", shell_format("pane_id"));
     let cleanup = format!(
         "tmux set-option -pu -t {} @codex_mux_smart_left_active",
@@ -688,13 +786,37 @@ fn render_smart_left_binding(executables: &ExecutablePaths) -> String {
         "#{||:#{==:#{pane_current_command},bash},#{==:#{pane_current_command},zsh}}";
     let shell_is_at_prompt =
         format!("#{{&&:{command_is_shell},#{{==:#{{@codex_mux_shell_prompt}},1}}}}");
-    let eligible =
-        format!("#{{||:#{{==:#{{pane_current_command}},{command_name}}},{shell_is_at_prompt}}}");
+    let command_matches = executables
+        .pane_commands
+        .iter()
+        .map(|command| format!("#{{==:#{{pane_current_command}},{command}}}"))
+        .reduce(|left, right| format!("#{{||:{left},{right}}}"))
+        .expect("validated non-empty pane commands");
+    let eligible = format!("#{{||:{command_matches},{shell_is_at_prompt}}}");
     let condition = format!("#{{&&:{eligible},#{{!=:#{{@codex_mux_smart_left_active}},1}}}}");
     format!(
         "bind-key -T root Left if-shell -F '{condition}' {{\n  set-option -p @codex_mux_smart_left_active 1\n  run-shell -b {}\n}} {{\n  send-keys Left\n}}\n",
         tmux_word(&shell)
     )
+}
+
+fn process_arguments(executables: &ExecutablePaths) -> Vec<String> {
+    if executables.legacy_shorthand {
+        return vec!["--codex".to_owned(), shell_word(&executables.codex)];
+    }
+    let mut arguments = vec![
+        "--launch-executable".to_owned(),
+        shell_word(&executables.codex),
+    ];
+    for executable in &executables.match_executables {
+        arguments.push("--match-executable".to_owned());
+        arguments.push(shell_word(executable));
+    }
+    for command in &executables.pane_commands {
+        arguments.push("--pane-command".to_owned());
+        arguments.push(command.clone());
+    }
+    arguments
 }
 
 pub(crate) fn smart_left_owner(path: &Path) -> String {
@@ -731,20 +853,14 @@ fn parse_smart_left(value: Option<&str>) -> InstallResult<bool> {
 }
 
 fn validate_smart_left_executable(executables: &ExecutablePaths) -> InstallResult<()> {
-    let Some(name) = executables.codex.file_name().and_then(|name| name.to_str()) else {
-        return Err(InstallError::InvalidValue {
-            field: "Smart Left Codex executable",
-            reason: "must have a UTF-8 file name".to_owned(),
-        });
-    };
-    if name.is_empty()
-        || !name
+    if executables.pane_commands.iter().any(|command| {
+        !command
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
-    {
+    }) {
         return Err(InstallError::InvalidValue {
-            field: "Smart Left Codex executable",
-            reason: "file name must contain only ASCII letters, digits, dot, underscore, plus, or hyphen"
+            field: "Smart Left pane command",
+            reason: "must contain only ASCII letters, digits, dot, underscore, plus, or hyphen"
                 .to_owned(),
         });
     }
@@ -920,6 +1036,22 @@ fn tmux_word(value: &str) -> String {
 
 fn field<'a>(block: &'a str, prefix: &str) -> Option<&'a str> {
     block.lines().find_map(|line| line.strip_prefix(prefix))
+}
+
+fn fields(block: &str, prefix: &str) -> Vec<String> {
+    block
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(crate) fn read(path: &Path) -> InstallResult<Vec<u8>> {

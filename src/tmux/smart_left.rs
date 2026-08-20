@@ -34,7 +34,7 @@ pub trait DirectCodexInspector {
 
 impl DirectCodexInspector for LinuxProcessInspector {
     fn is_direct_codex(&self, pid: u32) -> Result<bool> {
-        self.foreground_process_is_exact(pid)
+        self.foreground_process_matches(pid)
     }
 
     fn is_direct_shell(&self, pid: u32, command: &str) -> Result<bool> {
@@ -89,6 +89,8 @@ pub struct SmartLeftProbe<'a, Runner, Inspector, Sleeper> {
     sleeper: &'a Sleeper,
     mux: &'a Path,
     codex: &'a CodexExecutable,
+    pane_commands: &'a [String],
+    match_executables: &'a [CodexExecutable],
 }
 
 impl<'a, Runner, Inspector, Sleeper> SmartLeftProbe<'a, Runner, Inspector, Sleeper>
@@ -112,6 +114,30 @@ where
             sleeper,
             mux,
             codex,
+            pane_commands: &[],
+            match_executables: &[],
+        }
+    }
+
+    /// Creates a probe with the exact configured tmux command prefilter values.
+    #[must_use]
+    pub const fn with_pane_commands(
+        runner: &'a Runner,
+        inspector: &'a Inspector,
+        sleeper: &'a Sleeper,
+        mux: &'a Path,
+        codex: &'a CodexExecutable,
+        pane_commands: &'a [String],
+        match_executables: &'a [CodexExecutable],
+    ) -> Self {
+        Self {
+            runner,
+            inspector,
+            sleeper,
+            mux,
+            codex,
+            pane_commands,
+            match_executables,
         }
     }
 
@@ -119,10 +145,16 @@ where
     pub fn run(&self, context: &InvocationContext) -> Result<SmartLeftOutcome> {
         let initial = match self.read_state(context) {
             Ok(state) if state.cursor_visible && !state.pane_in_mode => {
-                let target = if self
-                    .inspector
-                    .is_direct_codex(state.pane_pid)
-                    .unwrap_or(false)
+                let pane_command_allowed = self.pane_commands.is_empty()
+                    || self
+                        .pane_commands
+                        .iter()
+                        .any(|command| command == &state.pane_command);
+                let target = if pane_command_allowed
+                    && self
+                        .inspector
+                        .is_direct_codex(state.pane_pid)
+                        .unwrap_or(false)
                 {
                     Some(SmartLeftTarget::Codex)
                 } else if state.shell_prompt
@@ -262,10 +294,31 @@ where
         let compact = width < 90 || height < 28;
         let popup_width = if compact { "100%" } else { "80%" };
         let popup_height = if compact { "100%" } else { "70%" };
-        let command = [
-            shell_literal(self.mux.as_os_str().to_string_lossy().as_ref()),
-            "--codex".to_owned(),
-            shell_literal(self.codex.as_path().as_os_str().to_string_lossy().as_ref()),
+        let mut command = vec![shell_literal(
+            self.mux.as_os_str().to_string_lossy().as_ref(),
+        )];
+        if self.match_executables.is_empty() {
+            command.extend([
+                "--codex".to_owned(),
+                shell_literal(self.codex.as_path().as_os_str().to_string_lossy().as_ref()),
+            ]);
+        } else {
+            command.extend([
+                "--launch-executable".to_owned(),
+                shell_literal(self.codex.as_path().as_os_str().to_string_lossy().as_ref()),
+            ]);
+            for executable in self.match_executables {
+                command.push("--match-executable".to_owned());
+                command.push(shell_literal(
+                    executable.as_path().as_os_str().to_string_lossy().as_ref(),
+                ));
+            }
+            for pane_command in self.pane_commands {
+                command.push("--pane-command".to_owned());
+                command.push(shell_literal(pane_command));
+            }
+        }
+        command.extend([
             "--client".to_owned(),
             shell_literal(context.client_id.as_str()),
             "--invoking-pane".to_owned(),
@@ -274,8 +327,8 @@ where
             shell_literal(context.session_id.as_str()),
             "--invoking-path".to_owned(),
             shell_literal(context.current_path.as_os_str().to_string_lossy().as_ref()),
-        ]
-        .join(" ");
+        ]);
+        let command = command.join(" ");
         self.run_checked(vec![
             OsString::from("display-popup"),
             OsString::from("-E"),
@@ -780,6 +833,47 @@ mod tests {
                 SmartLeftOutcome::Forwarded
             );
             assert_eq!(runner.calls.borrow().len(), 2);
+        }
+    }
+
+    #[test]
+    fn configured_pane_command_prefilter_controls_wrapper_aware_probe() {
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+        for (pane_commands, expected) in [
+            (vec!["other".to_owned()], SmartLeftOutcome::Forwarded),
+            (vec!["codex".to_owned()], SmartLeftOutcome::Opened),
+        ] {
+            let mut screen = [""; 11];
+            screen[10] = "› draft";
+            let outputs = if expected == SmartLeftOutcome::Opened {
+                vec![
+                    state(2, 10, true, false),
+                    output(format!("{}\n", screen.join("\n")).into_bytes()),
+                    output([]),
+                    state(2, 10, true, false),
+                    output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+                    output([]),
+                ]
+            } else {
+                vec![state(2, 10, true, false), output([])]
+            };
+            let runner = Runner::with(outputs);
+            let sleeper = Sleeper::default();
+            let matches = vec![codex.clone()];
+            let inspector = Inspector {
+                codex: true,
+                shell: false,
+            };
+            let probe = SmartLeftProbe::with_pane_commands(
+                &runner,
+                &inspector,
+                &sleeper,
+                std::path::Path::new("/opt/codex-mux"),
+                &codex,
+                &pane_commands,
+                &matches,
+            );
+            assert_eq!(probe.run(&context()).unwrap(), expected);
         }
     }
 

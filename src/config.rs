@@ -35,7 +35,7 @@ pub struct LaunchProfile {
     pub name: String,
     /// One-character key used after entering new-session mode.
     pub key: char,
-    /// Optional executable override; `None` uses the CLI-configured Codex binary.
+    /// Legacy profile executable retained as an additional discovery identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
     /// Permission behavior for this profile.
@@ -84,6 +84,20 @@ pub struct ThemePreference {
     pub profiles: Vec<LaunchProfile>,
     /// Whether conversation-aware Luna naming is explicitly enabled.
     pub smart_naming: bool,
+    /// Explicit process launch and discovery configuration, when configured.
+    pub process: Option<ProcessSettings>,
+}
+
+/// Persisted separation between launching Codex and recognizing its processes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSettings {
+    /// Executable used for every new Codex and app-server process.
+    pub launch_executable: PathBuf,
+    /// Executable or interpreted-script paths accepted during discovery.
+    pub match_executables: Vec<PathBuf>,
+    /// Exact tmux `pane_current_command` values accepted by Smart Left.
+    pub pane_commands: Vec<String>,
 }
 
 impl ThemePreference {
@@ -115,6 +129,8 @@ struct ConfigFile {
     profiles: Vec<LaunchProfile>,
     #[serde(default)]
     smart_naming: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process: Option<ProcessSettings>,
 }
 
 /// Filesystem-backed theme store using an XDG configuration path.
@@ -159,6 +175,7 @@ impl XdgThemeStore {
                 was_saved: true,
                 profiles: config.profiles,
                 smart_naming: config.smart_naming,
+                process: config.process,
             },
             Ok(None) => ThemePreference {
                 selected: ThemeId::default(),
@@ -166,6 +183,7 @@ impl XdgThemeStore {
                 was_saved: false,
                 profiles: default_profiles(),
                 smart_naming: false,
+                process: None,
             },
             Err(error) => ThemePreference {
                 selected: ThemeId::default(),
@@ -177,6 +195,7 @@ impl XdgThemeStore {
                 was_saved: false,
                 profiles: default_profiles(),
                 smart_naming: false,
+                process: None,
             },
         }
     }
@@ -185,6 +204,9 @@ impl XdgThemeStore {
         let config = self.load_parsed_config()?;
         if let Some(config) = &config {
             validate_profiles(&config.profiles)?;
+            if let Some(process) = &config.process {
+                validate_process_settings(process)?;
+            }
         }
         Ok(config)
     }
@@ -213,8 +235,9 @@ impl XdgThemeStore {
         let theme = config
             .as_ref()
             .map_or_else(ThemeId::default, |config| config.theme);
-        let smart_naming = config.is_some_and(|config| config.smart_naming);
-        self.save_atomic(theme, profiles, smart_naming)
+        let smart_naming = config.as_ref().is_some_and(|config| config.smart_naming);
+        let process = config.and_then(|config| config.process);
+        self.save_atomic(theme, profiles, smart_naming, process)
     }
 
     /// Atomically persists the explicit conversation-aware naming preference.
@@ -225,7 +248,24 @@ impl XdgThemeStore {
             .as_ref()
             .map_or_else(ThemeId::default, |value| value.theme);
         let profiles = config.map_or_else(default_profiles, |value| value.profiles);
-        self.save_atomic(theme, &profiles, enabled)
+        let process = self.load_parsed_config()?.and_then(|value| value.process);
+        self.save_atomic(theme, &profiles, enabled, process)
+    }
+
+    /// Atomically persists process launch/detection settings without changing
+    /// theme, profiles, or Smart Naming.
+    pub fn save_process(&self, process: ProcessSettings) -> Result<()> {
+        validate_process_settings(&process)?;
+        let _lock = self.lock_parent()?;
+        let config = self.load_config()?;
+        let theme = config
+            .as_ref()
+            .map_or_else(ThemeId::default, |value| value.theme);
+        let profiles = config
+            .as_ref()
+            .map_or_else(default_profiles, |value| value.profiles.clone());
+        let smart_naming = config.as_ref().is_some_and(|value| value.smart_naming);
+        self.save_atomic(theme, &profiles, smart_naming, Some(process))
     }
 
     fn lock_parent(&self) -> Result<ConfigLock> {
@@ -255,6 +295,7 @@ impl XdgThemeStore {
         theme: ThemeId,
         profiles: &[LaunchProfile],
         smart_naming: bool,
+        process: Option<ProcessSettings>,
     ) -> Result<()> {
         let parent = self.path.parent().ok_or_else(|| MuxError::InvalidValue {
             field: "theme configuration path",
@@ -269,6 +310,7 @@ impl XdgThemeStore {
             theme,
             profiles: profiles.to_vec(),
             smart_naming,
+            process,
         })
         .map_err(|error| {
             MuxError::Command(format!("could not serialize configuration: {error}"))
@@ -341,8 +383,9 @@ impl ThemeStore for XdgThemeStore {
         let _lock = self.lock_parent()?;
         let profiles = self.load_config()?;
         let smart_naming = profiles.as_ref().is_some_and(|config| config.smart_naming);
+        let process = profiles.as_ref().and_then(|config| config.process.clone());
         let profiles = profiles.map_or_else(default_profiles, |config| config.profiles);
-        self.save_atomic(theme, &profiles, smart_naming)
+        self.save_atomic(theme, &profiles, smart_naming, process)
     }
 }
 
@@ -400,6 +443,59 @@ pub fn validate_profiles(profiles: &[LaunchProfile]) -> Result<()> {
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Validates persisted process paths and exact tmux command names.
+pub fn validate_process_settings(settings: &ProcessSettings) -> Result<()> {
+    validate_executable_path(&settings.launch_executable, "process launch executable")?;
+    if settings.match_executables.is_empty() {
+        return Err(MuxError::InvalidValue {
+            field: "process match executables",
+            message: "must contain at least one executable".to_owned(),
+        });
+    }
+    for path in &settings.match_executables {
+        validate_executable_path(path, "process match executable")?;
+    }
+    if settings.pane_commands.is_empty() {
+        return Err(MuxError::InvalidValue {
+            field: "process pane commands",
+            message: "must contain at least one command".to_owned(),
+        });
+    }
+    for command in &settings.pane_commands {
+        if command.is_empty()
+            || !command
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
+        {
+            return Err(MuxError::InvalidValue {
+                field: "process pane command",
+                message: format!("{command:?} must be one exact safe command name"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_executable_path(path: &Path, field: &'static str) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(MuxError::InvalidValue {
+            field,
+            message: "must be an absolute path".to_owned(),
+        });
+    }
+    let metadata = fs::metadata(path).map_err(|source| MuxError::Filesystem {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(MuxError::InvalidValue {
+            field,
+            message: format!("{} is not executable", path.display()),
+        });
     }
     Ok(())
 }

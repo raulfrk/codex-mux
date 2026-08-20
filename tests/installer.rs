@@ -134,7 +134,7 @@ fn paths_are_quoted_and_status_reports_drift_without_writing() {
     let report = status(&config, &expected).unwrap();
     assert!(report.installed);
     assert_eq!(report.key.as_deref(), Some("C-a"));
-    assert_eq!(report.drift.len(), 2);
+    assert_eq!(report.drift.len(), 3);
     assert!(!report.smart_left);
     assert_eq!(fs::read(&config).unwrap(), before);
 }

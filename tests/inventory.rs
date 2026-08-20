@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -15,7 +15,7 @@ use codex_mux::{
     MuxError, Result,
     domain::{CodexExecutable, CommandOutput, ProcessInspector, TmuxCommandRunner},
     linux_process::LinuxProcessInspector,
-    tmux::{inventory::PaneInventory, runner::SystemTmuxRunner},
+    tmux::{inventory::PaneInventory, runner::SystemTmuxRunner, smart_left::DirectCodexInspector},
 };
 
 const SEPARATOR: u8 = 0x1f;
@@ -231,7 +231,7 @@ fn basename_fallback_requires_canonical_file_identity() {
     let inventory = PaneInventory::new(
         FakeRunner::returning(row),
         processes,
-        CodexExecutable::new(configured).unwrap(),
+        CodexExecutable::new(&configured).unwrap(),
     );
 
     let panes = inventory.discover().unwrap();
@@ -305,7 +305,42 @@ fn proc_group_wrapper_requires_absolute_configured_path_evidence() {
         inspector.foreground_executable(10).unwrap(),
         Some(configured)
     );
+    assert!(inspector.foreground_process_matches(10).unwrap());
     assert!(!inspector.foreground_process_is_exact(10).unwrap());
+}
+
+#[test]
+fn launcher_and_differently_located_underlying_binary_share_the_matcher() {
+    let root = TemporaryDirectory::new("proc-launcher-underlying");
+    let launcher = root.path().join("launch/codex-launcher");
+    let underlying = root.path().join("runtime/codex");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    fs::create_dir_all(underlying.parent().unwrap()).unwrap();
+    fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+    fs::write(&underlying, b"binary").unwrap();
+    write_process(root.path(), 10, 10, 34816, 20, "/bin/sh", &["/bin/sh"]);
+    write_process(
+        root.path(),
+        20,
+        20,
+        34816,
+        20,
+        underlying.to_str().unwrap(),
+        &[underlying.to_str().unwrap()],
+    );
+    let launcher_executable = CodexExecutable::new(launcher).unwrap();
+    let underlying_executable = CodexExecutable::new(&underlying).unwrap();
+    let inspector = LinuxProcessInspector::with_proc_root_and_executables(
+        launcher_executable.clone(),
+        vec![launcher_executable, underlying_executable],
+        root.path(),
+    );
+
+    assert_eq!(
+        inspector.foreground_executable(10).unwrap(),
+        Some(underlying)
+    );
+    assert!(inspector.foreground_process_matches(10).unwrap());
 }
 
 #[test]
@@ -586,6 +621,34 @@ fn unrelated_process_with_codex_as_data_is_not_a_wrapper_match() {
 }
 
 #[test]
+fn unrelated_same_basename_interpreter_cannot_match_a_launcher_argument() {
+    let root = TemporaryDirectory::new("proc-fake-interpreter");
+    let configured = root.path().join("codex-launcher");
+    let fake_bash = root.path().join("bash");
+    fs::write(&configured, b"#!/bin/sh\n").unwrap();
+    fs::write(&fake_bash, b"unrelated").unwrap();
+    write_process(
+        root.path(),
+        10,
+        10,
+        34816,
+        10,
+        fake_bash.to_str().unwrap(),
+        &[fake_bash.to_str().unwrap(), configured.to_str().unwrap()],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new(&configured).unwrap(),
+        root.path(),
+    );
+
+    assert_ne!(
+        inspector.foreground_executable(10).unwrap(),
+        Some(configured.clone())
+    );
+    assert!(!inspector.foreground_process_matches(10).unwrap());
+}
+
+#[test]
 fn exact_configured_pane_matches_without_a_foreground_process_group() {
     let root = TemporaryDirectory::new("proc-detached-direct");
     let configured = root.path().join("bin/codex-custom");
@@ -760,6 +823,80 @@ fn disposable_tmux_server_smoke_discovers_a_foreground_process() {
     drop(server);
 }
 
+#[test]
+fn real_tmux_recognizes_foreground_script_and_spawned_underlying_binary() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux is unavailable; skipping real-wrapper integration test");
+        return;
+    }
+    for underlying_mode in [false, true] {
+        let root = TemporaryDirectory::new(if underlying_mode {
+            "real-underlying-wrapper"
+        } else {
+            "real-foreground-wrapper"
+        });
+        let launcher = root.path().join("codex-launcher");
+        let underlying = root.path().join("runtime-codex");
+        if underlying_mode {
+            fs::copy("/usr/bin/sleep", &underlying).unwrap();
+            fs::write(
+                &launcher,
+                format!("#!/bin/sh\nexec '{}' 30\n", underlying.display()),
+            )
+            .unwrap();
+        } else {
+            fs::write(&launcher, b"#!/bin/sh\nsleep 30\n").unwrap();
+        }
+        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&launcher, permissions).unwrap();
+
+        let socket = format!(
+            "codex-mux-real-wrapper-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let server = TmuxServer::start_command(&socket, &format!("exec '{}'", launcher.display()));
+        let pane_pid = Command::new("tmux")
+            .args(["-L", &socket, "list-panes", "-a", "-F", "#{pane_pid}"])
+            .output()
+            .unwrap();
+        let pane_pid = String::from_utf8(pane_pid.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let launcher_executable = CodexExecutable::new(&launcher).unwrap();
+        let mut matches = vec![launcher_executable.clone()];
+        if underlying_mode {
+            matches.push(CodexExecutable::new(&underlying).unwrap());
+        }
+        let inspector = LinuxProcessInspector::matching_executables(matches.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !inspector.foreground_process_matches(pane_pid).unwrap() {
+            assert!(Instant::now() < deadline, "real wrapper never matched");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            DirectCodexInspector::is_direct_codex(&inspector, pane_pid).unwrap(),
+            "Smart Left process boundary rejected a wrapper accepted by inventory"
+        );
+        let inventory = PaneInventory::with_executables(
+            PrefixedRunner {
+                inner: SystemTmuxRunner::default(),
+                socket: socket.clone(),
+            },
+            LinuxProcessInspector::matching_executables(matches.clone()),
+            matches,
+        );
+        assert_eq!(inventory.discover().unwrap().len(), 1);
+        drop(server);
+    }
+}
+
 struct PrefixedRunner {
     inner: SystemTmuxRunner,
     socket: String,
@@ -777,6 +914,10 @@ struct TmuxServer(String);
 
 impl TmuxServer {
     fn start(socket: &str) -> Self {
+        Self::start_command(socket, "exec /usr/bin/sleep 30")
+    }
+
+    fn start_command(socket: &str, command: &str) -> Self {
         let output = Command::new("tmux")
             .args([
                 "-L",
@@ -787,7 +928,7 @@ impl TmuxServer {
                 "-d",
                 "-s",
                 "inventory-smoke",
-                "exec /usr/bin/sleep 30",
+                command,
             ])
             .output()
             .unwrap();

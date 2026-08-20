@@ -17,6 +17,18 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub codex: Option<PathBuf>,
 
+    /// Absolute executable used only to launch Codex and its app-server.
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "codex")]
+    pub launch_executable: Option<PathBuf>,
+
+    /// Absolute executable or interpreted-script path accepted during discovery.
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "codex")]
+    pub match_executable: Vec<PathBuf>,
+
+    /// Exact tmux pane_current_command value accepted by Smart Left.
+    #[arg(long, global = true, value_name = "COMMAND", conflicts_with = "codex")]
+    pub pane_command: Vec<String>,
+
     /// Exact tmux client that opened the popup.
     #[arg(long, value_name = "CLIENT")]
     pub client: Option<String>,

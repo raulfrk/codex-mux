@@ -19,7 +19,6 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct LinuxProcessInspector {
     proc_root: PathBuf,
-    codex: CodexExecutable,
     recognized: Vec<CodexExecutable>,
 }
 
@@ -36,7 +35,6 @@ impl LinuxProcessInspector {
         Self {
             proc_root: proc_root.into(),
             recognized: vec![codex.clone()],
-            codex,
         }
     }
 
@@ -46,32 +44,77 @@ impl LinuxProcessInspector {
         Self::with_proc_root_and_executables(codex, recognized, "/proc")
     }
 
+    /// Creates a host inspector accepting every exact configured process identity.
+    #[must_use]
+    pub fn matching_executables(recognized: Vec<CodexExecutable>) -> Self {
+        let primary = recognized
+            .first()
+            .cloned()
+            .expect("validated non-empty matches");
+        Self::with_proc_root_and_executables(primary, recognized, "/proc")
+    }
+
     /// Creates a multi-executable inspector with an alternate procfs root for tests.
     #[must_use]
     pub fn with_proc_root_and_executables(
-        codex: CodexExecutable,
+        _codex: CodexExecutable,
         recognized: Vec<CodexExecutable>,
         proc_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             proc_root: proc_root.into(),
-            codex,
             recognized,
         }
     }
 
-    /// Returns whether the pane's foreground process group contains the exact
-    /// configured Codex executable.
-    ///
-    /// Unlike inventory discovery, this deliberately excludes wrappers. Smart
-    /// Left uses it to keep its prefixless interception fail-closed while still
-    /// supporting the normal case where tmux's pane PID is the parent shell.
+    /// Returns whether the pane foreground matches any configured exact binary
+    /// or interpreted-script identity using the same matcher as inventory.
+    pub fn foreground_process_matches(&self, pane_pid: u32) -> Result<bool> {
+        self.inspect(pane_pid)
+            .map(|matched| {
+                matched.is_some_and(|path| {
+                    self.recognized
+                        .iter()
+                        .any(|executable| same_file(&path, executable.as_path()))
+                })
+            })
+            .map_err(|source| MuxError::Filesystem {
+                path: self.proc_root.clone(),
+                source,
+            })
+    }
+
+    /// Legacy exact-binary probe retained for API compatibility.
     pub fn foreground_process_is_exact(&self, pane_pid: u32) -> Result<bool> {
         self.foreground_contains_exact(pane_pid)
             .map_err(|source| MuxError::Filesystem {
                 path: self.proc_root.clone(),
                 source,
             })
+    }
+
+    fn foreground_contains_exact(&self, pane_pid: u32) -> std::io::Result<bool> {
+        let Some(pane) = self.read_process(pane_pid)? else {
+            return Ok(false);
+        };
+        if self.exact_recognized_match(&pane).is_some() {
+            return Ok(true);
+        }
+        if pane.tty_nr == 0 || pane.tpgid <= 0 {
+            return Ok(false);
+        }
+        for process in self.process_snapshot()? {
+            if process.pgrp == pane.tpgid
+                && process.tty_nr == pane.tty_nr
+                && self.exact_recognized_match(&process).is_some()
+            {
+                let Some(current) = self.read_process(pane_pid)? else {
+                    return Ok(false);
+                };
+                return Ok(same_foreground_snapshot(&pane, &current));
+            }
+        }
+        Ok(false)
     }
 
     /// Returns whether the pane process itself is an exact foreground Bash or
@@ -111,53 +154,18 @@ impl LinuxProcessInspector {
             && current.arguments == pane.arguments)
     }
 
-    fn foreground_contains_exact(&self, pane_pid: u32) -> std::io::Result<bool> {
-        let Some(pane) = self.read_process(pane_pid)? else {
-            return Ok(false);
-        };
-        if self.is_exact_configured_executable(&pane) {
-            return Ok(true);
-        }
-        if pane.tty_nr == 0 || pane.tpgid <= 0 {
-            return Ok(false);
-        }
-
-        for entry in fs::read_dir(&self.proc_root)? {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse().ok())
-            else {
-                continue;
-            };
-            let process = match self.read_process(pid) {
-                Ok(Some(process)) => process,
-                Ok(None) | Err(_) => continue,
-            };
-            if process.pgrp == pane.tpgid
-                && process.tty_nr == pane.tty_nr
-                && self.is_exact_configured_executable(&process)
-            {
-                let Some(current_pane) = self.read_process(pane_pid)? else {
-                    return Ok(false);
-                };
-                return Ok(same_foreground_snapshot(&pane, &current_pane));
-            }
-        }
-        Ok(false)
-    }
-
     fn inspect(&self, pane_pid: u32) -> std::io::Result<Option<PathBuf>> {
         let pane = match self.read_process(pane_pid)? {
             Some(process) => process,
             None => return Ok(None),
         };
         if let Some(executable) = self.exact_recognized_match(&pane) {
-            return Ok(Some(executable.as_path().to_owned()));
+            let Some(current) = self.read_process(pane_pid)? else {
+                return Ok(None);
+            };
+            return Ok(
+                same_process_evidence(&pane, &current).then(|| executable.as_path().to_owned())
+            );
         }
         if pane.tty_nr == 0 || pane.tpgid <= 0 {
             return Ok(None);
@@ -191,7 +199,15 @@ impl LinuxProcessInspector {
         // configured absolute launcher path.
         for candidate in &candidates {
             if let Some(executable) = self.recognized_match(candidate) {
-                return Ok(Some(executable.as_path().to_owned()));
+                let Some(current_candidate) = self.read_process(candidate.pid)? else {
+                    return Ok(None);
+                };
+                let Some(current_pane) = self.read_process(pane_pid)? else {
+                    return Ok(None);
+                };
+                return Ok((same_process_evidence(candidate, &current_candidate)
+                    && same_foreground_snapshot(&pane, &current_pane))
+                .then(|| executable.as_path().to_owned()));
             }
         }
 
@@ -254,7 +270,11 @@ impl LinuxProcessInspector {
                 if let Some(executable) =
                     self.exact_recognized_match_cached(&pane, &recognized_paths)
                 {
-                    return Ok(Some(executable.as_path().to_owned()));
+                    let Some(current) = self.read_process(pane.pid)? else {
+                        return Ok(None);
+                    };
+                    return Ok(same_process_evidence(&pane, &current)
+                        .then(|| executable.as_path().to_owned()));
                 }
                 if pane.tty_nr == 0 || pane.tpgid <= 0 {
                     return Ok(None);
@@ -267,21 +287,33 @@ impl LinuxProcessInspector {
                     .unwrap_or_default();
                 let matched = candidates
                     .iter()
-                    .find_map(|process| self.recognized_match_cached(process, &recognized_paths))
-                    .map(|executable| executable.as_path().to_owned())
+                    .find_map(|process| {
+                        self.recognized_match_cached(process, &recognized_paths)
+                            .map(|executable| (process, executable.as_path().to_owned()))
+                    })
                     .or_else(|| {
                         candidates
                             .iter()
                             .filter(|process| i64::from(process.pid) == pane.tpgid)
-                            .find_map(|process| process.executable.clone())
+                            .find_map(|process| {
+                                process
+                                    .executable
+                                    .clone()
+                                    .map(|executable| (process, executable))
+                            })
                     });
-                let Some(matched) = matched else {
+                let Some((matched_process, matched)) = matched else {
                     return Ok(None);
                 };
                 let Some(current) = self.read_process(pane.pid)? else {
                     return Ok(None);
                 };
-                Ok(same_foreground_snapshot(&pane, &current).then_some(matched))
+                let Some(current_match) = self.read_process(matched_process.pid)? else {
+                    return Ok(None);
+                };
+                Ok((same_foreground_snapshot(&pane, &current)
+                    && same_process_evidence(matched_process, &current_match))
+                .then_some(matched))
             })
             .collect()
     }
@@ -299,8 +331,8 @@ impl LinuxProcessInspector {
                 process
                     .executable
                     .as_deref()
-                    .filter(|path| is_wrapper(path))
-                    .and_then(|_| process.arguments.get(1))
+                    .filter(|path| is_trusted_interpreter(path))
+                    .and_then(|path| interpreted_script_argument(path, &process.arguments))
                     .map(Path::new)
                     .and_then(|path| self.configured_match(path, recognized_paths))
             })
@@ -363,10 +395,17 @@ impl LinuxProcessInspector {
                 .executable
                 .as_deref()
                 .is_some_and(|path| same_file(path, executable.as_path()))
-                || (process.executable.as_deref().is_some_and(is_wrapper)
-                    && process.arguments.get(1).is_some_and(|argument| {
-                        same_file(Path::new(argument), executable.as_path())
-                    }))
+                || (process
+                    .executable
+                    .as_deref()
+                    .is_some_and(is_trusted_interpreter)
+                    && process
+                        .executable
+                        .as_deref()
+                        .and_then(|path| interpreted_script_argument(path, &process.arguments))
+                        .is_some_and(|argument| {
+                            same_file(Path::new(argument), executable.as_path())
+                        }))
         })
     }
 
@@ -375,13 +414,6 @@ impl LinuxProcessInspector {
         self.recognized
             .iter()
             .find(|executable| same_file(actual, executable.as_path()))
-    }
-
-    fn is_exact_configured_executable(&self, process: &ProcessEvidence) -> bool {
-        process
-            .executable
-            .as_deref()
-            .is_some_and(|path| same_file(path, self.codex.as_path()))
     }
 
     fn read_process(&self, pid: u32) -> std::io::Result<Option<ProcessEvidence>> {
@@ -487,6 +519,16 @@ fn same_foreground_snapshot(initial: &ProcessEvidence, current: &ProcessEvidence
         && current.tpgid > 0
 }
 
+fn same_process_evidence(initial: &ProcessEvidence, current: &ProcessEvidence) -> bool {
+    initial.pid == current.pid
+        && initial.pgrp == current.pgrp
+        && initial.tty_nr == current.tty_nr
+        && initial.tpgid == current.tpgid
+        && initial.start_time == current.start_time
+        && initial.executable == current.executable
+        && initial.arguments == current.arguments
+}
+
 fn interactive_shell_arguments(arguments: &[OsString], command: &str) -> bool {
     let Some(argv_zero) = arguments.first().and_then(|argument| argument.to_str()) else {
         return false;
@@ -565,13 +607,47 @@ fn same_file(candidate: &Path, configured: &Path) -> bool {
         )
 }
 
-fn is_wrapper(executable: &Path) -> bool {
-    executable.file_name().is_some_and(|name| {
-        [
-            "env", "sh", "bash", "dash", "zsh", "node", "nodejs", "bun", "deno",
-        ]
-        .iter()
-        .any(|wrapper| name == *wrapper)
+fn is_trusted_interpreter(executable: &Path) -> bool {
+    let Some(name) = executable.file_name() else {
+        return false;
+    };
+    let known_name = [
+        "env", "sh", "bash", "dash", "zsh", "node", "nodejs", "bun", "deno",
+    ]
+    .iter()
+    .any(|wrapper| name == *wrapper);
+    if !known_name {
+        return false;
+    }
+    ["/usr/bin", "/bin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(name))
+        .chain(
+            env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+                .map(|directory| directory.join(name)),
+        )
+        .any(|candidate| candidate.is_file() && same_file(&candidate, executable))
+}
+
+fn interpreted_script_argument<'a>(
+    executable: &Path,
+    arguments: &'a [OsString],
+) -> Option<&'a OsString> {
+    let name = executable.file_name()?.to_str()?;
+    let mut candidates = arguments.iter().skip(1);
+    if name == "env" {
+        return candidates.find(|argument| {
+            argument
+                .to_str()
+                .is_some_and(|value| !value.starts_with('-') && !value.contains('='))
+        });
+    }
+    candidates.find(|argument| {
+        argument
+            .to_str()
+            .is_some_and(|value| !value.starts_with('-'))
     })
 }
 

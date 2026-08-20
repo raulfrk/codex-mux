@@ -20,7 +20,10 @@ use crossterm::event::{self, Event};
 use crate::{
     MuxError, Result,
     cli::{Cli, Command, ConfigPathArgs, InstallArgs, RemoveArgs, SetupArgs, TmuxCommand},
-    config::{PermissionPreset, XdgThemeStore, no_color_requested},
+    config::{
+        PermissionPreset, ProcessSettings, ThemePreference, XdgThemeStore, no_color_requested,
+        validate_process_settings,
+    },
     domain::{
         ClientId, CodexExecutable, InvocationContext, PaneId, SessionId, ThemeStore,
         TmuxCommandRunner,
@@ -45,6 +48,22 @@ use crate::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Debug)]
+struct ProcessArguments {
+    codex: Option<PathBuf>,
+    launch_executable: Option<PathBuf>,
+    match_executables: Vec<PathBuf>,
+    pane_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedProcessConfig {
+    launch: CodexExecutable,
+    matches: Vec<CodexExecutable>,
+    pane_commands: Vec<String>,
+    legacy_shorthand: bool,
+}
 
 struct RefreshSnapshot {
     generation: u64,
@@ -124,29 +143,77 @@ impl Drop for PaneRefreshWorker {
 
 /// Runs the parsed command and writes management results to standard output.
 pub fn run(cli: Cli) -> Result<()> {
-    let codex_argument = cli.codex.clone();
+    let process_arguments = ProcessArguments {
+        codex: cli.codex.clone(),
+        launch_executable: cli.launch_executable.clone(),
+        match_executables: cli.match_executable.clone(),
+        pane_commands: cli.pane_command.clone(),
+    };
     match cli.command.clone() {
-        Some(Command::Setup(arguments)) => run_setup(arguments, codex_argument),
+        Some(Command::Setup(arguments)) => run_setup(arguments, process_arguments),
         Some(Command::Remove(arguments)) => run_remove(arguments),
-        Some(Command::Tmux(tmux)) => run_tmux_command(tmux.command, codex_argument),
-        Some(Command::SmartLeft) => run_smart_left(&cli, codex_argument),
-        Some(Command::SmartNamingWorker) => run_smart_naming_worker(codex_argument),
-        Some(Command::SmartNamingStart) => ensure_naming_daemon(&resolve_codex(codex_argument)?),
-        None => run_interactive(cli, codex_argument),
+        Some(Command::Tmux(tmux)) => run_tmux_command(tmux.command, process_arguments),
+        Some(Command::SmartLeft) => run_smart_left(&cli, &process_arguments),
+        Some(Command::SmartNamingWorker) => run_smart_naming_worker(&process_arguments),
+        Some(Command::SmartNamingStart) => {
+            let preference = process_preference(&process_arguments)?;
+            ensure_naming_daemon(&resolve_process(&process_arguments, preference.as_ref())?)
+        }
+        None => run_interactive(cli, &process_arguments),
     }
 }
 
-fn run_setup(arguments: SetupArgs, codex_argument: Option<PathBuf>) -> Result<()> {
+fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Result<()> {
     let home = home_directory()?;
     let tmux_path = resolve_config(arguments.tmux_config)?;
     let shell_paths = shell_paths(&home, arguments.bash_config, arguments.zsh_config)?;
     validate_distinct_config_targets(&tmux_path, &shell_paths)?;
-    let executables = executable_paths(codex_argument)?;
+    let persist_process = process_arguments.launch_executable.is_some()
+        || !process_arguments.match_executables.is_empty()
+        || !process_arguments.pane_commands.is_empty();
+    let preference_required = process_preference_required(&process_arguments);
+    let store = (persist_process || preference_required)
+        .then(XdgThemeStore::discover)
+        .transpose()?;
+    let preference = if preference_required {
+        Some(store.as_ref().expect("store required").load_preference())
+    } else {
+        None
+    };
+    let process = resolve_process(&process_arguments, preference.as_ref())?;
+    let executables = executable_paths(&process)?;
     let mut reloader = SystemTmuxReloader::for_path(&tmux_path)?;
     let tmux_snapshot = ConfigSnapshot::read(&tmux_path)?;
-    let mut shells =
-        ShellTransaction::prepare_install(shell_paths.clone()).map_err(install_error)?;
-    let shell_outcomes = shells.apply().map_err(install_error)?;
+    let process_snapshot = if persist_process {
+        let store = store.as_ref().expect("store required");
+        let snapshot = PreferenceSnapshot::read(store.path())?;
+        store.save_process(ProcessSettings {
+            launch_executable: process.launch.as_path().to_owned(),
+            match_executables: process
+                .matches
+                .iter()
+                .map(|executable| executable.as_path().to_owned())
+                .collect(),
+            pane_commands: process.pane_commands.clone(),
+        })?;
+        Some(snapshot)
+    } else {
+        None
+    };
+    let mut shells = match ShellTransaction::prepare_install(shell_paths.clone()) {
+        Ok(shells) => shells,
+        Err(error) => {
+            restore_process_snapshot(process_snapshot.as_ref())?;
+            return Err(install_error(error));
+        }
+    };
+    let shell_outcomes = match shells.apply() {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            restore_process_snapshot(process_snapshot.as_ref())?;
+            return Err(install_error(error));
+        }
+    };
     let tmux_outcome = match install_with_options(
         &tmux_path,
         &arguments.key,
@@ -156,7 +223,10 @@ fn run_setup(arguments: SetupArgs, codex_argument: Option<PathBuf>) -> Result<()
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
-            rollback_aggregate(&mut shells, &tmux_snapshot, &mut reloader, &error)?;
+            let rollback = rollback_aggregate(&mut shells, &tmux_snapshot, &mut reloader, &error);
+            let process_rollback = restore_process_snapshot(process_snapshot.as_ref());
+            rollback?;
+            process_rollback?;
             return Err(install_error(error));
         }
     };
@@ -310,6 +380,60 @@ struct ConfigSnapshot {
     mode: u32,
 }
 
+struct PreferenceSnapshot {
+    path: PathBuf,
+    previous: Option<(Vec<u8>, u32)>,
+}
+
+impl PreferenceSnapshot {
+    fn read(path: &Path) -> Result<Self> {
+        let previous = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => Some((
+                fs::read(path).map_err(|source| MuxError::Filesystem {
+                    path: path.to_owned(),
+                    source,
+                })?,
+                metadata.mode(),
+            )),
+            Ok(_) => {
+                return Err(MuxError::InvalidValue {
+                    field: "process configuration path",
+                    message: "must be a regular file".to_owned(),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(MuxError::Filesystem {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            previous,
+        })
+    }
+
+    fn restore(&self) -> Result<()> {
+        match &self.previous {
+            Some((bytes, mode)) => atomic_replace(&self.path, bytes, *mode).map_err(install_error),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(MuxError::Filesystem {
+                    path: self.path.clone(),
+                    source,
+                }),
+            },
+        }
+    }
+}
+
+fn restore_process_snapshot(snapshot: Option<&PreferenceSnapshot>) -> Result<()> {
+    snapshot.map_or(Ok(()), PreferenceSnapshot::restore)
+}
+
 impl ConfigSnapshot {
     fn read(path: &Path) -> Result<Self> {
         let metadata = validate_regular_writable(path).map_err(install_error)?;
@@ -389,9 +513,10 @@ fn print_shell_outcomes(outcomes: &[ShellOutcome], operation: &str) {
     }
 }
 
-fn run_smart_left(cli: &Cli, codex_argument: Option<PathBuf>) -> Result<()> {
+fn run_smart_left(cli: &Cli, process_arguments: &ProcessArguments) -> Result<()> {
     let context = invocation_context(cli)?;
-    let codex = resolve_codex(codex_argument)?;
+    let preference = process_preference(process_arguments)?;
+    let process = resolve_process(process_arguments, preference.as_ref())?;
     let mux = env::current_exe()
         .and_then(|path| path.canonicalize())
         .map_err(|source| MuxError::Filesystem {
@@ -399,17 +524,27 @@ fn run_smart_left(cli: &Cli, codex_argument: Option<PathBuf>) -> Result<()> {
             source,
         })?;
     let runner = SystemTmuxRunner::default();
-    let inspector = LinuxProcessInspector::new(codex.clone());
-    SmartLeftProbe::new(&runner, &inspector, &SystemSleeper, &mux, &codex).run(&context)?;
+    let inspector = LinuxProcessInspector::matching_executables(process.matches.clone());
+    SmartLeftProbe::with_pane_commands(
+        &runner,
+        &inspector,
+        &SystemSleeper,
+        &mux,
+        &process.launch,
+        &process.pane_commands,
+        &process.matches,
+    )
+    .run(&context)?;
     Ok(())
 }
 
-fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
+fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()> {
     let context = invocation_context(&cli)?;
-    let codex = resolve_codex(codex_argument)?;
     let theme_store = XdgThemeStore::discover()?;
     let preference = theme_store.load_preference();
-    let mut codex_executables = vec![codex.clone()];
+    let process = resolve_process(process_arguments, Some(&preference))?;
+    let codex = process.launch.clone();
+    let mut codex_executables = process.matches.clone();
     for path in preference
         .profiles
         .iter()
@@ -420,8 +555,7 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
             codex_executables.push(executable);
         }
     }
-    let inspector =
-        LinuxProcessInspector::with_executables(codex.clone(), codex_executables.clone());
+    let inspector = LinuxProcessInspector::matching_executables(codex_executables.clone());
     let inventory =
         PaneInventory::with_executables(SystemTmuxRunner::default(), inspector, codex_executables);
     let refresh_worker = PaneRefreshWorker::spawn(move || inventory.discover());
@@ -443,7 +577,7 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
     let runner = SystemTmuxRunner::default();
     let actions = TmuxActions::new(&runner, &codex);
     if preference.smart_naming {
-        if let Err(error) = ensure_naming_daemon(&codex) {
+        if let Err(error) = ensure_naming_daemon(&process) {
             app.smart_naming_runtime_failed(error.to_string());
         }
     }
@@ -528,14 +662,10 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                     return Ok(());
                 }
                 Action::LaunchProfile(profile) => {
-                    let executable = match profile.executable {
-                        Some(path) => crate::domain::CodexExecutable::new(path)?,
-                        None => codex.clone(),
-                    };
                     actions.new_session_with_profile(
                         &context,
                         selected_pane(&app),
-                        &executable,
+                        &codex,
                         profile.permissions == PermissionPreset::Yolo,
                     )?;
                     return Ok(());
@@ -550,7 +680,7 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                         Ok(()) => {
                             if enabled {
                                 app.smart_naming_saved(true);
-                                if let Err(error) = ensure_naming_daemon(&codex) {
+                                if let Err(error) = ensure_naming_daemon(&process) {
                                     app.smart_naming_runtime_failed(error.to_string());
                                 }
                             } else {
@@ -568,14 +698,10 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
                     let profile = app.resume_profile().ok_or_else(|| {
                         MuxError::Command("resume profile selection disappeared".to_owned())
                     })?;
-                    let executable = match &profile.executable {
-                        Some(path) => crate::domain::CodexExecutable::new(path.clone())?,
-                        None => codex.clone(),
-                    };
                     actions.resume_all_with_profile(
                         &context,
                         selected_pane(&app),
-                        &executable,
+                        &codex,
                         profile.permissions == PermissionPreset::Yolo,
                     )?;
                     return Ok(());
@@ -605,13 +731,13 @@ fn run_interactive(cli: Cli, codex_argument: Option<PathBuf>) -> Result<()> {
     })
 }
 
-fn start_naming_worker(codex: &CodexExecutable, executables: &[CodexExecutable]) -> NamingWorker {
-    let codex_path = codex.as_path().to_owned();
-    let inspector = LinuxProcessInspector::with_executables(codex.clone(), executables.to_vec());
+fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
+    let codex_path = process.launch.as_path().to_owned();
+    let inspector = LinuxProcessInspector::matching_executables(process.matches.clone());
     let inventory = PaneInventory::with_executables(
         SystemTmuxRunner::default(),
         inspector,
-        executables.to_vec(),
+        process.matches.clone(),
     );
     NamingWorker::spawn(
         move |cancelled| {
@@ -626,7 +752,7 @@ fn start_naming_worker(codex: &CodexExecutable, executables: &[CodexExecutable])
     )
 }
 
-fn run_smart_naming_worker(codex_argument: Option<PathBuf>) -> Result<()> {
+fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
     let Some(_lock) = try_naming_daemon_lock()? else {
         return Ok(());
     };
@@ -642,19 +768,18 @@ fn run_smart_naming_worker(codex_argument: Option<PathBuf>) -> Result<()> {
         owned_names.clear_all();
         return Ok(());
     }
-    let codex = resolve_codex(codex_argument)?;
-    let mut executables = vec![codex.clone()];
+    let mut process = resolve_process(process_arguments, Some(&preference))?;
     for path in preference
         .profiles
         .iter()
         .filter_map(|profile| profile.executable.clone())
     {
         let executable = CodexExecutable::new(path)?;
-        if !executables.contains(&executable) {
-            executables.push(executable);
+        if !process.matches.contains(&executable) {
+            process.matches.push(executable);
         }
     }
-    let mut worker = Some(start_naming_worker(&codex, &executables));
+    let mut worker = Some(start_naming_worker(&process));
     let mut applied_names = HashMap::new();
     let mut last_name_reconcile = Instant::now() - Duration::from_secs(2);
     let identity = naming_server_identity_from_environment()?;
@@ -678,7 +803,7 @@ fn run_smart_naming_worker(codex_argument: Option<PathBuf>) -> Result<()> {
                 break;
             }
             retry = (retry * 2).min(Duration::from_secs(5));
-            worker = Some(start_naming_worker(&codex, &executables));
+            worker = Some(start_naming_worker(&process));
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -709,16 +834,15 @@ fn wait_for_naming_retry(
     }
 }
 
-fn ensure_naming_daemon(codex: &CodexExecutable) -> Result<()> {
+fn ensure_naming_daemon(process: &ResolvedProcessConfig) -> Result<()> {
     let executable = env::current_exe().map_err(|source| MuxError::Filesystem {
         path: PathBuf::from("current executable"),
         source,
     })?;
-    let command = format!(
-        "exec {} --codex {} smart-naming-worker",
-        shell_word(&executable)?,
-        shell_word(codex.as_path())?
-    );
+    let mut command = vec!["exec".to_owned(), shell_word(&executable)?];
+    command.extend(process_cli_words(process)?);
+    command.push("smart-naming-worker".to_owned());
+    let command = command.join(" ");
     let output = SystemTmuxRunner::default().run(&[
         OsString::from("run-shell"),
         OsString::from("-b"),
@@ -817,17 +941,18 @@ fn invocation_context(cli: &Cli) -> Result<InvocationContext> {
     })
 }
 
-fn run_tmux_command(command: TmuxCommand, codex_argument: Option<PathBuf>) -> Result<()> {
+fn run_tmux_command(command: TmuxCommand, process_arguments: ProcessArguments) -> Result<()> {
     match command {
-        TmuxCommand::Install(arguments) => install_binding(arguments, codex_argument),
-        TmuxCommand::Status(arguments) => show_status(arguments, codex_argument),
+        TmuxCommand::Install(arguments) => install_binding(arguments, &process_arguments),
+        TmuxCommand::Status(arguments) => show_status(arguments, &process_arguments),
         TmuxCommand::Uninstall(arguments) => uninstall_binding(arguments),
     }
 }
 
-fn install_binding(arguments: InstallArgs, codex_argument: Option<PathBuf>) -> Result<()> {
+fn install_binding(arguments: InstallArgs, process_arguments: &ProcessArguments) -> Result<()> {
     let path = resolve_config(arguments.config)?;
-    let executables = executable_paths(codex_argument)?;
+    let preference = process_preference(process_arguments)?;
+    let executables = executable_paths(&resolve_process(process_arguments, preference.as_ref())?)?;
     let mut reloader = SystemTmuxReloader::for_path(&path)?;
     let outcome = install_with_options(
         &path,
@@ -851,9 +976,11 @@ fn install_binding(arguments: InstallArgs, codex_argument: Option<PathBuf>) -> R
     Ok(())
 }
 
-fn show_status(arguments: ConfigPathArgs, codex_argument: Option<PathBuf>) -> Result<()> {
+fn show_status(arguments: ConfigPathArgs, process_arguments: &ProcessArguments) -> Result<()> {
     let path = resolve_config(arguments.config)?;
-    let report = status(&path, &executable_paths(codex_argument)?).map_err(install_error)?;
+    let preference = process_preference(process_arguments)?;
+    let expected = executable_paths(&resolve_process(process_arguments, preference.as_ref())?)?;
+    let report = status(&path, &expected).map_err(install_error)?;
     if !report.installed {
         println!("not installed: {}", report.path.display());
         return Ok(());
@@ -868,12 +995,18 @@ fn show_status(arguments: ConfigPathArgs, codex_argument: Option<PathBuf>) -> Re
             .map_or("<missing>".to_owned(), |path| path.display().to_string())
     );
     println!(
-        "codex: {}",
+        "launch-executable: {}",
         report
             .codex
             .as_deref()
             .map_or("<missing>".to_owned(), |path| path.display().to_string())
     );
+    for executable in &report.match_executables {
+        println!("match-executable: {}", executable.display());
+    }
+    for command in &report.pane_commands {
+        println!("pane-command: {command}");
+    }
     println!(
         "smart-left: {}",
         if report.smart_left {
@@ -903,21 +1036,28 @@ fn uninstall_binding(arguments: ConfigPathArgs) -> Result<()> {
     Ok(())
 }
 
-fn executable_paths(codex_argument: Option<PathBuf>) -> Result<ExecutablePaths> {
+fn executable_paths(process: &ResolvedProcessConfig) -> Result<ExecutablePaths> {
     let mux = env::current_exe()
         .and_then(|path| path.canonicalize())
         .map_err(|source| MuxError::Filesystem {
             path: PathBuf::from("current executable"),
             source,
         })?;
-    ExecutablePaths::new(mux, resolve_codex(codex_argument)?.as_path().to_owned())
-        .map_err(install_error)
+    ExecutablePaths::with_process(
+        mux,
+        process.launch.as_path().to_owned(),
+        process
+            .matches
+            .iter()
+            .map(|path| path.as_path().to_owned())
+            .collect(),
+        process.pane_commands.clone(),
+        process.legacy_shorthand,
+    )
+    .map_err(install_error)
 }
 
-fn resolve_codex(argument: Option<PathBuf>) -> Result<CodexExecutable> {
-    if let Some(path) = argument {
-        return CodexExecutable::new(path);
-    }
+fn discover_codex() -> Result<PathBuf> {
     let path = env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
@@ -931,7 +1071,124 @@ fn resolve_codex(argument: Option<PathBuf>) -> Result<CodexExecutable> {
         path: path.clone(),
         source,
     })?;
-    CodexExecutable::new(path)
+    Ok(path)
+}
+
+fn resolve_process(
+    arguments: &ProcessArguments,
+    preference: Option<&ThemePreference>,
+) -> Result<ResolvedProcessConfig> {
+    let stored = preference.and_then(|preference| preference.process.clone());
+    let legacy_shorthand = arguments.codex.is_some();
+    let launch = if let Some(path) = &arguments.codex {
+        path.clone()
+    } else if let Some(path) = &arguments.launch_executable {
+        path.clone()
+    } else if let Some(settings) = &stored {
+        settings.launch_executable.clone()
+    } else {
+        discover_codex()?
+    };
+    let match_executables = if let Some(path) = &arguments.codex {
+        vec![path.clone()]
+    } else if !arguments.match_executables.is_empty() {
+        arguments.match_executables.clone()
+    } else if let Some(settings) = &stored {
+        settings.match_executables.clone()
+    } else {
+        vec![launch.clone()]
+    };
+    let pane_commands = if arguments.codex.is_some() {
+        vec![legacy_pane_command(&launch)?]
+    } else if !arguments.pane_commands.is_empty() {
+        arguments.pane_commands.clone()
+    } else if let Some(settings) = &stored {
+        settings.pane_commands.clone()
+    } else {
+        vec![legacy_pane_command(&launch)?]
+    };
+    let settings = ProcessSettings {
+        launch_executable: launch.clone(),
+        match_executables: match_executables.clone(),
+        pane_commands: pane_commands.clone(),
+    };
+    validate_process_settings(&settings)?;
+    let mut matches = match_executables
+        .into_iter()
+        .map(CodexExecutable::new)
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(preference) = preference {
+        for path in preference
+            .profiles
+            .iter()
+            .filter_map(|profile| profile.executable.clone())
+        {
+            let settings = ProcessSettings {
+                launch_executable: path.clone(),
+                match_executables: vec![path.clone()],
+                pane_commands: vec![legacy_pane_command(&path)?],
+            };
+            validate_process_settings(&settings)?;
+            let executable = CodexExecutable::new(path)?;
+            if !matches.contains(&executable) {
+                matches.push(executable);
+            }
+        }
+    }
+    Ok(ResolvedProcessConfig {
+        launch: CodexExecutable::new(launch)?,
+        matches,
+        pane_commands,
+        legacy_shorthand,
+    })
+}
+
+fn process_preference(arguments: &ProcessArguments) -> Result<Option<ThemePreference>> {
+    if !process_preference_required(arguments) {
+        Ok(None)
+    } else {
+        Ok(Some(XdgThemeStore::discover()?.load_preference()))
+    }
+}
+
+fn process_preference_required(arguments: &ProcessArguments) -> bool {
+    arguments.codex.is_none()
+        && !(arguments.launch_executable.is_some()
+            && !arguments.match_executables.is_empty()
+            && !arguments.pane_commands.is_empty())
+}
+
+fn legacy_pane_command(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| MuxError::InvalidValue {
+            field: "Codex executable",
+            message: "must have a UTF-8 file name".to_owned(),
+        })
+}
+
+fn process_cli_words(process: &ResolvedProcessConfig) -> Result<Vec<String>> {
+    if process.legacy_shorthand {
+        return Ok(vec![
+            "--codex".to_owned(),
+            shell_word(process.launch.as_path())?,
+        ]);
+    }
+    let mut words = vec![
+        "--launch-executable".to_owned(),
+        shell_word(process.launch.as_path())?,
+    ];
+    for executable in &process.matches {
+        words.push("--match-executable".to_owned());
+        words.push(shell_word(executable.as_path())?);
+    }
+    for command in &process.pane_commands {
+        words.push("--pane-command".to_owned());
+        words.push(format!("'{}'", command.replace('\'', "'\\''")));
+    }
+    Ok(words)
 }
 
 fn resolve_config(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -1215,6 +1472,9 @@ mod tests {
     fn interactive_context_requires_every_absolute_tmux_value() {
         let mut cli = Cli {
             codex: None,
+            launch_executable: None,
+            match_executable: Vec::new(),
+            pane_command: Vec::new(),
             client: Some("/dev/pts/3".to_owned()),
             invoking_pane: Some("%4".to_owned()),
             invoking_session: Some("$2".to_owned()),

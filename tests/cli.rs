@@ -108,6 +108,86 @@ fn setup_and_remove_manage_all_three_marker_blocks() {
 }
 
 #[test]
+fn explicit_process_configuration_is_embedded_and_reported() {
+    let root = scratch("process-config");
+    let tmux_tmp = root.join("tmux-tmp");
+    fs::create_dir(&tmux_tmp).unwrap();
+    let tmux = root.join("tmux.conf");
+    let bash = root.join("bashrc");
+    let zsh = root.join("zshrc");
+    let launcher = root.join("codex-launcher");
+    let underlying = root.join("real-codex");
+    fs::write(&tmux, b"set -g status off\n").unwrap();
+    fs::write(&bash, b"host bash\n").unwrap();
+    fs::write(&zsh, b"host zsh\n").unwrap();
+    for executable in [&launcher, &underlying] {
+        fs::write(executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+
+    let install = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .arg("--launch-executable")
+        .arg(&launcher)
+        .arg("--match-executable")
+        .arg(&launcher)
+        .arg("--match-executable")
+        .arg(&underlying)
+        .args(["--pane-command", "codex", "setup", "--tmux-config"])
+        .arg(&tmux)
+        .arg("--bash-config")
+        .arg(&bash)
+        .arg("--zsh-config")
+        .arg(&zsh)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let rendered = fs::read_to_string(&tmux).unwrap();
+    assert!(rendered.contains(&format!(
+        "# codex-launch-executable: {}",
+        launcher.display()
+    )));
+    assert!(rendered.contains(&format!(
+        "# codex-match-executable: {}",
+        underlying.display()
+    )));
+    assert!(rendered.contains("# codex-pane-command: codex"));
+    assert!(rendered.contains("--launch-executable"));
+    assert!(rendered.contains("--match-executable"));
+    let saved = fs::read_to_string(root.join(".config/codex-mux/config.toml")).unwrap();
+    assert!(saved.contains("[process]"));
+    assert!(saved.contains(&format!("launch_executable = {:?}", launcher)));
+    assert!(saved.contains("match_executables = ["));
+    assert!(saved.contains(&format!("{:?}", launcher)));
+    assert!(saved.contains(&format!("{:?}", underlying)));
+    assert!(saved.contains("pane_commands = [\"codex\"]"));
+
+    let status = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .args(["tmux", "status", "--config"])
+        .arg(&tmux)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).unwrap();
+    assert!(stdout.contains(&format!("launch-executable: {}", launcher.display())));
+    assert!(stdout.contains(&format!("match-executable: {}", underlying.display())));
+    assert!(stdout.contains("pane-command: codex"));
+    assert!(stdout.contains("drift: none"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn zero_argument_setup_and_remove_use_safe_standard_defaults() {
     let root = scratch("zero-argument");
     let tmux_tmp = root.join("tmux-tmp");
@@ -189,8 +269,11 @@ fn setup_conflict_leaves_all_host_configuration_bytes_unchanged() {
         .env("HOME", &root)
         .env("TMUX_TMPDIR", &tmux_tmp)
         .env_remove("TMUX")
-        .arg("--codex")
+        .arg("--launch-executable")
         .arg(&codex)
+        .arg("--match-executable")
+        .arg(&codex)
+        .args(["--pane-command", "codex"])
         .arg("setup")
         .arg("--tmux-config")
         .arg(&tmux)
@@ -204,6 +287,10 @@ fn setup_conflict_leaves_all_host_configuration_bytes_unchanged() {
     assert_eq!(fs::read(&tmux).unwrap(), tmux_bytes);
     assert_eq!(fs::read(&bash).unwrap(), b"host bash\n");
     assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+    assert!(
+        !root.join(".config/codex-mux/config.toml").exists(),
+        "failed setup left persisted process configuration"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
