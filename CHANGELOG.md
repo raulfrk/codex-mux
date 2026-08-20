@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-20
+
 ### Added
 
 - Press capital `R` in the session switcher to manually rename the selected pane. This permanently relinquishes Smart Naming ownership of that pane, so generated names cannot overwrite the manual title.
