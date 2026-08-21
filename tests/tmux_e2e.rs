@@ -1,7 +1,7 @@
 mod support;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt,
@@ -117,6 +117,8 @@ fn main() {
         .unwrap(),
         title: Some("c".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -189,6 +191,13 @@ fn smart_naming_targets_a_background_pane_format_context() {
         PaneId::new(&pane).unwrap(),
         GeneratedName {
             thread_id: thread_id.to_owned(),
+            source_session: SessionId::new("$0").unwrap(),
+            source_pane_pid: server
+                .checked(&["display-message", "-p", "-t", &pane, "#{pane_pid}"])
+                .trim()
+                .parse()
+                .unwrap(),
+            stable_source_title: true,
             source_title,
             source_cwd: scratch.path().to_owned(),
             name: "Background naming works".to_owned(),
@@ -261,6 +270,77 @@ fn smart_naming_targets_a_background_pane_format_context() {
 }
 
 #[test]
+fn authoritative_recovery_names_a_pane_while_codex_redraws_its_title() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("volatile-owned-name");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    server.checked(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        &pane,
+        "-c",
+        path(scratch.path()),
+        "sleep 60",
+    ]);
+    let pane_pid = server
+        .checked(&["display-message", "-p", "-t", &pane, "#{pane_pid}"])
+        .trim()
+        .parse()
+        .unwrap();
+    let session = SessionId::new(
+        server
+            .checked(&["display-message", "-p", "-t", &pane, "#{session_id}"])
+            .trim(),
+    )
+    .unwrap();
+    let session_text = session.to_string();
+    server.checked(&["select-pane", "-t", &pane, "-T", "⠸ earlier spinner"]);
+    let names = HashMap::from([(
+        PaneId::new(&pane).unwrap(),
+        GeneratedName {
+            thread_id: "12345678-1234-1234-1234-123456789abc".to_owned(),
+            source_session: session,
+            source_pane_pid: pane_pid,
+            stable_source_title: false,
+            source_title: "⠸ earlier spinner".to_owned(),
+            source_cwd: scratch.path().to_owned(),
+            name: "Recovered volatile session".to_owned(),
+            generated_at_unix: 1_700_000_000,
+        },
+    )]);
+    server.checked(&["select-pane", "-t", &pane, "-T", "⠹ later spinner"]);
+
+    OwnedTmuxNames::new(SocketRunner(server.socket().to_owned()))
+        .reconcile_with_verified_volatile(&names, &HashSet::from([PaneId::new(&pane).unwrap()]));
+
+    for (option, expected) in [
+        (
+            "@codex_mux_generated_name",
+            "Recovered volatile session".to_owned(),
+        ),
+        ("@codex_mux_generated_source_pid", pane_pid.to_string()),
+        ("@codex_mux_generated_source_session", session_text),
+    ] {
+        assert_eq!(
+            server
+                .checked(&["show-options", "-pv", "-t", &pane, option])
+                .trim(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
     let _serial = serial_tmux_test();
     if !tools_available() {
@@ -290,6 +370,8 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
         session_id: SessionId::new(session_id).unwrap(),
         title: Some(thread_id.to_owned()),
         generated_title: Some("Generated name".to_owned()),
+        generated_thread_id: Some(thread_id.to_owned()),
+        generated_source_stable: true,
         generated_at_unix: Some(1_700_000_000),
         immediate_naming: true,
         manual_name: false,
@@ -316,6 +398,9 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
         pane.id.clone(),
         GeneratedName {
             thread_id: thread_id.to_owned(),
+            source_session: pane.session_id.clone(),
+            source_pane_pid: pane.pane_pid,
+            stable_source_title: true,
             source_title: thread_id.to_owned(),
             source_cwd: scratch.path().to_owned(),
             name: "Generated name".to_owned(),
@@ -448,6 +533,8 @@ fn manual_pane_rename_accepts_an_outside_codex_title_refresh() {
         session_id: SessionId::new(session_id).unwrap(),
         title: Some("12345678-1234-1234-1234-123456789abc".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -530,6 +617,8 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
         session_id: SessionId::new(session_id).unwrap(),
         title: Some("thread".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -597,6 +686,8 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
         session_id: pane.session_id.clone(),
         title: Some("thread".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -847,6 +938,7 @@ fn installer_cli_loads_a_real_prefix_binding_with_responsive_geometry() {
         "--client",
         "--invoking-pane",
         "--invoking-session",
+        "--invoking-window",
         "--invoking-path",
     ] {
         assert!(
@@ -1884,6 +1976,8 @@ impl RuntimeFixture {
             self.origin_pane.clone(),
             "--invoking-session".to_owned(),
             self.origin_session.clone(),
+            // Deliberately omit --invoking-window to exercise compatibility
+            // with the binding rendered by v0.9.4 before a binary-only update.
             "--invoking-path".to_owned(),
             path(self.scratch.path()).to_owned(),
         ]

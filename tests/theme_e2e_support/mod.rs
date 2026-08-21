@@ -318,6 +318,7 @@ pub struct ThemeFixture {
     client_tty: String,
     pane_id: String,
     session_id: String,
+    window_id: String,
     popup_number: u64,
 }
 
@@ -389,6 +390,10 @@ impl ThemeFixture {
                 .map(str::to_owned);
             client_tty.is_some()
         });
+        let window_id = server
+            .checked(&["display-message", "-p", "-t", &pane, "#{window_id}"])
+            .trim()
+            .to_owned();
         Self {
             client,
             server,
@@ -398,6 +403,7 @@ impl ThemeFixture {
             client_tty: client_tty.unwrap(),
             pane_id: pane,
             session_id,
+            window_id,
             popup_number: 0,
         }
     }
@@ -434,6 +440,8 @@ impl ThemeFixture {
             self.pane_id.clone(),
             "--invoking-session".to_owned(),
             self.session_id.clone(),
+            "--invoking-window".to_owned(),
+            self.window_id.clone(),
             "--invoking-path".to_owned(),
             self.scratch.path().to_string_lossy().into_owned(),
         ];

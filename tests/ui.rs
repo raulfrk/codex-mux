@@ -15,6 +15,8 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
         session_id: SessionId::new("$1").unwrap(),
         title: Some(title.to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -298,6 +300,17 @@ fn profile_picker_supports_fast_keys_and_creating_a_yolo_profile() {
         app.handle_key(key(KeyCode::Enter)),
         Some(Action::LaunchProfile(profiles[2].clone()))
     );
+}
+
+#[test]
+fn failed_profile_launch_stays_visible_in_the_picker() {
+    let mut app = App::new(vec![], ThemeId::AdaptiveCyan, None);
+    app.handle_key(key(KeyCode::Char('n')));
+    app.launch_failed("tmux could not create the selected profile");
+
+    let rendered = rendered_app(&app, 100, 30);
+    assert!(rendered.contains("launch profile"));
+    assert!(rendered.contains("tmux could not create the selected profile"));
 }
 
 #[test]

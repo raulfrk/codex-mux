@@ -56,11 +56,12 @@ pub fn new_window_arguments_with_permissions(
     let mut arguments = vec![
         OsString::from("new-window"),
         OsString::from("-d"),
+        OsString::from("-a"),
         OsString::from("-P"),
         OsString::from("-F"),
         OsString::from("#{pane_id}"),
         OsString::from("-t"),
-        OsString::from(context.session_id.as_str()),
+        OsString::from(context.window_id.as_str()),
         OsString::from("-c"),
         launch_directory(selected, context).as_os_str().to_owned(),
         OsString::from("--"),

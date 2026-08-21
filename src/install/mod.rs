@@ -807,6 +807,8 @@ fn render_block(
         shell_format("pane_id"),
         "--invoking-session".to_owned(),
         shell_format("session_id"),
+        "--invoking-window".to_owned(),
+        shell_format("window_id"),
         "--invoking-path".to_owned(),
         shell_format("pane_current_path"),
     ]);
@@ -862,6 +864,8 @@ fn render_smart_left_binding(executables: &ExecutablePaths) -> String {
         shell_format("pane_id"),
         "--invoking-session".to_owned(),
         shell_format("session_id"),
+        "--invoking-window".to_owned(),
+        shell_format("window_id"),
         "--invoking-path".to_owned(),
         shell_format("pane_current_path"),
         "smart-left".to_owned(),

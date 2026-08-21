@@ -60,6 +60,11 @@ identifier!(
     "session ID",
     "Stable tmux session identity used for new windows."
 );
+identifier!(
+    WindowId,
+    "window ID",
+    "Stable tmux window identity used for adjacent window creation."
+);
 
 /// An absolute executable path used for Codex discovery and launches.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +101,10 @@ pub struct Pane {
     pub title: Option<String>,
     /// Smart title owned by codex-mux, when the tmux ownership marker is valid.
     pub generated_title: Option<String>,
+    /// Exact thread identity that owns the generated title metadata.
+    pub generated_thread_id: Option<String>,
+    /// Whether the live Codex title itself proves that thread identity.
+    pub generated_source_stable: bool,
     /// Unix timestamp of the last successful smart-title generation.
     pub generated_at_unix: Option<u64>,
     /// A pane-local request to refresh its smart title without waiting for the
@@ -156,6 +165,8 @@ pub struct InvocationContext {
     pub pane_id: PaneId,
     /// Session in which new windows should be created.
     pub session_id: SessionId,
+    /// Window after which new windows should be inserted.
+    pub window_id: WindowId,
     /// Working-directory fallback when no selected pane is available.
     pub current_path: PathBuf,
 }
@@ -326,6 +337,8 @@ mod tests {
             session_id: SessionId::new("$1").unwrap(),
             title: None,
             generated_title: None,
+            generated_thread_id: None,
+            generated_source_stable: false,
             generated_at_unix: None,
             immediate_naming: false,
             manual_name: false,

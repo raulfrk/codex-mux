@@ -14,6 +14,7 @@ use crate::{
 const FIELD_SEPARATOR: char = '\u{1f}';
 const ESCAPED_FIELD_SEPARATOR: &str = "\\037";
 const SHELL_SETTLE_INTERVAL: Duration = Duration::from_millis(30);
+const CODEX_REDRAW_SETTLE_INTERVAL: Duration = Duration::from_millis(30);
 
 /// Observable result of one Smart Left gesture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,10 +307,18 @@ where
             self.sleeper.sleep(SHELL_SETTLE_INTERVAL);
         }
 
-        let Ok(current) = self.read_state(context) else {
+        let Ok(mut current) = self.read_state(context) else {
             self.event("state_recheck_failed");
             return Ok(SmartLeftOutcome::Forwarded);
         };
+        if target == SmartLeftTarget::Codex && !state_is_unchanged(&initial, &current) {
+            self.sleeper.sleep(CODEX_REDRAW_SETTLE_INTERVAL);
+            let Ok(settled) = self.read_state(context) else {
+                self.event("state_recheck_failed");
+                return Ok(SmartLeftOutcome::Forwarded);
+            };
+            current = settled;
+        }
         if !state_is_unchanged(&initial, &current) {
             self.event("state_changed_after_left");
             return Ok(SmartLeftOutcome::Forwarded);
@@ -474,6 +483,8 @@ where
             shell_literal(context.pane_id.as_str()),
             "--invoking-session".to_owned(),
             shell_literal(context.session_id.as_str()),
+            "--invoking-window".to_owned(),
+            shell_literal(context.window_id.as_str()),
             "--invoking-path".to_owned(),
             shell_literal(context.current_path.as_os_str().to_string_lossy().as_ref()),
         ]);
@@ -717,6 +728,7 @@ mod tests {
             client_id: ClientId::new("/dev/pts/7").unwrap(),
             pane_id: PaneId::new("%4").unwrap(),
             session_id: SessionId::new("$2").unwrap(),
+            window_id: crate::domain::WindowId::new("@3").unwrap(),
             current_path: PathBuf::from("/work/project's"),
         }
     }
@@ -1062,6 +1074,7 @@ mod tests {
             output(format!("{}\n", screen.join("\n")).into_bytes()),
             output([]),
             state(3, 10, true, false),
+            state(3, 10, true, false),
         ]);
         let sleeper = Sleeper::default();
         let codex = CodexExecutable::new("/opt/codex").unwrap();
@@ -1080,7 +1093,7 @@ mod tests {
             .unwrap(),
             SmartLeftOutcome::Forwarded
         );
-        assert_eq!(sleeper.calls.get(), 0);
+        assert_eq!(sleeper.calls.get(), 1);
         assert!(
             !runner
                 .calls
@@ -1088,6 +1101,40 @@ mod tests {
                 .iter()
                 .any(|call| call[0] == "display-popup")
         );
+    }
+
+    #[test]
+    fn transient_ultra_redraw_settles_back_to_the_exact_boundary() {
+        let mut screen = [""; 11];
+        screen[10] = "› draft";
+        let runner = Runner::with([
+            state(2, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output([]),
+            state(54, 3, true, false),
+            state(2, 10, true, false),
+            output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Opened
+        );
+        assert_eq!(sleeper.calls.get(), 1);
+        assert_eq!(sleeper.elapsed.get(), Duration::from_millis(30));
     }
 
     #[test]

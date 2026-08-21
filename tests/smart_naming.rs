@@ -172,6 +172,8 @@ fn verified_rollout_resolves_without_cwd_and_recovers_when_app_server_is_unavail
         .with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/different/resumed/project".into(),
@@ -238,6 +240,8 @@ fn verified_rollout_survives_provider_exit_during_archive_cross_check() {
         AppServerNamer::new(session).with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -269,6 +273,8 @@ fn verified_rollout_prefix_ambiguity_fails_closed() {
         .with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -307,6 +313,8 @@ fn response_only_rollout_uses_visible_assistant_without_contextual_user_fragment
         .with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -346,6 +354,8 @@ fn rollout_and_app_server_prefix_collision_fails_closed() {
         AppServerNamer::new(session).with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -379,6 +389,8 @@ fn unhealthy_provider_cannot_hide_a_cross_source_collision() {
     let mut namer = AppServerNamer::new(session).with_rollouts(RolloutStore::at(sessions));
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -483,6 +495,8 @@ fn multi_cursor_thread_list_cycle_fails_closed() {
     };
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -506,6 +520,8 @@ fn rollout_store_rejects_symlinked_and_writable_trees() {
     symlink(&private, &linked).unwrap();
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -548,6 +564,8 @@ fn wide_rollout_tree_still_detects_prefix_ambiguity() {
         AppServerNamer::new(UnavailableSession).with_rollouts(RolloutStore::at(sessions));
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -618,6 +636,8 @@ fn resolves_one_truncated_thread_across_pages_after_cwd_changes() {
     let mut namer = AppServerNamer::new(session);
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -661,6 +681,8 @@ fn resolves_external_truncated_thread_after_state_db_miss() {
     let mut namer = AppServerNamer::new(session);
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -691,6 +713,8 @@ fn external_fallback_rejects_an_ambiguous_uuid_prefix() {
     let mut namer = AppServerNamer::new(session);
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -724,6 +748,8 @@ fn external_fallback_rejects_a_state_and_archive_prefix_collision() {
     let mut namer = AppServerNamer::new(session);
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -752,6 +778,8 @@ fn ambiguous_truncated_thread_fails_closed() {
     let mut namer = AppServerNamer::new(session);
     let target = NamingTarget {
         pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
         thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
         cwd: "/work/project".into(),
@@ -775,6 +803,8 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
         session_id: SessionId::new("$1").unwrap(),
         title: Some("01a01001-2dbb-74e2-86ab-996b3...".to_owned()),
         generated_title: Some("Existing entry title".to_owned()),
+        generated_thread_id: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned()),
+        generated_source_stable: true,
         generated_at_unix: Some(1_700_000_000),
         immediate_naming: false,
         manual_name: false,
@@ -816,6 +846,8 @@ fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
         session_id: SessionId::new("$1").unwrap(),
         title: Some("12345678...".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -855,6 +887,8 @@ fn pane_target_rejects_a_manual_uuid_shaped_title() {
         session_id: SessionId::new("$1").unwrap(),
         title: Some("12345678-1234-1234-1234-123456789abc".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: true,
@@ -888,6 +922,8 @@ fn source_less_unpin_waits_for_a_changed_exact_thread_title() {
         session_id: SessionId::new("$1").unwrap(),
         title: Some("Manual project title".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: true,
         manual_name: false,
@@ -917,6 +953,8 @@ fn source_less_unpin_does_not_trim_its_unchanged_manual_title_into_an_identity()
         session_id: SessionId::new("$1").unwrap(),
         title: Some(" 01a01001-2dbb-74e2-86ab-996b31234567 ".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -1040,6 +1078,8 @@ impl ConversationNamer for CountingNamer {
 fn target(pane: &str, thread: &str) -> NamingTarget {
     NamingTarget {
         pane_id: PaneId::new(pane).unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
         pane_title: thread.to_owned(),
         thread_hint: thread.to_owned(),
         cwd: "/work/project".into(),

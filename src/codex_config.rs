@@ -17,6 +17,21 @@ use crate::{MuxError, Result};
 static FAIL_NEXT_PARENT_SYNC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
+static FORCE_NOREPLACE_LINK_FALLBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_AMBIGUOUS_LINK_SUCCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_EXCHANGE_FALLBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_AMBIGUOUS_RENAME_SUCCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_AMBIGUOUS_RECOVERY_LINK_SUCCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
 static SYNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 static MISMATCH_HOOK: std::sync::Mutex<
@@ -445,7 +460,37 @@ fn write_owned(
         };
         prepared = Some(installed.clone());
         if let Some(expected) = expected {
-            exchange(&temporary, path)?;
+            #[cfg(test)]
+            let force_exchange_fallback =
+                FORCE_EXCHANGE_FALLBACK.swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let force_exchange_fallback = false;
+            let exchange_result = if force_exchange_fallback {
+                Err(rustix::io::Errno::INVAL)
+            } else {
+                rustix::fs::renameat_with(
+                    rustix::fs::CWD,
+                    &temporary,
+                    rustix::fs::CWD,
+                    path,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                )
+            };
+            if matches!(
+                exchange_result,
+                Err(rustix::io::Errno::INVAL
+                    | rustix::io::Errno::NOSYS
+                    | rustix::io::Errno::OPNOTSUPP)
+            ) {
+                portable_replace(&temporary, path, expected, &installed)?;
+                committed = Some(installed.clone());
+                sync_parent(path)?;
+                return Ok(installed);
+            }
+            exchange_result.map_err(|source| MuxError::Filesystem {
+                path: path.to_owned(),
+                source: source.into(),
+            })?;
             let displaced = snapshot(&temporary)?;
             if !same_snapshot(displaced.as_ref(), Some(expected)) {
                 rollback_exchange(
@@ -465,18 +510,26 @@ fn write_owned(
                 source,
             })?;
         } else {
-            rustix::fs::renameat_with(
-                rustix::fs::CWD,
-                &temporary,
-                rustix::fs::CWD,
-                path,
-                rustix::fs::RenameFlags::NOREPLACE,
-            )
-            .map_err(|source| MuxError::Filesystem {
-                path: path.to_owned(),
-                source: source.into(),
-            })?;
+            let link_fallback = install_noreplace(&temporary, path, &installed)?;
             committed = Some(installed.clone());
+            if link_fallback {
+                // The file and namespace link are already committed. A later
+                // directory-sync error cannot be rolled back portably on the
+                // NFSv3 filesystem that required this fallback.
+                sync_parent(path).or_else(|error| {
+                    if snapshot(path)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .is_some_and(|current| same_snapshot(Some(current), Some(&installed)))
+                    {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })?;
+                return Ok(installed);
+            }
         }
         sync_parent(path)?;
         Ok(installed)
@@ -512,90 +565,163 @@ fn remove_owned(path: &Path, expected: Option<&FileSnapshot>) -> Result<()> {
             ))),
         };
     };
-    let tombstone = temporary_path(path, "remove")?;
     let grave = temporary_path(path, "removed")?;
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tombstone)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| MuxError::Filesystem {
-            path: tombstone.clone(),
-            source,
-        })?;
-    let tombstone_snapshot = snapshot(&tombstone)?.expect("new tombstone");
-    let mut committed_current = None::<Option<FileSnapshot>>;
-    let result = (|| {
-        exchange(&tombstone, path)?;
-        let displaced = snapshot(&tombstone)?;
-        if !same_snapshot(displaced.as_ref(), Some(expected)) {
-            if rollback_exchange(
-                &tombstone,
-                path,
-                &tombstone_snapshot,
-                displaced.as_ref().expect("exchange displaced a file"),
-            )
-            .is_ok()
-            {
-                remove_if_snapshot(&tombstone, &tombstone_snapshot);
-            }
+    rename_to_private(path, &grave)?;
+    let moved = snapshot(&grave)?;
+    if !same_snapshot(moved.as_ref(), Some(expected)) {
+        if let Err(source) =
+            recovery_link(&grave, path, moved.as_ref().expect("rename moved a file"))
+        {
             return Err(MuxError::Command(format!(
-                "{} changed concurrently; refusing to remove it",
-                path.display()
+                "{} changed concurrently and could not be restored: {source}; displaced file retained at {}",
+                path.display(),
+                grave.display()
             )));
         }
-        committed_current = Some(Some(tombstone_snapshot.clone()));
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::CWD,
-            &grave,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(|source| MuxError::Filesystem {
-            path: path.to_owned(),
-            source: source.into(),
-        })?;
-        committed_current = Some(None);
-        let moved = snapshot(&grave)?;
-        if !same_snapshot(moved.as_ref(), Some(&tombstone_snapshot)) {
-            let _ = rustix::fs::renameat_with(
-                rustix::fs::CWD,
-                &grave,
-                rustix::fs::CWD,
-                path,
-                rustix::fs::RenameFlags::NOREPLACE,
-            );
+        remove_if_snapshot(&grave, moved.as_ref().expect("rename moved a file"));
+        return Err(MuxError::Command(format!(
+            "{} changed concurrently; refusing to remove it",
+            path.display()
+        )));
+    }
+    if let Err(error) = sync_parent(path) {
+        if let Err(source) = recovery_link(&grave, path, expected) {
             return Err(MuxError::Command(format!(
-                "{} changed concurrently; refusing to remove it",
-                path.display()
+                "{error}; additionally failed to restore {}: {source}; displaced file retained at {}",
+                path.display(),
+                grave.display()
             )));
         }
-        fs::remove_file(&grave).map_err(|source| MuxError::Filesystem {
-            path: grave.clone(),
-            source,
-        })?;
-        fs::remove_file(&tombstone).map_err(|source| MuxError::Filesystem {
-            path: tombstone.clone(),
-            source,
-        })?;
-        sync_parent(path)
-    })();
-    if let Err(error) = result {
-        if let Some(current) = committed_current.as_ref() {
-            if let Err(rollback) = restore(path, Some(expected), current.as_ref()) {
-                return Err(MuxError::Command(format!(
-                    "{error}; additionally failed to roll back {}: {rollback}",
-                    path.display()
-                )));
-            }
-        }
-        remove_if_snapshot(&grave, &tombstone_snapshot);
-        remove_if_snapshot(&tombstone, expected);
-        remove_if_snapshot(&tombstone, &tombstone_snapshot);
+        remove_if_snapshot(&grave, expected);
         return Err(error);
     }
+    // The public removal is committed. A private recovery link that cannot be
+    // unlinked is harmless and preferable to reporting a partial transaction.
+    let _ = fs::remove_file(&grave);
+    // Removal is already committed. A failure to sync the directory cannot be
+    // rolled back after the final link is gone, and must not be reported as an
+    // uncommitted transaction.
+    let _ = sync_parent(path);
     Ok(())
+}
+
+fn portable_replace(
+    temporary: &Path,
+    path: &Path,
+    expected: &FileSnapshot,
+    installed: &FileSnapshot,
+) -> Result<()> {
+    let displaced = temporary_path(path, "displaced")?;
+    rename_to_private(path, &displaced)?;
+    let captured = snapshot(&displaced)?;
+    if !same_snapshot(captured.as_ref(), Some(expected)) {
+        if recovery_link(
+            &displaced,
+            path,
+            captured.as_ref().expect("rename captured a file"),
+        )
+        .is_ok()
+        {
+            remove_if_snapshot(
+                &displaced,
+                captured.as_ref().expect("rename captured a file"),
+            );
+        }
+        return Err(MuxError::Command(format!(
+            "{} changed concurrently; refusing to overwrite it",
+            path.display()
+        )));
+    }
+    if let Err(error) = install_noreplace(temporary, path, installed) {
+        if recovery_link(&displaced, path, expected).is_err() {
+            return Err(MuxError::Command(format!(
+                "{error}; original retained at {} because {} could not be restored",
+                displaced.display(),
+                path.display()
+            )));
+        }
+        remove_if_snapshot(&displaced, expected);
+        return Err(error);
+    }
+    let _ = fs::remove_file(&displaced);
+    Ok(())
+}
+
+fn recovery_link(source: &Path, path: &Path, expected: &FileSnapshot) -> std::io::Result<()> {
+    let result = match fs::hard_link(source, path) {
+        Ok(()) => {
+            #[cfg(test)]
+            if FORCE_AMBIGUOUS_RECOVERY_LINK_SUCCESS
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(std::io::Error::other(
+                    "injected ambiguous NFS recovery-link reply",
+                ))
+            } else {
+                Ok(())
+            }
+            #[cfg(not(test))]
+            Ok(())
+        }
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let source_matches = snapshot(source)
+                .ok()
+                .flatten()
+                .as_ref()
+                .is_some_and(|current| same_snapshot(Some(current), Some(expected)));
+            let public_matches = snapshot(path)
+                .ok()
+                .flatten()
+                .as_ref()
+                .is_some_and(|current| same_snapshot(Some(current), Some(expected)));
+            if source_matches && public_matches {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn rename_to_private(path: &Path, destination: &Path) -> Result<()> {
+    if snapshot(destination)?.is_some() {
+        return Err(MuxError::Command(format!(
+            "private recovery path {} already exists",
+            destination.display()
+        )));
+    }
+    let result = match fs::rename(path, destination) {
+        Ok(()) => {
+            #[cfg(test)]
+            if FORCE_AMBIGUOUS_RENAME_SUCCESS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(std::io::Error::other("injected ambiguous NFS rename reply"))
+            } else {
+                Ok(())
+            }
+            #[cfg(not(test))]
+            Ok(())
+        }
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(source) => {
+            let public = snapshot(path)?;
+            let private = snapshot(destination)?;
+            if public.is_none() && private.is_some() {
+                Ok(())
+            } else {
+                Err(MuxError::Filesystem {
+                    path: path.to_owned(),
+                    source,
+                })
+            }
+        }
+    }
 }
 
 fn remove_if_snapshot(path: &Path, expected: &FileSnapshot) {
@@ -702,6 +828,66 @@ fn exchange(left: &Path, right: &Path) -> Result<()> {
     })
 }
 
+fn install_noreplace(temporary: &Path, path: &Path, prepared: &FileSnapshot) -> Result<bool> {
+    #[cfg(test)]
+    let force_fallback =
+        FORCE_NOREPLACE_LINK_FALLBACK.swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let force_fallback = false;
+
+    let renamed = if force_fallback {
+        Err(rustix::io::Errno::INVAL)
+    } else {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            temporary,
+            rustix::fs::CWD,
+            path,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+    };
+    match renamed {
+        Ok(()) => Ok(false),
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP) => {
+            // NFSv3 commonly rejects renameat2(RENAME_NOREPLACE) with EINVAL.
+            // A same-directory hard link retains create-new atomicity: it either
+            // installs this exact inode or reports that the public path exists.
+            #[cfg(test)]
+            let ambiguous_success =
+                FORCE_AMBIGUOUS_LINK_SUCCESS.swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let ambiguous_success = false;
+            let link_result = fs::hard_link(temporary, path).and_then(|()| {
+                if ambiguous_success {
+                    Err(std::io::Error::other("injected ambiguous NFS link reply"))
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(source) = link_result {
+                let temporary_snapshot = snapshot(temporary)?;
+                let public_snapshot = snapshot(path)?;
+                if !same_snapshot(temporary_snapshot.as_ref(), Some(prepared))
+                    || !same_snapshot(public_snapshot.as_ref(), Some(prepared))
+                {
+                    return Err(MuxError::Filesystem {
+                        path: path.to_owned(),
+                        source,
+                    });
+                }
+            }
+            // The public link is already committed. Leaving a private link after
+            // an unlink failure is safer than reporting the installation absent.
+            let _ = fs::remove_file(temporary);
+            Ok(true)
+        }
+        Err(source) => Err(MuxError::Filesystem {
+            path: path.to_owned(),
+            source: source.into(),
+        }),
+    }
+}
+
 fn temporary_path(path: &Path, role: &str) -> Result<PathBuf> {
     let parent = path
         .parent()
@@ -731,12 +917,26 @@ fn sync_parent(path: &Path) -> Result<()> {
             source: std::io::Error::other("injected parent sync failure"),
         });
     }
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| MuxError::Filesystem {
+    match fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        Ok(()) => Ok(()),
+        // Some network filesystems, including NFSv3 mounts, do not implement
+        // directory fsync. The prepared file itself was already synced and the
+        // namespace operation completed; unsupported directory durability is
+        // not a reason to attempt an unsupported exchange rollback.
+        Err(source)
+            if matches!(
+                source.raw_os_error(),
+                Some(libc_errno) if libc_errno == rustix::io::Errno::INVAL.raw_os_error()
+                    || libc_errno == rustix::io::Errno::OPNOTSUPP.raw_os_error()
+            ) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(MuxError::Filesystem {
             path: parent.to_owned(),
             source,
-        })
+        }),
+    }
 }
 
 fn codex_config_path() -> Result<PathBuf> {
@@ -761,6 +961,113 @@ fn optional_state_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_noreplace_uses_atomic_link_creation() {
+        let _serial = SYNC_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "codex-mux-codex-config-nfs-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.toml");
+
+        FORCE_NOREPLACE_LINK_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        let installed = write_owned(&path, b"owned", 0o600, None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"owned");
+        assert_eq!(snapshot(&path).unwrap().unwrap().ino, installed.ino);
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("codex-mux-")
+        }));
+
+        let ambiguous = root.join("ambiguous.toml");
+        FORCE_NOREPLACE_LINK_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_AMBIGUOUS_LINK_SUCCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        write_owned(&ambiguous, b"committed", 0o600, None).unwrap();
+        assert_eq!(fs::read(&ambiguous).unwrap(), b"committed");
+
+        let concurrent = root.join("concurrent.toml");
+        fs::write(&concurrent, b"external").unwrap();
+        FORCE_NOREPLACE_LINK_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(write_owned(&concurrent, b"ours", 0o600, None).is_err());
+        assert_eq!(fs::read(&concurrent).unwrap(), b"external");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_exchange_replaces_and_restores_an_existing_nfs_config() {
+        let _serial = SYNC_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "codex-mux-codex-config-nfs-replace-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, b"original").unwrap();
+        let original = snapshot(&path).unwrap().unwrap();
+        FORCE_EXCHANGE_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_NOREPLACE_LINK_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        let installed = write_owned(&path, b"replacement", 0o600, Some(&original)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+
+        FORCE_EXCHANGE_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_NOREPLACE_LINK_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        write_owned(&path, b"original", 0o600, Some(&installed)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+
+        let original = snapshot(&path).unwrap().unwrap();
+        FORCE_EXCHANGE_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_AMBIGUOUS_RENAME_SUCCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_NOREPLACE_LINK_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        let installed = write_owned(&path, b"replacement", 0o600, Some(&original)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        FAIL_NEXT_PARENT_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_AMBIGUOUS_RECOVERY_LINK_SUCCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(remove_owned(&path, Some(&installed)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+
+        let installed = snapshot(&path).unwrap().unwrap();
+        FORCE_AMBIGUOUS_RENAME_SUCCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        remove_owned(&path, Some(&installed)).unwrap();
+        assert!(!path.exists());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("codex-mux-")
+        }));
+
+        let mismatch = root.join("mismatch.toml");
+        fs::write(&mismatch, b"captured").unwrap();
+        let captured = snapshot(&mismatch).unwrap().unwrap();
+        fs::write(&mismatch, b"new editor bytes").unwrap();
+        FORCE_EXCHANGE_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_AMBIGUOUS_RENAME_SUCCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_AMBIGUOUS_RECOVERY_LINK_SUCCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(write_owned(&mismatch, b"ours", 0o600, Some(&captured)).is_err());
+        assert_eq!(fs::read(&mismatch).unwrap(), b"new editor bytes");
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("codex-mux-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn conditional_replace_and_remove_preserve_concurrent_changes() {
@@ -872,7 +1179,8 @@ mod tests {
     #[test]
     fn mismatch_rollback_never_deletes_a_later_external_edit() {
         let _serial = SYNC_TEST_LOCK.lock().unwrap();
-        for operation in ["replace", "remove"] {
+        {
+            let operation = "replace";
             let root = std::env::temp_dir().join(format!(
                 "codex-mux-codex-config-external-{operation}-{}-{}",
                 std::process::id(),
@@ -895,11 +1203,7 @@ mod tests {
                 Some((post_reached.clone(), post_release.clone()));
             let worker_path = path.clone();
             let worker = std::thread::spawn(move || {
-                if operation == "replace" {
-                    write_owned(&worker_path, b"ours", 0o600, Some(&expected)).map(|_| ())
-                } else {
-                    remove_owned(&worker_path, Some(&expected))
-                }
+                write_owned(&worker_path, b"ours", 0o600, Some(&expected)).map(|_| ())
             });
             reached.wait();
             let external = root.join("external-editor.tmp");

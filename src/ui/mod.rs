@@ -320,6 +320,12 @@ impl App {
         }
     }
 
+    /// Keeps the picker open and exposes a failed tmux launch instead of closing silently.
+    pub fn launch_failed(&mut self, error: impl Into<String>) {
+        self.warning = Some(error.into());
+        self.inventory_warning = false;
+    }
+
     /// Returns the active launch profiles.
     #[must_use]
     pub fn profiles(&self) -> &[LaunchProfile] {
@@ -946,7 +952,10 @@ fn render_profile_picker(
     palette: Theme,
     selected: usize,
 ) {
-    let height = (app.profiles.len() as u16 + 4).min(area.height).max(5);
+    let warning_height = u16::from(app.warning.is_some());
+    let height = (app.profiles.len() as u16 + 4 + warning_height)
+        .min(area.height)
+        .max(5);
     let popup = centered_rect(area, if area.width <= 62 { 96 } else { 72 }, height);
     frame.render_widget(Clear, popup);
     let block = Block::default()
@@ -957,7 +966,11 @@ fn render_profile_picker(
     frame.render_widget(block, popup);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(warning_height),
+        ])
         .split(inner);
     let items = app.profiles.iter().enumerate().map(|(index, profile)| {
         let executable = profile
@@ -992,6 +1005,12 @@ fn render_profile_picker(
         Paragraph::new("key launch · ↑/↓ · Enter · a add · e edit · Esc").style(palette.muted),
         chunks[1],
     );
+    if let Some(warning) = &app.warning {
+        frame.render_widget(
+            Paragraph::new(sanitized(warning)).style(palette.warning),
+            chunks[2],
+        );
+    }
 }
 
 fn render_profile_editor(
@@ -1255,6 +1274,8 @@ mod tests {
             session_id: SessionId::new("$1").unwrap(),
             title: Some(title.to_owned()),
             generated_title: None,
+            generated_thread_id: None,
+            generated_source_stable: false,
             generated_at_unix: None,
             immediate_naming: false,
             manual_name: false,

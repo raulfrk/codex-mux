@@ -573,6 +573,33 @@ fn installed_prefix_key_opens_the_extracted_binary_popup() {
 }
 
 #[test]
+fn installed_leader_a_popup_launches_a_selected_profile() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("prefix-profile-launch");
+    fixture.add_sentinel_window_after_origin();
+    fixture.install_binding(&binary, "a");
+    let (mut client, _tty) = fixture.client("origin", (120, 40), "prefix-profile-client");
+
+    client.send(b"\x02a");
+    client.wait_text("Commands");
+    client.send(b"n");
+    client.wait_text("launch profile");
+    client.send(b"s");
+
+    fixture.server.wait("Leader+A selected profile pane", || {
+        fixture
+            .server
+            .checked(&["list-panes", "-a", "-F", "#{pane_current_command}"])
+            .lines()
+            .any(|command| command == "codex-e2e")
+    });
+    fixture.assert_profile_window_is_immediately_after_origin();
+    client.send(b"\x02d");
+}
+
+#[test]
 fn installed_smart_left_moves_then_opens_the_extracted_binary_at_the_boundary() {
     let Some(binary) = require_prerequisites() else {
         return;
@@ -683,6 +710,47 @@ fn installed_smart_left_opens_at_the_ultra_max_post_glyph_noop_boundary() {
     fixture.server.wait("post glyph Smart Left cleanup", || {
         smart_left_inactive(&fixture.server, &fixture.origin_pane)
     });
+    client.send(b"\x02d");
+}
+
+#[test]
+fn installed_smart_left_popup_launches_a_selected_profile() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("smart-left-profile-launch");
+    fixture.add_sentinel_window_after_origin();
+    fixture.install_smart_left(&binary);
+    let output = fixture
+        .server
+        .command()
+        .args(["respawn-pane", "-k", "-t", &fixture.origin_pane, "--"])
+        .arg(&fixture.codex)
+        .arg("smart-left-post-glyph")
+        .output()
+        .unwrap();
+    assert_success(&output, "start packaged Smart Left profile fixture");
+    fixture.server.wait("profile fixture boundary", || {
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 5
+    });
+
+    let (mut client, _tty) = fixture.client("origin", (100, 32), "profile-launch-client");
+    client.send(b"\x1b[D");
+    client.wait_text("sessions");
+    client.send(b"n");
+    client.wait_text("launch profile");
+    client.send(b"s");
+
+    fixture.server.wait("selected profile pane", || {
+        fixture
+            .server
+            .checked(&["list-panes", "-a", "-F", "#{pane_current_command}"])
+            .lines()
+            .filter(|command| *command == "codex-e2e")
+            .count()
+            >= 2
+    });
+    fixture.assert_profile_window_is_immediately_after_origin();
     client.send(b"\x02d");
 }
 
@@ -967,6 +1035,7 @@ struct Fixture {
     log: PathBuf,
     origin_pane: String,
     origin_session: String,
+    origin_window: String,
 }
 
 impl Fixture {
@@ -990,6 +1059,10 @@ impl Fixture {
             .checked(&["display-message", "-p", "-t", "origin", "#{session_id}"])
             .trim()
             .to_owned();
+        let origin_window = server
+            .checked(&["display-message", "-p", "-t", "origin", "#{window_id}"])
+            .trim()
+            .to_owned();
         Self {
             scratch,
             config,
@@ -998,7 +1071,54 @@ impl Fixture {
             log,
             origin_pane,
             origin_session,
+            origin_window,
         }
+    }
+
+    fn add_sentinel_window_after_origin(&self) {
+        self.server.checked(&[
+            "new-window",
+            "-d",
+            "-t",
+            "origin:",
+            "-n",
+            "sentinel",
+            "--",
+            "sh",
+        ]);
+    }
+
+    fn assert_profile_window_is_immediately_after_origin(&self) {
+        let origin_index = self
+            .server
+            .checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                &self.origin_window,
+                "#{window_index}",
+            ])
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let panes = self.server.checked(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_id}\x1f#{window_index}\x1f#{window_id}\x1f#{pane_current_command}",
+        ]);
+        let fields = panes
+            .lines()
+            .find_map(|line| {
+                let fields = line.split('\x1f').collect::<Vec<_>>();
+                (fields.get(3) == Some(&"codex-e2e")
+                    && fields.get(2) != Some(&self.origin_window.as_str()))
+                .then_some(fields)
+            })
+            .expect("profile launch pane exists");
+        assert_eq!(fields[0], self.origin_session);
+        assert_eq!(fields[1].parse::<u32>().unwrap(), origin_index + 1);
+        assert_ne!(fields[2], self.origin_window);
     }
 
     fn agent(&self, session: &str, cwd: &Path, marker: &str) -> String {
@@ -1160,6 +1280,8 @@ impl Fixture {
             self.origin_pane.clone(),
             "--invoking-session".to_owned(),
             self.origin_session.clone(),
+            "--invoking-window".to_owned(),
+            self.origin_window.clone(),
             "--invoking-path".to_owned(),
             text(cwd).to_owned(),
         ];

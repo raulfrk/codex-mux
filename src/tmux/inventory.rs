@@ -17,7 +17,7 @@ use crate::{
 };
 const FIELD_SEPARATOR: u8 = 0x1f;
 const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_manual_name_source}\x1f#{@codex_mux_manual_name_pid}\x1f#{@codex_mux_manual_name_session}\x1f#{@codex_mux_unpin_waiting}\x1f#{@codex_mux_unpin_waiting_title}\x1f#{@codex_mux_unpin_waiting_pid}\x1f#{@codex_mux_unpin_waiting_session}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_manual_name_source}\x1f#{@codex_mux_manual_name_pid}\x1f#{@codex_mux_manual_name_session}\x1f#{@codex_mux_unpin_waiting}\x1f#{@codex_mux_unpin_waiting_title}\x1f#{@codex_mux_unpin_waiting_pid}\x1f#{@codex_mux_unpin_waiting_session}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_pid}\x1f#{@codex_mux_generated_source_session}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
 pub struct PaneInventory<R, I> {
@@ -117,6 +117,10 @@ where
 
             let generated_title = record.generated_title();
             let generated_at_unix = record.generated_at();
+            let generated_thread_id = generated_title
+                .as_ref()
+                .map(|_| record.generated_thread.clone());
+            let generated_source_stable = record.generated_source_stable();
             let Ok(id) = PaneId::new(record.pane_id) else {
                 continue;
             };
@@ -128,6 +132,8 @@ where
                 session_id,
                 title: nonempty_title(record.title),
                 generated_title,
+                generated_thread_id,
+                generated_source_stable,
                 generated_at_unix,
                 immediate_naming: record.immediate_naming,
                 manual_name: record.manual_name,
@@ -219,6 +225,9 @@ struct TmuxPaneRecord {
     unpin_waiting_title: String,
     unpin_waiting_pid: Option<u32>,
     unpin_waiting_session: Option<String>,
+    generated_source_title: String,
+    generated_source_pid: Option<u32>,
+    generated_source_session: Option<String>,
 }
 
 impl TmuxPaneRecord {
@@ -227,7 +236,7 @@ impl TmuxPaneRecord {
             return None;
         }
         let fields = split_fields(line);
-        if !matches!(fields.len(), 11..=21) {
+        if !matches!(fields.len(), 11..=24) {
             return None;
         }
 
@@ -291,18 +300,36 @@ impl TmuxPaneRecord {
             unpin_waiting_session: fields
                 .get(20)
                 .map(|field| String::from_utf8_lossy(field).into_owned()),
+            generated_source_title: fields.get(21).map_or_else(String::new, |field| {
+                String::from_utf8_lossy(field).into_owned()
+            }),
+            generated_source_pid: fields
+                .get(22)
+                .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok()),
+            generated_source_session: fields
+                .get(23)
+                .map(|field| String::from_utf8_lossy(field).into_owned()),
         })
     }
 
     fn generated_title(&self) -> Option<String> {
+        let stable_source = self.generated_source_stable();
+        let volatile_source = !self.generated_source_title.is_empty()
+            && !thread_marker_matches_title(&self.generated_thread, &self.generated_source_title)
+            && self.generated_source_pid == Some(self.pane_pid)
+            && self.generated_source_session.as_deref() == Some(self.session_id.as_str());
         if self.generated_at.parse::<u64>().is_ok()
-            && thread_marker_matches_title(&self.generated_thread, &self.title)
+            && (stable_source || volatile_source)
             && !self.generated_name.trim().is_empty()
         {
             Some(self.generated_name.clone())
         } else {
             None
         }
+    }
+
+    fn generated_source_stable(&self) -> bool {
+        thread_marker_matches_title(&self.generated_thread, &self.title)
     }
 
     fn generated_at(&self) -> Option<u64> {
@@ -411,6 +438,30 @@ mod tests {
         assert_eq!(record.current_path, Path::new("/work/project"));
         assert_eq!(record.command, OsStr::new("codex"));
         assert_eq!(record.pane_pid, 42);
+    }
+
+    #[test]
+    fn generated_title_survives_volatile_codex_title_redraws_for_same_process() {
+        let record = TmuxPaneRecord::parse(
+            b"%7\x1f$1\x1f@1\x1fmain\x1f\xe2\xa0\xb9 changed spinner\x1f/work/project\x1fcodex\x1f77\x1f/dev/pts/1\x1f12345678-1234-1234-1234-123456789abc\x1fRecovered conversation\x1f1700000000\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\xe2\xa0\xb8 earlier spinner\x1f77\x1f$1",
+        )
+        .expect("volatile title record should parse");
+
+        assert_eq!(
+            record.generated_title().as_deref(),
+            Some("Recovered conversation")
+        );
+    }
+
+    #[test]
+    fn volatile_generated_title_is_rejected_after_process_or_session_reuse() {
+        for (pid, session) in [("78", "$1"), ("77", "$2")] {
+            let row = format!(
+                "%7\x1f{session}\x1f@1\x1fmain\x1fspinner\x1f/work/project\x1fcodex\x1f{pid}\x1f/dev/pts/1\x1f12345678-1234-1234-1234-123456789abc\x1fWrong conversation\x1f1700000000\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1fprevious spinner\x1f77\x1f$1"
+            );
+            let record = TmuxPaneRecord::parse(row.as_bytes()).unwrap();
+            assert_eq!(record.generated_title(), None);
+        }
     }
 
     #[test]

@@ -28,7 +28,8 @@ use std::os::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{CodexExecutable, Pane, PaneId};
+use crate::domain::{CodexExecutable, Pane, PaneId, SessionId};
+use crate::linux_process::pid_matches_file_identities;
 use crate::{MuxError, Result};
 
 /// Codex model used exclusively for background session naming.
@@ -545,6 +546,10 @@ pub struct NamingConversation {
 pub struct NamingTarget {
     /// Exact tmux pane identity.
     pub pane_id: PaneId,
+    /// Tmux session that owned the pane during authoritative discovery.
+    pub session_id: SessionId,
+    /// Pane leader PID observed during authoritative discovery.
+    pub pane_pid: u32,
     /// Exact pane title observed during discovery.
     pub pane_title: String,
     /// Full UUID or unambiguous UUID prefix exposed in the pane title.
@@ -578,6 +583,8 @@ impl NamingTarget {
         let thread_hint = thread_hint(pane_title)?;
         Some(Self {
             pane_id: pane.id.clone(),
+            session_id: pane.session_id.clone(),
+            pane_pid: pane.pane_pid,
             pane_title: pane_title.to_owned(),
             thread_hint: thread_hint.to_owned(),
             cwd: pane.current_path.clone(),
@@ -596,6 +603,8 @@ impl NamingTarget {
         let pane_title = pane.title.as_deref()?.trim().to_owned();
         Some(Self {
             pane_id: pane.id.clone(),
+            session_id: pane.session_id.clone(),
+            pane_pid: pane.pane_pid,
             pane_title,
             thread_hint: thread_id,
             cwd: pane.current_path.clone(),
@@ -1040,6 +1049,12 @@ impl<S: AppServerSession + Send + 'static> ConversationNamer for AppServerNamer<
 pub struct GeneratedName {
     /// Source Codex thread identity.
     pub thread_id: String,
+    /// Tmux session that owned the pane when the thread was revalidated.
+    pub source_session: SessionId,
+    /// Pane leader PID observed when the thread was revalidated.
+    pub source_pane_pid: u32,
+    /// Whether the visible source title itself was authoritative thread evidence.
+    pub stable_source_title: bool,
     /// Exact pane title that was resolved to the source thread.
     pub source_title: String,
     /// Exact pane working directory used during thread resolution.
@@ -1423,6 +1438,10 @@ impl NamingWorker {
                                 target.pane_id.clone(),
                                 GeneratedName {
                                     thread_id: thread_id.clone(),
+                                    source_session: target.session_id.clone(),
+                                    source_pane_pid: target.pane_pid,
+                                    stable_source_title: thread_hint(&target.pane_title)
+                                        .is_some_and(|hint| thread_id.starts_with(hint)),
                                     source_title: target.pane_title.clone(),
                                     source_cwd: target.cwd.clone(),
                                     name: name.clone(),
@@ -1804,7 +1823,7 @@ impl ProcessRolloutStore {
             .map(|(&pid, &(parent, _))| (pid, parent))
             .collect::<HashMap<_, _>>();
         for &pid in processes.keys() {
-            if !self.executable_matches(pid)
+            if !self.executable_matches(pid, budget)?
                 || !panes
                     .iter()
                     .any(|pane| descends_from(pid, pane.pane_pid, &parents))
@@ -1837,13 +1856,14 @@ impl ProcessRolloutStore {
             .iter()
             .map(|(&pid, &(parent, _))| (pid, parent))
             .collect::<HashMap<_, _>>();
-        let candidates = processes
-            .iter()
-            .filter(|(pid, _)| {
-                descends_from(**pid, pane.pane_pid, &parents) && self.executable_matches(**pid)
-            })
-            .map(|(&pid, &identity)| (pid, identity))
-            .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for (&pid, &identity) in processes {
+            if descends_from(pid, pane.pane_pid, &parents)
+                && self.executable_matches(pid, budget)?
+            {
+                candidates.push((pid, identity));
+            }
+        }
         // Direct rollout descriptors are authoritative without sock_diag.
         // Netlink is optional evidence used only for legacy control peers.
         let mut peer_inodes = HashSet::new();
@@ -1866,7 +1886,7 @@ impl ProcessRolloutStore {
         for (pid, identity) in candidates {
             let identities = self.process_rollouts(pid, budget)?;
             if !revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
-                || !self.executable_matches(pid)
+                || !self.executable_matches(pid, budget)?
             {
                 continue;
             }
@@ -1914,7 +1934,13 @@ impl ProcessRolloutStore {
                         continue;
                     }
                     let peer_rollouts = self.process_rollouts(peer_pid, budget)?;
-                    if process_stat_identity(peer_pid).ok() != Some(peer_identity)
+                    if !process_socket_inodes(pid, budget)?.contains(&candidate_inode)
+                        || !process_socket_inodes(peer_pid, budget)?.contains(&peer_inode)
+                        || !self.peer_is_private_control_connection(
+                            peer_pid, peer_inode, fresh, proc_unix, budget,
+                        )?
+                        || !self.executable_matches(pid, budget)?
+                        || process_stat_identity(peer_pid).ok() != Some(peer_identity)
                         || !revalidate_descendant(
                             pid,
                             identity,
@@ -1922,11 +1948,6 @@ impl ProcessRolloutStore {
                             root_identity,
                             processes,
                         )
-                        || !process_socket_inodes(pid, budget)?.contains(&candidate_inode)
-                        || !process_socket_inodes(peer_pid, budget)?.contains(&peer_inode)
-                        || !self.peer_is_private_control_connection(
-                            peer_pid, peer_inode, fresh, proc_unix, budget,
-                        )?
                     {
                         continue;
                     }
@@ -1935,12 +1956,12 @@ impl ProcessRolloutStore {
             }
         }
         for (pid, identity) in direct_candidates {
-            if revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
-                && self.executable_matches(pid)
+            if self.executable_matches(pid, budget)?
+                && revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
             {
                 let rollouts = self.process_rollouts(pid, budget)?;
-                if revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
-                    && self.executable_matches(pid)
+                if self.executable_matches(pid, budget)?
+                    && revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
                 {
                     matched.extend(rollouts);
                 }
@@ -1959,13 +1980,13 @@ impl ProcessRolloutStore {
         }
     }
 
-    fn executable_matches(&self, pid: u32) -> bool {
-        let path = PathBuf::from(format!("/proc/{pid}/exe"));
-        fs::metadata(path).ok().is_some_and(|metadata| {
-            self.executables
-                .iter()
-                .any(|identity| *identity == (metadata.dev(), metadata.ino()))
-        })
+    fn executable_matches(&self, pid: u32, budget: &mut ProcessScanBudget<'_>) -> Result<bool> {
+        budget.checkpoint()?;
+        let remaining = MAX_PROCESS_SCAN_BYTES.saturating_sub(budget.bytes);
+        let (matched, bytes) =
+            pid_matches_file_identities(pid, &self.executables, remaining.min(1024 * 1024));
+        budget.bytes(bytes)?;
+        Ok(matched)
     }
 
     fn private_control_server_matches(
@@ -1974,7 +1995,7 @@ impl ProcessRolloutStore {
         codex_home: &Path,
         budget: &mut ProcessScanBudget<'_>,
     ) -> Result<bool> {
-        if self.executable_matches(pid) {
+        if self.executable_matches(pid, budget)? {
             return Ok(true);
         }
         let Ok(executable) = fs::read_link(format!("/proc/{pid}/exe")) else {
@@ -3455,6 +3476,8 @@ mod transport_tests {
             session_id: crate::domain::SessionId::new("$1").unwrap(),
             title: Some(title.to_owned()),
             generated_title: None,
+            generated_thread_id: None,
+            generated_source_stable: false,
             generated_at_unix: None,
             immediate_naming: false,
             manual_name: false,
@@ -4247,6 +4270,8 @@ mod transport_tests {
         );
         NamingTarget {
             pane_id: PaneId::new("%1").unwrap(),
+            session_id: SessionId::new("$1").unwrap(),
+            pane_pid: 77,
             pane_title: thread.clone(),
             thread_hint: thread,
             cwd: "/work/project".into(),

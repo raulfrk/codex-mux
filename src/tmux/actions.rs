@@ -82,7 +82,7 @@ where
         );
         let output = self.run_checked(&arguments)?;
         let pane_id = parse_pane_id(&output.stdout)?;
-        self.switch_client(context, &pane_id, false)?;
+        self.switch_created_pane(context, &pane_id)?;
         Ok(pane_id)
     }
 
@@ -114,7 +114,7 @@ where
         );
         let output = self.run_checked(&arguments)?;
         let pane_id = parse_pane_id(&output.stdout)?;
-        self.switch_client(context, &pane_id, false)?;
+        self.switch_created_pane(context, &pane_id)?;
         self.mark_for_immediate_naming(&pane_id);
         Ok(pane_id)
     }
@@ -384,7 +384,7 @@ where
         let arguments = new_window_arguments(self.executable, context, selected, kind);
         let output = self.run_checked(&arguments)?;
         let pane_id = parse_pane_id(&output.stdout)?;
-        self.switch_client(context, &pane_id, false)?;
+        self.switch_created_pane(context, &pane_id)?;
         Ok(pane_id)
     }
 
@@ -399,6 +399,14 @@ where
             IMMEDIATE_NAMING_OPTION,
             "1",
         ]));
+    }
+
+    fn switch_created_pane(&self, context: &InvocationContext, pane_id: &PaneId) -> Result<()> {
+        self.switch_client(context, pane_id, false)
+            .map_err(|error| MuxError::CreatedPaneNotSelected {
+                pane: pane_id.to_string(),
+                detail: error.to_string(),
+            })
     }
 
     fn switch_client(

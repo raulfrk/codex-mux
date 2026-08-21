@@ -4,6 +4,15 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-08-21
+
+### Fixed
+
+- Apply and retain an authoritative recovered Smart Name when Codex continuously redraws an arbitrary spinner title, while fencing the ownership to the same tmux session, pane leader process, working directory, and manual-name state.
+- Let Smart Left tolerate one bounded transient Ultra/Max redraw before its unchanged-state and exact-process recheck, while still forwarding a genuine cursor move.
+- Target the exact invoking tmux window and insert after it when New or Resume launches a selected profile, avoiding both an occupied index and nested-shell expansion of tmux's `$`-prefixed session ID; keep the picker open with the exact tmux error if creation still fails.
+- Create new Codex title-ownership state safely on NFSv3 filesystems that reject `renameat2(RENAME_NOREPLACE)` with `EINVAL`, using an atomic same-directory link fallback without overwriting an existing file.
+
 ## [0.9.4] - 2026-08-21
 
 ### Fixed

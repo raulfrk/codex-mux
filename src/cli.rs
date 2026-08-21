@@ -55,6 +55,10 @@ pub struct Cli {
     #[arg(long, value_name = "SESSION")]
     pub invoking_session: Option<String>,
 
+    /// tmux window after which new Codex windows should be created.
+    #[arg(long, value_name = "WINDOW")]
+    pub invoking_window: Option<String>,
+
     /// Working-directory fallback supplied by the invoking pane.
     #[arg(long, value_name = "PATH")]
     pub invoking_path: Option<PathBuf>,

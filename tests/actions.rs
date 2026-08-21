@@ -4,7 +4,7 @@ use codex_mux::{
     Result,
     domain::{
         ClientId, CodexExecutable, CommandOutput, InvocationContext, Pane, PaneId, SessionId,
-        TmuxCommandRunner,
+        TmuxCommandRunner, WindowId,
     },
     launch::TERMINAL_TITLE_CONFIG,
     tmux::actions::TmuxActions,
@@ -74,6 +74,14 @@ fn stdout(value: &str) -> CommandOutput {
     }
 }
 
+fn failed(message: &str) -> CommandOutput {
+    CommandOutput {
+        stderr: message.as_bytes().to_vec(),
+        status: Some(1),
+        ..ok()
+    }
+}
+
 fn operation_marker() -> CommandOutput {
     stdout("<operation-token>\n")
 }
@@ -87,6 +95,7 @@ fn context(path: &str) -> InvocationContext {
         client_id: ClientId::new("/dev/pts/42; display-message hacked").unwrap(),
         pane_id: PaneId::new("%1").unwrap(),
         session_id: SessionId::new("$7").unwrap(),
+        window_id: WindowId::new("@8").unwrap(),
         current_path: PathBuf::from(path),
     }
 }
@@ -97,6 +106,8 @@ fn pane(id: &str, path: &str) -> Pane {
         session_id: SessionId::new("$9").unwrap(),
         title: Some("thread".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,
@@ -218,11 +229,12 @@ fn new_session_uses_selected_cwd_and_direct_custom_executable_arguments() {
             args(&[
                 "new-window",
                 "-d",
+                "-a",
                 "-P",
                 "-F",
                 "#{pane_id}",
                 "-t",
-                "$7",
+                "@8",
                 "-c",
                 "/work/quote' ; $(touch nope)",
                 "--",
@@ -268,11 +280,12 @@ fn yolo_profile_uses_custom_executable_and_exact_direct_arguments() {
         args(&[
             "new-window",
             "-d",
+            "-a",
             "-P",
             "-F",
             "#{pane_id}",
             "-t",
-            "$7",
+            "@8",
             "-c",
             "/fallback",
             "--",
@@ -298,11 +311,12 @@ fn resume_uses_invoking_cwd_fallback_and_resume_all_exactly() {
         args(&[
             "new-window",
             "-d",
+            "-a",
             "-P",
             "-F",
             "#{pane_id}",
             "-t",
-            "$7",
+            "@8",
             "-c",
             "/fallback dir/with $dollar",
             "--",
@@ -341,11 +355,12 @@ fn yolo_resume_profile_uses_custom_executable_and_global_permission_flag() {
             args(&[
                 "new-window",
                 "-d",
+                "-a",
                 "-P",
                 "-F",
                 "#{pane_id}",
                 "-t",
-                "$7",
+                "@8",
                 "-c",
                 "/selected",
                 "--",
@@ -611,4 +626,16 @@ fn invalid_tmux_zoom_or_created_pane_output_fails_closed() {
             .is_err()
     );
     assert_eq!(bad_pane.commands().len(), 1);
+}
+
+#[test]
+fn failed_client_switch_reports_the_committed_pane_without_unsafe_cleanup() {
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let runner = RecordingRunner::with_outputs([stdout("%120\n"), failed("client disappeared")]);
+    let error = TmuxActions::new(&runner, &executable)
+        .new_session(&context("/fallback"), None)
+        .unwrap_err();
+    assert!(error.to_string().contains("client disappeared"));
+    assert!(error.to_string().contains("created Codex pane %120"));
+    assert_eq!(runner.commands().len(), 2);
 }

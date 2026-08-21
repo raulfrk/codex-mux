@@ -31,6 +31,15 @@ pub enum MuxError {
     #[error("command failed: {0}")]
     Command(String),
 
+    /// A launch committed, but the invoking tmux client could not be selected.
+    #[error("created Codex pane {pane}, but could not select it: {detail}")]
+    CreatedPaneNotSelected {
+        /// Exact pane created by the successful launch.
+        pane: String,
+        /// Selection failure reported by tmux.
+        detail: String,
+    },
+
     /// Cooperative cancellation interrupted an in-flight operation.
     #[error("operation cancelled")]
     Cancelled,

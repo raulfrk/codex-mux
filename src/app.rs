@@ -1,7 +1,7 @@
 //! Runtime composition for the interactive popup and tmux management commands.
 
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     env,
     ffi::OsString,
     fs,
@@ -10,7 +10,7 @@ use std::{
     io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{atomic::AtomicBool, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,12 +22,12 @@ use crate::{
     cli::{Cli, Command, ConfigPathArgs, InstallArgs, RemoveArgs, SetupArgs, TmuxCommand},
     codex_config,
     config::{
-        MatchScope, PermissionPreset, ProcessSettings, ThemePreference, XdgThemeStore,
-        no_color_requested, validate_process_settings,
+        LaunchProfile, MatchScope, PermissionPreset, ProcessSettings, ThemePreference,
+        XdgThemeStore, no_color_requested, validate_process_settings,
     },
     domain::{
         ClientId, CodexExecutable, InvocationContext, PaneId, SessionId, ThemeStore,
-        TmuxCommandRunner,
+        TmuxCommandRunner, WindowId,
     },
     install::{
         DiscoveryContext, ExecutablePaths, InstallError, ProcessMetadata, ServerEvidence,
@@ -53,6 +53,7 @@ use crate::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const MAX_VOLATILE_RECONCILES_PER_CYCLE: usize = 4;
 
 #[derive(Clone, Debug)]
 struct ProcessArguments {
@@ -624,25 +625,21 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
     let preference = theme_store.load_preference();
     let process = resolve_process(process_arguments, Some(&preference))?;
     let codex = process.launch.clone();
-    let mut codex_executables = process.matches.clone();
-    for path in preference
-        .profiles
-        .iter()
-        .filter_map(|profile| profile.executable.clone())
-    {
-        let executable = CodexExecutable::new(path)?;
-        if !codex_executables.contains(&executable) {
-            codex_executables.push(executable);
-        }
-    }
+    let codex_executables =
+        configured_codex_executables(process.matches.clone(), &preference.profiles)?;
     let inspector = LinuxProcessInspector::with_matcher(
         codex_executables.clone(),
         process.match_scope,
         &process.match_command_regexes,
     )?;
+    let title_verifier = ProcessRolloutStore::discover(&codex_executables).ok();
     let inventory =
         PaneInventory::with_executables(SystemTmuxRunner::default(), inspector, codex_executables);
-    let refresh_worker = PaneRefreshWorker::spawn(move || inventory.discover());
+    let refresh_worker = PaneRefreshWorker::spawn(move || {
+        let mut panes = inventory.discover()?;
+        verify_volatile_pane_titles(&mut panes, title_verifier.as_ref());
+        Ok(panes)
+    });
     let color_policy = if no_color_requested() {
         ColorPolicy::ForceMonochrome
     } else {
@@ -741,18 +738,27 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
                     actions.switch_and_zoom(&context, pane)?;
                     return Ok(());
                 }
-                Action::New => {
-                    actions.new_session(&context, selected_pane(&app))?;
-                    return Ok(());
-                }
+                Action::New => match actions.new_session(&context, selected_pane(&app)) {
+                    Ok(_) => return Ok(()),
+                    Err(error @ MuxError::CreatedPaneNotSelected { .. }) => return Err(error),
+                    Err(error) => {
+                        app.launch_failed(format!("New Codex session was not created: {error}"))
+                    }
+                },
                 Action::LaunchProfile(profile) => {
-                    actions.new_session_with_profile(
+                    match actions.new_session_with_profile(
                         &context,
                         selected_pane(&app),
                         &codex,
                         profile.permissions == PermissionPreset::Yolo,
-                    )?;
-                    return Ok(());
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(error @ MuxError::CreatedPaneNotSelected { .. }) => return Err(error),
+                        Err(error) => app.launch_failed(format!(
+                            "Profile {:?} did not create a Codex session: {error}",
+                            profile.name
+                        )),
+                    }
                 }
                 Action::PersistProfiles(profiles) => match theme_store.save_profiles(&profiles) {
                     Ok(()) => app.profiles_saved(profiles),
@@ -837,6 +843,22 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
     })
 }
 
+fn configured_codex_executables(
+    mut executables: Vec<CodexExecutable>,
+    profiles: &[LaunchProfile],
+) -> Result<Vec<CodexExecutable>> {
+    for path in profiles
+        .iter()
+        .filter_map(|profile| profile.executable.clone())
+    {
+        let executable = CodexExecutable::new(path)?;
+        if !executables.contains(&executable) {
+            executables.push(executable);
+        }
+    }
+    Ok(executables)
+}
+
 fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
     let codex_path = process.launch.as_path().to_owned();
     let inspector = LinuxProcessInspector::with_matcher(
@@ -909,6 +931,116 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
     )
 }
 
+fn verify_volatile_pane_titles(
+    panes: &mut [crate::domain::Pane],
+    store: Option<&ProcessRolloutStore>,
+) {
+    let indices = panes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pane)| {
+            (pane.generated_title.is_some() && !pane.generated_source_stable).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        return;
+    }
+    let candidates = indices
+        .iter()
+        .map(|index| panes[*index].clone())
+        .collect::<Vec<_>>();
+    let cancelled = AtomicBool::new(false);
+    let resolved =
+        store.and_then(|store| store.resolve_all_cancellable(&candidates, &cancelled).ok());
+    for (offset, index) in indices.into_iter().enumerate() {
+        let verified = resolved
+            .as_ref()
+            .and_then(|values| values.get(offset))
+            .and_then(Option::as_deref)
+            == panes[index].generated_thread_id.as_deref();
+        if !verified {
+            panes[index].generated_title = None;
+            panes[index].generated_at_unix = None;
+        }
+    }
+}
+
+fn verify_volatile_generated_names(
+    names: &HashMap<PaneId, crate::smart_naming::GeneratedName>,
+    panes: &[crate::domain::Pane],
+    store: Option<&ProcessRolloutStore>,
+) -> (
+    HashMap<PaneId, crate::smart_naming::GeneratedName>,
+    HashMap<PaneId, crate::smart_naming::GeneratedName>,
+) {
+    let volatile = names
+        .iter()
+        .filter(|(_, generated)| !generated.stable_source_title)
+        .filter_map(|(pane_id, generated)| {
+            panes
+                .iter()
+                .find(|pane| &pane.id == pane_id)
+                .cloned()
+                .map(|pane| (pane_id.clone(), generated.thread_id.clone(), pane))
+        })
+        .collect::<Vec<_>>();
+    let candidates = volatile
+        .iter()
+        .map(|(_, _, pane)| pane.clone())
+        .collect::<Vec<_>>();
+    let cancelled = AtomicBool::new(false);
+    let resolved =
+        store.and_then(|store| store.resolve_all_cancellable(&candidates, &cancelled).ok());
+    let authoritative = volatile
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (pane_id, _, _))| {
+            resolved
+                .as_ref()?
+                .get(index)?
+                .clone()
+                .map(|thread| (pane_id.clone(), thread))
+        })
+        .collect::<HashMap<_, _>>();
+    filter_names_by_authoritative_threads(names, &authoritative)
+}
+
+fn filter_names_by_authoritative_threads(
+    names: &HashMap<PaneId, crate::smart_naming::GeneratedName>,
+    authoritative: &HashMap<PaneId, String>,
+) -> (
+    HashMap<PaneId, crate::smart_naming::GeneratedName>,
+    HashMap<PaneId, crate::smart_naming::GeneratedName>,
+) {
+    let mut verified = names.clone();
+    let mut invalid = HashMap::new();
+    for (pane_id, generated) in names {
+        if !generated.stable_source_title
+            && authoritative.get(pane_id) != Some(&generated.thread_id)
+        {
+            verified.remove(pane_id);
+            invalid.insert(pane_id.clone(), generated.clone());
+        }
+    }
+    (verified, invalid)
+}
+
+fn volatile_name_matches(
+    store: Option<&ProcessRolloutStore>,
+    pane: &crate::domain::Pane,
+    generated: &crate::smart_naming::GeneratedName,
+) -> bool {
+    let cancelled = AtomicBool::new(false);
+    store
+        .and_then(|store| {
+            store
+                .resolve_all_cancellable(std::slice::from_ref(pane), &cancelled)
+                .ok()
+        })
+        .and_then(|mut resolved| resolved.pop().flatten())
+        .is_some_and(|thread| thread == generated.thread_id)
+}
+
 fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
     let Some(_lock) = try_naming_daemon_lock()? else {
         return Ok(());
@@ -936,9 +1068,21 @@ fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
             process.matches.push(executable);
         }
     }
+    let verification_inspector = LinuxProcessInspector::with_matcher(
+        process.matches.clone(),
+        process.match_scope,
+        &process.match_command_regexes,
+    )?;
+    let verification_inventory = PaneInventory::with_executables(
+        SystemTmuxRunner::default(),
+        verification_inspector,
+        process.matches.clone(),
+    );
+    let verification_rollouts = ProcessRolloutStore::discover(&process.matches).ok();
     let mut worker = Some(start_naming_worker(&process));
     let mut applied_names = HashMap::new();
     let mut last_name_reconcile = Instant::now() - Duration::from_secs(2);
+    let mut volatile_reconcile_cursor = 0_usize;
     let identity = naming_server_identity_from_environment()?;
     let mut retry = Duration::from_millis(100);
     while store.load_preference().smart_naming && tmux_server_matches(&identity) {
@@ -950,7 +1094,55 @@ fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
             .unwrap()
             .clone();
         if names != applied_names || last_name_reconcile.elapsed() >= Duration::from_secs(2) {
-            let immediate_pending = owned_names.reconcile(&names);
+            let panes = verification_inventory.discover().unwrap_or_default();
+            let (verified_names, invalid_volatile) =
+                verify_volatile_generated_names(&names, &panes, verification_rollouts.as_ref());
+            let stable_names = verified_names
+                .iter()
+                .filter(|(_, generated)| generated.stable_source_title)
+                .map(|(pane, generated)| (pane.clone(), generated.clone()))
+                .collect::<HashMap<_, _>>();
+            let mut immediate_pending = owned_names.reconcile(&stable_names);
+            let mut volatile_names = names
+                .iter()
+                .filter(|(_, generated)| !generated.stable_source_title)
+                .collect::<Vec<_>>();
+            volatile_names.sort_by_key(|(pane_id, _)| pane_id.as_str());
+            if !volatile_names.is_empty() {
+                let offset = volatile_reconcile_cursor % volatile_names.len();
+                volatile_names.rotate_left(offset);
+                volatile_reconcile_cursor = (volatile_reconcile_cursor
+                    + MAX_VOLATILE_RECONCILES_PER_CYCLE)
+                    % volatile_names.len();
+            }
+            for (pane_id, generated) in volatile_names
+                .into_iter()
+                .take(MAX_VOLATILE_RECONCILES_PER_CYCLE)
+            {
+                if let Some(invalid) = invalid_volatile.get(pane_id) {
+                    owned_names
+                        .clear_generated(&HashMap::from([(pane_id.clone(), invalid.clone())]));
+                    continue;
+                }
+                let Some(pane) = panes.iter().find(|pane| &pane.id == pane_id) else {
+                    continue;
+                };
+                if !volatile_name_matches(verification_rollouts.as_ref(), pane, generated) {
+                    owned_names
+                        .clear_generated(&HashMap::from([(pane_id.clone(), generated.clone())]));
+                    continue;
+                }
+                immediate_pending |= owned_names.reconcile_with_verified_volatile(
+                    &HashMap::from([(pane_id.clone(), generated.clone())]),
+                    &HashSet::from([pane_id.clone()]),
+                );
+                // Re-prove the exact thread after the tmux mutation. A Resume can
+                // switch threads without changing the pane leader PID/session/CWD.
+                if !volatile_name_matches(verification_rollouts.as_ref(), pane, generated) {
+                    owned_names
+                        .clear_generated(&HashMap::from([(pane_id.clone(), generated.clone())]));
+                }
+            }
             applied_names = names;
             last_name_reconcile = Instant::now();
             if immediate_pending {
@@ -1096,10 +1288,33 @@ fn invocation_context(cli: &Cli) -> Result<InvocationContext> {
             message: "must be absolute".to_owned(),
         });
     }
+    let pane_id = PaneId::new(required(&cli.invoking_pane, "invoking pane")?)?;
+    let window_id = match cli.invoking_window.clone() {
+        Some(window) => WindowId::new(window)?,
+        None => {
+            // v0.9.4 bindings predate --invoking-window. Resolve it from the
+            // exact invoking pane so a binary-only self-update remains usable.
+            let output = SystemTmuxRunner::default().run(&[
+                OsString::from("display-message"),
+                OsString::from("-p"),
+                OsString::from("-t"),
+                OsString::from(pane_id.as_str()),
+                OsString::from("#{window_id}"),
+            ])?;
+            if output.status != Some(0) {
+                return Err(MuxError::Command(format!(
+                    "could not resolve the invoking tmux window: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            WindowId::new(String::from_utf8_lossy(&output.stdout).trim().to_owned())?
+        }
+    };
     Ok(InvocationContext {
         client_id: ClientId::new(required(&cli.client, "tmux client")?)?,
-        pane_id: PaneId::new(required(&cli.invoking_pane, "invoking pane")?)?,
+        pane_id,
         session_id: SessionId::new(required(&cli.invoking_session, "invoking session")?)?,
+        window_id,
         current_path,
     })
 }
@@ -1752,10 +1967,59 @@ fn os_strings<const N: usize>(values: [&str; N]) -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::mpsc, time::Duration};
+    use std::{collections::HashMap, path::PathBuf, sync::mpsc, time::Duration};
 
-    use super::{PaneRefreshWorker, invocation_context, parse_naming_server_identity};
+    use super::{
+        PaneRefreshWorker, configured_codex_executables, filter_names_by_authoritative_threads,
+        invocation_context, parse_naming_server_identity,
+    };
     use crate::cli::Cli;
+    use crate::{
+        config::{LaunchProfile, PermissionPreset},
+        domain::{CodexExecutable, PaneId, SessionId},
+    };
+
+    #[test]
+    fn volatile_name_is_rejected_when_the_same_pane_now_resolves_another_thread() {
+        let pane = PaneId::new("%9").unwrap();
+        let names = HashMap::from([(
+            pane.clone(),
+            crate::smart_naming::GeneratedName {
+                thread_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned(),
+                source_session: SessionId::new("$1").unwrap(),
+                source_pane_pid: 77,
+                stable_source_title: false,
+                source_title: "spinner".to_owned(),
+                source_cwd: PathBuf::from("/work"),
+                name: "Old conversation".to_owned(),
+                generated_at_unix: 1,
+            },
+        )]);
+        let authoritative = HashMap::from([(
+            pane.clone(),
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_owned(),
+        )]);
+        let (verified, invalid) = filter_names_by_authoritative_threads(&names, &authoritative);
+        assert!(verified.is_empty());
+        assert_eq!(
+            invalid.get(&pane).map(|name| name.thread_id.as_str()),
+            Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn profile_executables_are_shared_by_inventory_and_volatile_title_verification() {
+        let direct = CodexExecutable::new("/bin/sh").unwrap();
+        let profile = LaunchProfile {
+            name: "wrapped".to_owned(),
+            key: 'w',
+            executable: Some(PathBuf::from("/bin/bash")),
+            permissions: PermissionPreset::Standard,
+        };
+        let identities = configured_codex_executables(vec![direct.clone()], &[profile]).unwrap();
+        assert!(identities.contains(&direct));
+        assert!(identities.contains(&CodexExecutable::new("/bin/bash").unwrap()));
+    }
 
     #[test]
     fn interactive_context_requires_every_absolute_tmux_value() {
@@ -1770,6 +2034,7 @@ mod tests {
             client: Some("/dev/pts/3".to_owned()),
             invoking_pane: Some("%4".to_owned()),
             invoking_session: Some("$2".to_owned()),
+            invoking_window: Some("@3".to_owned()),
             invoking_path: Some(PathBuf::from("/work/project")),
             command: None,
         };

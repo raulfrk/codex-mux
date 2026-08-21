@@ -4,7 +4,7 @@ use codex_mux::{
     Result,
     domain::{
         CodexExecutable, CommandOutput, InvocationContext, Pane, PaneId, ProcessInspector,
-        SessionId, TmuxCommandRunner,
+        SessionId, TmuxCommandRunner, WindowId,
     },
     tmux::{actions::TmuxActions, inventory::PaneInventory},
 };
@@ -159,6 +159,7 @@ fn unzoomed_switch_uses_two_exact_tmux_requests() {
         client_id: codex_mux::domain::ClientId::new("/dev/pts/7").unwrap(),
         pane_id: PaneId::new("%1").unwrap(),
         session_id: SessionId::new("$1").unwrap(),
+        window_id: WindowId::new("@1").unwrap(),
         current_path: PathBuf::from("/work"),
     };
     let pane = Pane {
@@ -166,6 +167,8 @@ fn unzoomed_switch_uses_two_exact_tmux_requests() {
         session_id: SessionId::new("$2").unwrap(),
         title: Some("target".to_owned()),
         generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
         manual_name: false,

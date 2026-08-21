@@ -5,10 +5,76 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::ErrorKind,
-    os::unix::ffi::OsStringExt,
+    io::{ErrorKind, Read},
+    os::unix::{ffi::OsStringExt, fs::MetadataExt},
     path::{Path, PathBuf},
 };
+
+/// Matches one live process against exact executable or trusted interpreted-script
+/// file identities. Rollout recovery uses this same wrapper-aware identity rule.
+pub(crate) fn pid_matches_file_identities(
+    pid: u32,
+    recognized: &[(u64, u64)],
+    max_cmdline_bytes: u64,
+) -> (bool, u64) {
+    let directory = PathBuf::from(format!("/proc/{pid}"));
+    let executable_link = directory.join("exe");
+    let executable = match fs::read_link(directory.join("exe")) {
+        Ok(path) => path,
+        Err(_) => return (false, 0),
+    };
+    let direct = fs::metadata(&executable_link)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    if direct.is_some_and(|identity| recognized.contains(&identity)) {
+        let current = fs::metadata(&executable_link)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        return (current == direct, 0);
+    }
+    if !is_trusted_interpreter(&executable) {
+        return (false, 0);
+    }
+    let read_cmdline = || {
+        let mut bytes = Vec::new();
+        let read = fs::File::open(directory.join("cmdline"))
+            .and_then(|file| {
+                file.take(max_cmdline_bytes.saturating_add(1))
+                    .read_to_end(&mut bytes)
+            })
+            .is_ok();
+        let consumed = bytes.len() as u64;
+        (
+            (read && consumed <= max_cmdline_bytes).then_some(bytes),
+            consumed,
+        )
+    };
+    let (first, first_bytes) = read_cmdline();
+    let Some(cmdline) = first else {
+        return (false, first_bytes);
+    };
+    let arguments = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| OsString::from_vec(argument.to_vec()))
+        .collect::<Vec<_>>();
+    let Some(script) = interpreted_script_argument(&executable, &arguments) else {
+        return (false, cmdline.len() as u64);
+    };
+    let identity = fs::metadata(Path::new(script))
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    let (second, second_bytes) = read_cmdline();
+    (
+        identity.is_some_and(|identity| recognized.contains(&identity))
+            && second.as_deref() == Some(cmdline.as_slice())
+            && fs::metadata(&executable_link)
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                == direct,
+        first_bytes + second_bytes,
+    )
+}
 
 use regex::Regex;
 
@@ -914,9 +980,56 @@ fn interpreted_script_argument<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{
+        ffi::OsString,
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::PathBuf,
+        process::Command,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
-    use super::{ProcessEvidence, descendants, parse_stat, same_foreground_snapshot};
+    use super::{
+        ProcessEvidence, descendants, parse_stat, pid_matches_file_identities,
+        same_foreground_snapshot,
+    };
+
+    #[test]
+    fn rollout_identity_accepts_an_actual_interpreted_launcher_script() {
+        let script = std::env::temp_dir().join(format!(
+            "codex-mux-interpreted-profile-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&script, b"#!/bin/sh\nsleep 5 &\nwait\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = fs::metadata(&script).unwrap();
+        let mut child = Command::new(&script).spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !pid_matches_file_identities(
+            child.id(),
+            &[(metadata.dev(), metadata.ino())],
+            1024 * 1024,
+        )
+        .0 && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            pid_matches_file_identities(
+                child.id(),
+                &[(metadata.dev(), metadata.ino())],
+                1024 * 1024,
+            )
+            .0
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_file(script).unwrap();
+    }
 
     #[test]
     fn parses_stat_with_spaces_and_parentheses_in_comm() {
