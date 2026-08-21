@@ -4,6 +4,14 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-21
+
+### Fixed
+
+- Request Codex's non-truncated `thread` terminal title for new Mux sessions, resolve legacy prefixes against verified rollout identity without requiring the original working directory, and fail closed on ambiguity.
+- Read completed conversations through bounded `thread/turns/list` and `thread/items/list` pagination instead of the hanging monolithic `thread/read`, with a descriptor-pinned private rollout fallback for unloaded and externally started sessions.
+- Tolerate malformed individual rollout records without logging conversation text, and retain privacy-safe diagnostics for the selected identity and retrieval path.
+
 ## [0.9.2] - 2026-08-21
 
 ### Fixed

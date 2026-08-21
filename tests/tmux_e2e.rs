@@ -1534,7 +1534,7 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
             "{log}"
         );
         assert!(
-            log.contains("arg0=-c\narg1=tui.terminal_title=[\"thread-id\"]\n"),
+            log.contains("arg0=-c\narg1=tui.terminal_title=[\"thread\"]\n"),
             "launch did not preserve direct config arguments: {log}"
         );
         assert!(

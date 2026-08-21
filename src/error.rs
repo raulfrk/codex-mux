@@ -31,6 +31,10 @@ pub enum MuxError {
     #[error("command failed: {0}")]
     Command(String),
 
+    /// Cooperative cancellation interrupted an in-flight operation.
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// The requested surface exists in the CLI but is not wired yet.
     #[error("{0} is not available in this bootstrap build")]
     Unavailable(&'static str),

@@ -37,6 +37,7 @@ use crate::{
     shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
     smart_naming::{
         AppServerNamer, AppServerProcess, NamingDiagnostics, NamingTarget, NamingWorker,
+        RolloutStore,
     },
     tmux::{
         actions::TmuxActions,
@@ -818,12 +819,19 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
     );
     let diagnostics = NamingDiagnostics::discover().ok();
     let namer_diagnostics = diagnostics.clone();
+    let rollouts = RolloutStore::discover().ok();
     NamingWorker::spawn_logged(
         move |cancelled| {
-            AppServerProcess::spawn_with_cancel(&codex_path, cancelled).map(|session| {
-                match namer_diagnostics {
+            AppServerProcess::spawn_with_cancel(&codex_path, cancelled.clone()).map(|session| {
+                let namer = match namer_diagnostics {
                     Some(diagnostics) => AppServerNamer::with_diagnostics(session, diagnostics),
                     None => AppServerNamer::new(session),
+                };
+                match rollouts.clone() {
+                    Some(rollouts) => {
+                        namer.with_rollouts(rollouts.with_cancellation(cancelled.clone()))
+                    }
+                    None => namer,
                 }
             })
         },

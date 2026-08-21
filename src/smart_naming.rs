@@ -1,10 +1,10 @@
 //! Privacy-bounded conversation extraction and Codex app-server naming contract.
 
 use std::{
-    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -15,6 +15,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::{fd::OwnedFd, unix::ffi::OsStrExt};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,7 +33,17 @@ pub const MAX_CONVERSATION_BYTES: usize = 12 * 1024;
 pub const MAX_NAME_CHARS: usize = 48;
 const THREAD_LIST_PAGE_SIZE: u32 = 100;
 const MAX_THREAD_LIST_PAGES: usize = 20;
+const THREAD_TURNS_PAGE_SIZE: u32 = 100;
+const MAX_THREAD_TURNS_PAGES: usize = 100;
 const MAX_APP_SERVER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ROLLOUT_ENTRIES: usize = 100_000;
+const MAX_ROLLOUT_DEPTH: usize = 8;
+const MAX_ROLLOUT_IDENTITY_BYTES: u64 = 1024 * 1024;
+const MAX_ROLLOUT_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_HISTORY_REQUESTS: usize = 64;
+const MAX_HISTORY_ENTRIES: usize = MAX_HISTORY_REQUESTS * THREAD_TURNS_PAGE_SIZE as usize;
+const MAX_HISTORY_ID_BYTES: usize = 128;
+const MAX_CURSOR_BYTES: usize = 4096;
 /// Interval between reconsidering an existing smart title.
 pub const NAMING_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Cooldown before retrying a failed naming attempt or restarting an unhealthy provider.
@@ -54,6 +67,10 @@ const DIAGNOSTIC_CODES: &[&str] = &[
     "thread_state_db_miss",
     "thread_archive_cross_check",
     "thread_resolve_not_found",
+    "thread_rollout_resolved",
+    "thread_rollout_ambiguous",
+    "thread_turns_read",
+    "thread_rollout_read",
     "identity_changed",
     "name_published",
     "process_rejected",
@@ -295,7 +312,7 @@ impl AppServerProcess {
     fn initialize(&mut self) -> Result<()> {
         let id = self.send_request("initialize", json!({
             "clientInfo": {"name": "codex-mux", "title": "codex-mux smart naming", "version": env!("CARGO_PKG_VERSION")},
-            "capabilities": {"experimentalApi": false}
+            "capabilities": {"experimentalApi": true}
         }))?;
         let response =
             self.receive_matching(Duration::from_secs(15), |message| message["id"] == id)?;
@@ -337,7 +354,7 @@ impl AppServerProcess {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if self.cancelled.load(Ordering::Acquire) {
-                return Err(protocol("app-server request cancelled"));
+                return Err(MuxError::Cancelled);
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let wait = remaining.min(Duration::from_millis(100));
@@ -353,6 +370,7 @@ impl AppServerProcess {
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.healthy.store(false, Ordering::Release);
                     return Err(protocol("app-server readiness timed out"));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -598,7 +616,7 @@ impl<S: AppServerSession + Send + 'static> ConversationNamer for AppServerNamer<
 
     fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
         let thread_id = self.resolve(target)?;
-        self.read_completed(&thread_id)
+        self.read_with_fallback(&thread_id)
     }
 
     fn name(&mut self, conversation: &NamingConversation) -> Result<String> {
@@ -1078,10 +1096,420 @@ pub(crate) fn looks_like_thread_id(value: &str) -> bool {
         })
 }
 
+/// Bounded, local source of authoritative Codex thread identity and completed items.
+#[derive(Clone, Debug)]
+pub struct RolloutStore {
+    root: PathBuf,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl RolloutStore {
+    /// Discovers `$CODEX_HOME/sessions`, falling back to `~/.codex/sessions`.
+    pub fn discover() -> Result<Self> {
+        let codex_home = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .ok_or_else(|| MuxError::Command("HOME and CODEX_HOME are unset".to_owned()))?;
+        Ok(Self::at(codex_home.join("sessions")))
+    }
+
+    /// Uses an explicit sessions root, primarily for tests and embedding.
+    #[must_use]
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            cancelled: None,
+        }
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
+    fn resolve_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        let mut matched: Option<String> = None;
+        self.visit_rollouts(|thread_id, file, path| {
+            if thread_id.starts_with(prefix)
+                && rollout_identity_matches(file, path, thread_id, self.cancelled.as_ref())?
+            {
+                if matched
+                    .as_deref()
+                    .is_some_and(|existing| existing != thread_id)
+                {
+                    return Err(protocol("truncated pane title matches multiple rollouts"));
+                }
+                matched = Some(thread_id.to_owned());
+            }
+            Ok(())
+        })?;
+        Ok(matched)
+    }
+
+    fn read_completed(&self, thread_id: &str) -> Result<NamingConversation> {
+        let mut matched = None;
+        self.visit_rollouts(|candidate, file, path| {
+            if candidate == thread_id
+                && rollout_identity_matches(file, path, thread_id, self.cancelled.as_ref())?
+            {
+                let conversation =
+                    read_rollout_transcript(file, path, thread_id, self.cancelled.as_ref())?;
+                if matched.replace(conversation).is_some() {
+                    return Err(protocol("thread id matches multiple rollout files"));
+                }
+            }
+            Ok(())
+        })?;
+        matched.ok_or_else(|| protocol("verified rollout file was not found"))
+    }
+
+    #[cfg(unix)]
+    fn visit_rollouts(
+        &self,
+        mut visit: impl FnMut(&str, &mut fs::File, &Path) -> Result<()>,
+    ) -> Result<()> {
+        use rustix::fs::{Mode, OFlags, open};
+
+        ensure_not_cancelled(self.cancelled.as_ref())?;
+        let root = match open(
+            &self.root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(root) => root,
+            Err(rustix::io::Errno::NOENT) => return Ok(()),
+            Err(error) => return Err(rollout_io_error(&self.root, error)),
+        };
+        let root_file = fs::File::from(root);
+        validate_rollout_directory(&root_file, &self.root)?;
+        let root = root_file.into();
+        let mut visited = 0usize;
+        walk_rollout_directory(
+            &root,
+            &self.root,
+            0,
+            &mut visited,
+            self.cancelled.as_ref(),
+            &mut visit,
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn visit_rollouts(
+        &self,
+        _visit: impl FnMut(&str, &mut fs::File, &Path) -> Result<()>,
+    ) -> Result<()> {
+        Err(protocol(
+            "rollout fallback requires Unix descriptor-safe traversal",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn walk_rollout_directory(
+    directory: &OwnedFd,
+    directory_path: &Path,
+    depth: usize,
+    visited: &mut usize,
+    cancelled: Option<&Arc<AtomicBool>>,
+    visit: &mut impl FnMut(&str, &mut fs::File, &Path) -> Result<()>,
+) -> Result<()> {
+    use rustix::fs::{Dir, FileType, Mode, OFlags, openat};
+
+    if depth > MAX_ROLLOUT_DEPTH {
+        return Err(protocol("rollout discovery exceeded its depth limit"));
+    }
+    let entries =
+        Dir::read_from(directory).map_err(|error| rollout_io_error(directory_path, error))?;
+    for entry in entries {
+        ensure_not_cancelled(cancelled)?;
+        *visited += 1;
+        if *visited > MAX_ROLLOUT_ENTRIES {
+            return Err(protocol("rollout discovery exceeded its entry limit"));
+        }
+        let entry = entry.map_err(|error| rollout_io_error(directory_path, error))?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let path = directory_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        match entry.file_type() {
+            FileType::Directory => {
+                let child = openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| rollout_io_error(&path, error))?;
+                let child_file = fs::File::from(child);
+                validate_rollout_directory(&child_file, &path)?;
+                let child = child_file.into();
+                walk_rollout_directory(&child, &path, depth + 1, visited, cancelled, visit)?;
+            }
+            FileType::RegularFile => {
+                let Some(thread_id) = rollout_thread_id(&path) else {
+                    continue;
+                };
+                let file = openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| rollout_io_error(&path, error))?;
+                let mut file = fs::File::from(file);
+                validate_rollout_file(&file, &path)?;
+                visit(&thread_id, &mut file, &path)?;
+            }
+            FileType::Symlink => return Err(protocol("rollout tree contains a symlink")),
+            FileType::Unknown => {
+                return Err(protocol("rollout tree contains an unknown entry type"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_not_cancelled(cancelled: Option<&Arc<AtomicBool>>) -> Result<()> {
+    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+        return Err(MuxError::Cancelled);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rollout_io_error(path: &Path, error: rustix::io::Errno) -> MuxError {
+    MuxError::Filesystem {
+        path: path.to_owned(),
+        source: std::io::Error::from_raw_os_error(error.raw_os_error()),
+    }
+}
+
+#[cfg(unix)]
+fn validate_rollout_directory(file: &fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().map_err(|source| MuxError::Filesystem {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(protocol("rollout directory is not private and owned"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_rollout_file(file: &fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().map_err(|source| MuxError::Filesystem {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(protocol(
+            "rollout is not a private owned single-link regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn rollout_thread_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let start = stem.len().checked_sub(36)?;
+    let thread_id = &stem[start..];
+    looks_like_thread_id(thread_id).then(|| thread_id.to_owned())
+}
+
+fn rollout_identity_matches(
+    file: &mut fs::File,
+    path: &Path,
+    expected: &str,
+    cancelled: Option<&Arc<AtomicBool>>,
+) -> Result<bool> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| MuxError::Filesystem {
+            path: path.to_owned(),
+            source,
+        })?;
+    let mut reader = BufReader::new(file.take(MAX_ROLLOUT_IDENTITY_BYTES + 1));
+    let mut line = Vec::new();
+    let mut total = 0_u64;
+    loop {
+        ensure_not_cancelled(cancelled)?;
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| MuxError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > MAX_ROLLOUT_IDENTITY_BYTES {
+            return Err(protocol("rollout identity exceeded its byte limit"));
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+            if value["type"] == "session_meta" {
+                return Ok(value.pointer("/payload/id").and_then(Value::as_str) == Some(expected));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn read_rollout_transcript(
+    file: &mut fs::File,
+    path: &Path,
+    thread_id: &str,
+    cancelled: Option<&Arc<AtomicBool>>,
+) -> Result<NamingConversation> {
+    let length = file
+        .metadata()
+        .map_err(|source| MuxError::Filesystem {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if length > MAX_ROLLOUT_TRANSCRIPT_BYTES {
+        file.seek(SeekFrom::Start(length - MAX_ROLLOUT_TRANSCRIPT_BYTES))
+            .map_err(|source| MuxError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+    } else {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| MuxError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+    }
+    let mut reader = BufReader::new(file.take(MAX_ROLLOUT_TRANSCRIPT_BYTES + 1));
+    if length > MAX_ROLLOUT_TRANSCRIPT_BYTES {
+        let mut partial = Vec::new();
+        let _ = reader.read_until(b'\n', &mut partial);
+    }
+    let mut transcript = String::new();
+    let mut seen_item_ids = HashSet::new();
+    let mut legacy_assistant_for_pair: Option<String> = None;
+    let mut line = Vec::new();
+    while transcript.len() < MAX_CONVERSATION_BYTES {
+        ensure_not_cancelled(cancelled)?;
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| MuxError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        let paired_legacy_assistant = legacy_assistant_for_pair.take();
+        if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+            if value["type"] == "event_msg"
+                && value.pointer("/payload/type").and_then(Value::as_str) == Some("item_completed")
+            {
+                let item = &value["payload"]["item"];
+                if let Some(id) = item["id"].as_str() {
+                    if !seen_item_ids.insert(id.to_owned()) {
+                        continue;
+                    }
+                }
+                let role = match item["type"].as_str() {
+                    Some("UserMessage") => Some("User"),
+                    Some("AgentMessage") => Some("Assistant"),
+                    _ => None,
+                };
+                if let Some(role) = role {
+                    append_rollout_content(&mut transcript, role, &item["content"]);
+                }
+            } else if value["type"] == "event_msg" {
+                let payload = &value["payload"];
+                let role = match payload["type"].as_str() {
+                    Some("user_message") => Some("User"),
+                    Some("agent_message") => Some("Assistant"),
+                    _ => None,
+                };
+                if let Some(role) = role {
+                    if let Some(message) = payload["message"].as_str() {
+                        append_bounded(&mut transcript, role, message);
+                        if role == "Assistant" {
+                            legacy_assistant_for_pair = Some(message.to_owned());
+                        }
+                    }
+                }
+            } else if value["type"] == "response_item"
+                && value.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+                && value.pointer("/payload/role").and_then(Value::as_str) == Some("assistant")
+            {
+                let payload = &value["payload"];
+                let id_is_new = payload["id"]
+                    .as_str()
+                    .is_none_or(|id| seen_item_ids.insert(id.to_owned()));
+                let duplicates_legacy = payload["id"].as_str().is_none()
+                    && rollout_single_text(&payload["content"])
+                        .zip(paired_legacy_assistant.as_deref())
+                        .is_some_and(|(response, legacy)| response == legacy);
+                if id_is_new && !duplicates_legacy {
+                    append_rollout_content(&mut transcript, "Assistant", &payload["content"]);
+                }
+            }
+        }
+    }
+    Ok(NamingConversation {
+        thread_id: thread_id.to_owned(),
+        transcript,
+    })
+}
+
+fn rollout_single_text(content: &Value) -> Option<&str> {
+    if let Some(text) = content.as_str() {
+        return Some(text);
+    }
+    let parts = content.as_array()?;
+    (parts.len() == 1)
+        .then(|| parts[0]["text"].as_str())
+        .flatten()
+}
+
+fn append_rollout_content(transcript: &mut String, role: &str, content: &Value) {
+    if let Some(text) = content.as_str() {
+        append_bounded(transcript, role, text);
+        return;
+    }
+    let Some(parts) = content.as_array() else {
+        return;
+    };
+    for part in parts {
+        if let Some(text) = part["text"].as_str() {
+            append_bounded(transcript, role, text);
+        }
+    }
+}
+
 /// Reads completed turns and asks an ephemeral Luna thread for a short title.
 pub struct AppServerNamer<S> {
     session: S,
     diagnostics: Option<NamingDiagnostics>,
+    rollouts: Option<RolloutStore>,
+}
+
+enum ThreadLookupError {
+    Cancelled,
+    Transport(MuxError),
+    Evidence(MuxError),
 }
 
 impl<S: AppServerSession> AppServerNamer<S> {
@@ -1091,6 +1519,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
         Self {
             session,
             diagnostics: None,
+            rollouts: None,
         }
     }
 
@@ -1100,7 +1529,15 @@ impl<S: AppServerSession> AppServerNamer<S> {
         Self {
             session,
             diagnostics: Some(diagnostics),
+            rollouts: None,
         }
+    }
+
+    /// Adds the local authoritative rollout store used for identity and read fallback.
+    #[must_use]
+    pub fn with_rollouts(mut self, rollouts: RolloutStore) -> Self {
+        self.rollouts = Some(rollouts);
+        self
     }
 
     fn resolve_thread_id(&mut self, target: &NamingTarget) -> Result<String> {
@@ -1108,112 +1545,280 @@ impl<S: AppServerSession> AppServerNamer<S> {
             return Ok(target.thread_hint.clone());
         }
 
-        let state_match = self.find_thread_id(target, true, None)?;
+        let mut matched = None;
+        if let Some(rollouts) = &self.rollouts {
+            match rollouts.resolve_prefix(&target.thread_hint) {
+                Ok(Some(thread_id)) => {
+                    log_diagnostic(&self.diagnostics, "thread_rollout_resolved");
+                    matched = Some(thread_id);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    log_diagnostic(&self.diagnostics, "thread_rollout_ambiguous");
+                    return Err(error);
+                }
+            }
+        }
+
+        let state_match = match self.find_thread_id(target, true, matched.clone()) {
+            Ok(value) => value,
+            Err(ThreadLookupError::Cancelled) => return Err(MuxError::Cancelled),
+            Err(ThreadLookupError::Transport(_error)) if matched.is_some() => {
+                return Ok(matched.unwrap());
+            }
+            Err(ThreadLookupError::Transport(error) | ThreadLookupError::Evidence(error)) => {
+                return Err(error);
+            }
+        };
         if state_match.is_none() {
             log_diagnostic(&self.diagnostics, "thread_state_db_miss");
         }
         log_diagnostic(&self.diagnostics, "thread_archive_cross_check");
-        self.find_thread_id(target, false, state_match)?
-            .ok_or_else(|| {
-                log_diagnostic(&self.diagnostics, "thread_resolve_not_found");
-                protocol("truncated pane title did not match a thread in its working directory")
-            })
+        let archive_match = match self.find_thread_id(target, false, state_match) {
+            Ok(value) => value,
+            Err(ThreadLookupError::Cancelled) => return Err(MuxError::Cancelled),
+            Err(ThreadLookupError::Transport(_error)) if matched.is_some() => matched,
+            Err(ThreadLookupError::Transport(error) | ThreadLookupError::Evidence(error)) => {
+                return Err(error);
+            }
+        };
+        archive_match.ok_or_else(|| {
+            log_diagnostic(&self.diagnostics, "thread_resolve_not_found");
+            protocol("truncated pane title did not match one unique Codex thread")
+        })
     }
 
-    /// Finds one exact same-CWD UUID prefix in one bounded app-server source.
+    /// Finds one exact UUID prefix in one bounded app-server source.
     fn find_thread_id(
         &mut self,
         target: &NamingTarget,
         use_state_db_only: bool,
         mut matched: Option<String>,
-    ) -> Result<Option<String>> {
+    ) -> std::result::Result<Option<String>, ThreadLookupError> {
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
         for _ in 0..MAX_THREAD_LIST_PAGES {
-            let response = self.session.request(
-                "thread/list",
-                json!({
-                    "cwd": target.cwd,
-                    "cursor": cursor,
-                    "limit": THREAD_LIST_PAGE_SIZE,
-                    "sortKey": "updated_at",
-                    "sortDirection": "desc",
-                    "useStateDbOnly": use_state_db_only
-                }),
-            )?;
-            let threads = response["data"]
-                .as_array()
-                .ok_or_else(|| protocol("thread/list did not return thread data"))?;
+            let response = self
+                .session
+                .request(
+                    "thread/list",
+                    json!({
+                        "cursor": cursor,
+                        "limit": THREAD_LIST_PAGE_SIZE,
+                        "sortKey": "updated_at",
+                        "sortDirection": "desc",
+                        "useStateDbOnly": use_state_db_only
+                    }),
+                )
+                .map_err(|error| match error {
+                    MuxError::Cancelled => ThreadLookupError::Cancelled,
+                    error => ThreadLookupError::Transport(error),
+                })?;
+            let threads = response["data"].as_array().ok_or_else(|| {
+                ThreadLookupError::Evidence(protocol("thread/list did not return thread data"))
+            })?;
+            if threads.len() > THREAD_LIST_PAGE_SIZE as usize {
+                return Err(ThreadLookupError::Evidence(protocol(
+                    "thread/list exceeded its requested page size",
+                )));
+            }
             for thread in threads {
                 let Some(id) = thread["id"].as_str() else {
                     continue;
                 };
-                let same_cwd = thread["cwd"]
-                    .as_str()
-                    .is_some_and(|cwd| Path::new(cwd) == target.cwd);
-                if same_cwd && looks_like_thread_id(id) && id.starts_with(&target.thread_hint) {
+                if looks_like_thread_id(id) && id.starts_with(&target.thread_hint) {
                     if matched.as_deref().is_some_and(|existing| existing != id) {
-                        return Err(protocol("truncated pane title matches multiple threads"));
+                        return Err(ThreadLookupError::Evidence(protocol(
+                            "truncated pane title matches multiple threads",
+                        )));
                     }
                     matched = Some(id.to_owned());
                 }
             }
 
-            let next = response["nextCursor"].as_str().map(ToOwned::to_owned);
+            let next =
+                bounded_cursor(&response["nextCursor"]).map_err(ThreadLookupError::Evidence)?;
             if next.is_none() {
                 return Ok(matched);
             }
-            if next == cursor {
-                return Err(protocol("thread/list repeated its pagination cursor"));
+            if !seen_cursors.insert(next.clone().unwrap()) {
+                return Err(ThreadLookupError::Evidence(protocol(
+                    "thread/list repeated its pagination cursor",
+                )));
             }
             cursor = next;
         }
-        Err(protocol(
+        Err(ThreadLookupError::Evidence(protocol(
             "thread/list exceeded the bounded pagination limit",
-        ))
+        )))
     }
 
-    /// Reads only structured, completed turns through `thread/read`.
+    /// Reads structured completed turns through the bounded paginated API.
     pub fn read_completed(&mut self, thread_id: &str) -> Result<NamingConversation> {
-        let response = self.session.request(
-            "thread/read",
-            json!({"threadId": thread_id, "includeTurns": true}),
-        )?;
-        let turns = response
-            .pointer("/thread/turns")
-            .and_then(Value::as_array)
-            .ok_or_else(|| protocol("thread/read did not return full turns"))?;
         let mut transcript = String::new();
-        for turn in turns.iter().filter(|turn| turn["status"] == "completed") {
-            let Some(items) = turn["items"].as_array() else {
-                continue;
-            };
-            for item in items {
+        let mut completed_turns = HashSet::new();
+        let mut request_budget = MAX_HISTORY_REQUESTS;
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut turns_complete = false;
+        for _ in 0..MAX_THREAD_TURNS_PAGES {
+            take_history_request(&mut request_budget)?;
+            let response = self.session.request(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": THREAD_TURNS_PAGE_SIZE,
+                    "itemsView": "notLoaded",
+                    "sortDirection": "asc"
+                }),
+            )?;
+            let turns = response["data"]
+                .as_array()
+                .ok_or_else(|| protocol("thread/turns/list did not return turn data"))?;
+            if turns.len() > THREAD_TURNS_PAGE_SIZE as usize {
+                return Err(protocol(
+                    "thread/turns/list exceeded its requested page size",
+                ));
+            }
+            for turn in turns.iter().filter(|turn| turn["status"] == "completed") {
+                let Some(turn_id) = turn["id"].as_str() else {
+                    continue;
+                };
+                if turn_id.is_empty() || turn_id.len() > MAX_HISTORY_ID_BYTES {
+                    return Err(protocol("thread/turns/list returned an invalid turn id"));
+                }
+                if completed_turns.len() >= MAX_HISTORY_ENTRIES
+                    && !completed_turns.contains(turn_id)
+                {
+                    return Err(protocol("conversation history exceeded its entry budget"));
+                }
+                completed_turns.insert(turn_id.to_owned());
+            }
+            let next = bounded_cursor(&response["nextCursor"])?;
+            if next.is_none() {
+                turns_complete = true;
+                break;
+            }
+            if !seen_cursors.insert(next.clone().unwrap()) {
+                return Err(protocol("thread/turns/list repeated its pagination cursor"));
+            }
+            cursor = next;
+            continue;
+        }
+        if !turns_complete {
+            return Err(protocol(
+                "thread/turns/list exceeded the bounded pagination limit",
+            ));
+        }
+        self.read_thread_items(
+            thread_id,
+            &completed_turns,
+            &mut transcript,
+            &mut request_budget,
+        )?;
+        Ok(NamingConversation {
+            thread_id: thread_id.to_owned(),
+            transcript,
+        })
+    }
+
+    fn read_thread_items(
+        &mut self,
+        thread_id: &str,
+        completed_turns: &HashSet<String>,
+        transcript: &mut String,
+        request_budget: &mut usize,
+    ) -> Result<()> {
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        for _ in 0..MAX_THREAD_TURNS_PAGES {
+            take_history_request(request_budget)?;
+            let response = self.session.request(
+                "thread/items/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": THREAD_TURNS_PAGE_SIZE,
+                    "sortDirection": "asc"
+                }),
+            )?;
+            let items = response["data"]
+                .as_array()
+                .ok_or_else(|| protocol("thread/items/list did not return item data"))?;
+            if items.len() > THREAD_TURNS_PAGE_SIZE as usize {
+                return Err(protocol(
+                    "thread/items/list exceeded its requested page size",
+                ));
+            }
+            for entry in items {
+                let Some(turn_id) = entry["turnId"].as_str() else {
+                    continue;
+                };
+                if turn_id.is_empty() || turn_id.len() > MAX_HISTORY_ID_BYTES {
+                    return Err(protocol("thread/items/list returned an invalid turn id"));
+                }
+                if !completed_turns.contains(turn_id) {
+                    continue;
+                }
+                let item = &entry["item"];
                 match item["type"].as_str() {
                     Some("userMessage") => {
                         if let Some(content) = item["content"].as_array() {
                             for input in content {
                                 if let Some(text) = input["text"].as_str() {
-                                    append_bounded(&mut transcript, "User", text);
+                                    append_bounded(transcript, "User", text);
                                 }
                             }
                         }
                     }
                     Some("agentMessage") => {
                         if let Some(text) = item["text"].as_str() {
-                            append_bounded(&mut transcript, "Assistant", text);
+                            append_bounded(transcript, "Assistant", text);
                         }
                     }
                     _ => {}
                 }
-                if transcript.len() >= MAX_CONVERSATION_BYTES {
-                    break;
+            }
+            let next = bounded_cursor(&response["nextCursor"])?;
+            if let Some(next) = &next {
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(protocol("thread/items/list repeated its pagination cursor"));
+                }
+            }
+            if transcript.len() >= MAX_CONVERSATION_BYTES || next.is_none() {
+                return Ok(());
+            }
+            cursor = next;
+        }
+        Err(protocol(
+            "thread/items/list exceeded the bounded pagination limit",
+        ))
+    }
+
+    fn read_with_fallback(&mut self, thread_id: &str) -> Result<NamingConversation> {
+        match self.read_completed(thread_id) {
+            Ok(conversation) => {
+                log_diagnostic(&self.diagnostics, "thread_turns_read");
+                Ok(conversation)
+            }
+            Err(primary) => {
+                if matches!(primary, MuxError::Cancelled) {
+                    return Err(primary);
+                }
+                let Some(rollouts) = &self.rollouts else {
+                    return Err(primary);
+                };
+                match rollouts.read_completed(thread_id) {
+                    Ok(conversation) => {
+                        log_diagnostic(&self.diagnostics, "thread_rollout_read");
+                        Ok(conversation)
+                    }
+                    Err(MuxError::Cancelled) => Err(MuxError::Cancelled),
+                    Err(_) => Err(primary),
                 }
             }
         }
-        Ok(NamingConversation {
-            thread_id: thread_id.to_owned(),
-            transcript,
-        })
     }
 
     /// Generates and strictly validates a title using an ephemeral Luna thread.
@@ -1272,6 +1877,27 @@ impl<S: AppServerSession> AppServerNamer<S> {
             .map_err(|_| protocol("Luna returned malformed structured output"))?;
         validate_name(&output.title)
     }
+}
+
+fn take_history_request(remaining: &mut usize) -> Result<()> {
+    if *remaining == 0 {
+        return Err(protocol("conversation history exceeded its request budget"));
+    }
+    *remaining -= 1;
+    Ok(())
+}
+
+fn bounded_cursor(value: &Value) -> Result<Option<String>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(cursor) = value.as_str() else {
+        return Err(protocol("app-server returned an invalid pagination cursor"));
+    };
+    if cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES {
+        return Err(protocol("app-server returned an invalid pagination cursor"));
+    }
+    Ok(Some(cursor.to_owned()))
 }
 
 fn append_bounded(target: &mut String, role: &str, text: &str) {
@@ -1804,5 +2430,22 @@ mod transport_tests {
             message.pointer("/params/threadId").and_then(Value::as_str) != Some("other")
         });
         assert_eq!(pending, VecDeque::from([json!({"id": 7, "result": {}})]));
+    }
+
+    #[test]
+    fn cancelled_rollout_scan_stops_before_traversal() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-mux-cancelled-rollout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("2026/08/21")).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let store = RolloutStore::at(&root).with_cancellation(cancelled);
+        assert!(matches!(
+            store.resolve_prefix("01a01001"),
+            Err(MuxError::Cancelled)
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 }

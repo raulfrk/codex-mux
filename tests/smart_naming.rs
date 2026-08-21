@@ -1,5 +1,7 @@
 use std::{
     collections::VecDeque,
+    fs,
+    path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     thread,
@@ -7,11 +9,11 @@ use std::{
 };
 
 use codex_mux::{
-    Result,
+    MuxError, Result,
     smart_naming::{
         AppServerNamer, AppServerProcess, AppServerSession, ConversationNamer,
         MAX_CONVERSATION_BYTES, NAMING_MODEL, NamingConversation, NamingTarget, NamingWorker,
-        start_if_enabled,
+        RolloutStore, start_if_enabled,
     },
 };
 use serde_json::{Value, json};
@@ -59,18 +61,522 @@ impl AppServerSession for FakeSession {
     }
 }
 
+struct UnavailableSession;
+
+impl AppServerSession for UnavailableSession {
+    fn request(&mut self, _: &str, _: Value) -> Result<Value> {
+        Err(MuxError::Command("app-server unavailable".to_owned()))
+    }
+
+    fn wait_for(&mut self, _: &str, _: &str) -> Result<Value> {
+        Err(MuxError::Command("app-server unavailable".to_owned()))
+    }
+
+    fn is_healthy(&self) -> bool {
+        false
+    }
+}
+
+struct ArchiveFailsSession {
+    thread_id: String,
+    healthy: bool,
+}
+
+struct UnhealthyReplySession {
+    reply: Option<Value>,
+}
+
+impl AppServerSession for UnhealthyReplySession {
+    fn request(&mut self, _: &str, _: Value) -> Result<Value> {
+        Ok(self.reply.take().unwrap())
+    }
+
+    fn wait_for(&mut self, _: &str, _: &str) -> Result<Value> {
+        Err(MuxError::Command("app-server exited".to_owned()))
+    }
+
+    fn is_healthy(&self) -> bool {
+        false
+    }
+}
+
+impl AppServerSession for ArchiveFailsSession {
+    fn request(&mut self, _: &str, _: Value) -> Result<Value> {
+        if self.healthy {
+            self.healthy = false;
+            Ok(json!({"data": [{"id": self.thread_id}], "nextCursor": null}))
+        } else {
+            Err(MuxError::Command("app-server exited".to_owned()))
+        }
+    }
+
+    fn wait_for(&mut self, _: &str, _: &str) -> Result<Value> {
+        Err(MuxError::Command("app-server exited".to_owned()))
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+}
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "codex-mux-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn verified_rollout_resolves_without_cwd_and_recovers_when_app_server_is_unavailable() {
+    let scratch = Scratch::new("rollout-fallback");
+    let sessions = scratch.0.join("sessions/2026/08/21");
+    fs::create_dir_all(&sessions).unwrap();
+    let full = "01a01001-2dbb-74e2-86ab-996b31234567";
+    let rollout = sessions.join(format!("rollout-2026-08-21T00-00-00-{full}.jsonl"));
+    let mut rollout_bytes = b"\xff\xfe invalid utf8 record\n".to_vec();
+    rollout_bytes.extend_from_slice(
+        format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":\"/original/project\"}}}}\n",
+                "this is a malformed record\n",
+                "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"id\":\"context-1\",\"content\":[{{\"type\":\"input_text\",\"text\":\"secret contextual fragment\"}}]}}}}\n",
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"item_completed\",\"item\":{{\"id\":\"user-1\",\"type\":\"UserMessage\",\"content\":[{{\"type\":\"text\",\"text\":\"resume this elsewhere\"}}]}}}}}}\n",
+                "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"agent-1\",\"content\":[{{\"type\":\"output_text\",\"text\":\"working from the resumed directory\"}}]}}}}\n",
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"item_completed\",\"item\":{{\"id\":\"agent-1\",\"type\":\"AgentMessage\",\"phase\":\"final_answer\",\"content\":[{{\"type\":\"Text\",\"text\":\"working from the resumed directory\"}}]}}}}}}\n",
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"legacy visible answer\"}}}}\n",
+                "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"legacy visible answer\"}}]}}}}\n"
+            ),
+            full
+        )
+        .as_bytes(),
+    );
+    fs::write(&rollout, rollout_bytes).unwrap();
+    let mut namer = AppServerNamer::new(UnavailableSession)
+        .with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/different/resumed/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+
+    let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
+    assert_eq!(conversation.thread_id, full);
+    assert!(
+        conversation
+            .transcript
+            .contains("User: resume this elsewhere")
+    );
+    assert!(
+        conversation
+            .transcript
+            .contains("Assistant: working from the resumed directory")
+    );
+    assert!(
+        !conversation
+            .transcript
+            .contains("secret contextual fragment")
+    );
+    assert_eq!(
+        conversation
+            .transcript
+            .matches("working from the resumed directory")
+            .count(),
+        1
+    );
+    assert_eq!(
+        conversation
+            .transcript
+            .matches("legacy visible answer")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn verified_rollout_survives_provider_exit_during_archive_cross_check() {
+    let scratch = Scratch::new("rollout-partial-provider-failure");
+    let sessions = scratch.0.join("sessions/2026/08/21");
+    fs::create_dir_all(&sessions).unwrap();
+    let full = "01a01001-2dbb-74e2-86ab-996b31234567";
+    fs::write(
+        sessions.join(format!("rollout-2026-08-21T00-00-00-{full}.jsonl")),
+        format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\"}}}}\n",
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"item_completed\",\"item\":{{\"id\":\"user-1\",\"type\":\"UserMessage\",\"content\":[{{\"type\":\"text\",\"text\":\"keep naming\"}}]}}}}}}\n"
+            ),
+            full
+        ),
+    )
+    .unwrap();
+    let session = ArchiveFailsSession {
+        thread_id: full.to_owned(),
+        healthy: true,
+    };
+    let mut namer =
+        AppServerNamer::new(session).with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+    let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
+    assert_eq!(conversation.thread_id, full);
+    assert!(conversation.transcript.contains("User: keep naming"));
+}
+
+#[test]
+fn verified_rollout_prefix_ambiguity_fails_closed() {
+    let scratch = Scratch::new("rollout-ambiguity");
+    let sessions = scratch.0.join("sessions/2026/08/21");
+    fs::create_dir_all(&sessions).unwrap();
+    for full in [
+        "01a01001-2dbb-74e2-86ab-996b31234567",
+        "01a01001-2dbb-74e2-86ab-996b3abcdef0",
+    ] {
+        fs::write(
+            sessions.join(format!("rollout-2026-08-21T00-00-00-{full}.jsonl")),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{full}\"}}}}\n"),
+        )
+        .unwrap();
+    }
+    let mut namer = AppServerNamer::new(UnavailableSession)
+        .with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+
+    assert!(
+        ConversationNamer::read(&mut namer, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple rollouts")
+    );
+}
+
+#[test]
+fn response_only_rollout_uses_visible_assistant_without_contextual_user_fragments() {
+    let scratch = Scratch::new("response-only-rollout");
+    let sessions = scratch.0.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let full = "01a01001-2dbb-74e2-86ab-996b31234567";
+    fs::write(
+        sessions.join(format!("rollout-2026-08-21T00-00-00-{full}.jsonl")),
+        format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\"}}}}\n",
+                "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"id\":\"context\",\"content\":[{{\"type\":\"input_text\",\"text\":\"hidden context\"}}]}}}}\n",
+                "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"answer\",\"content\":[{{\"type\":\"output_text\",\"text\":\"visible completed answer\"}}]}}}}\n"
+            ),
+            full
+        ),
+    )
+    .unwrap();
+    let mut namer = AppServerNamer::new(UnavailableSession)
+        .with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+    let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
+    assert!(
+        conversation
+            .transcript
+            .contains("Assistant: visible completed answer")
+    );
+    assert!(!conversation.transcript.contains("hidden context"));
+}
+
+#[test]
+fn rollout_and_app_server_prefix_collision_fails_closed() {
+    let scratch = Scratch::new("rollout-app-collision");
+    let sessions = scratch.0.join("sessions/2026/08/21");
+    fs::create_dir_all(&sessions).unwrap();
+    let rollout_id = "01a01001-2dbb-74e2-86ab-996b31234567";
+    let server_id = "01a01001-2dbb-74e2-86ab-996b3abcdef0";
+    fs::write(
+        sessions.join(format!("rollout-2026-08-21T00-00-00-{rollout_id}.jsonl")),
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{rollout_id}\"}}}}\n"),
+    )
+    .unwrap();
+    let session = FakeSession {
+        replies: VecDeque::from([json!({
+            "data": [{"id": server_id}],
+            "nextCursor": null
+        })]),
+        calls: Arc::default(),
+    };
+    let mut namer =
+        AppServerNamer::new(session).with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+    assert!(
+        ConversationNamer::read(&mut namer, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple threads")
+    );
+}
+
+#[test]
+fn unhealthy_provider_cannot_hide_a_cross_source_collision() {
+    let scratch = Scratch::new("rollout-unhealthy-collision");
+    let sessions = scratch.0.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let rollout_id = "01a01001-2dbb-74e2-86ab-996b31234567";
+    let server_id = "01a01001-2dbb-74e2-86ab-996b3abcdef0";
+    fs::write(
+        sessions.join(format!("rollout-2026-08-21T00-00-00-{rollout_id}.jsonl")),
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{rollout_id}\"}}}}\n"),
+    )
+    .unwrap();
+    let session = UnhealthyReplySession {
+        reply: Some(json!({"data": [{"id": server_id}], "nextCursor": null})),
+    };
+    let mut namer = AppServerNamer::new(session).with_rollouts(RolloutStore::at(sessions));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+    assert!(
+        ConversationNamer::read(&mut namer, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple threads")
+    );
+}
+
+#[test]
+fn multi_cursor_turn_cycle_fails_closed() {
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [], "nextCursor": "a"}),
+            json!({"data": [], "nextCursor": "b"}),
+            json!({"data": [], "nextCursor": "a"}),
+        ]),
+        calls: Arc::default(),
+    };
+    let error = AppServerNamer::new(session)
+        .read_completed("source-thread")
+        .unwrap_err();
+    assert!(error.to_string().contains("repeated its pagination cursor"));
+}
+
+#[test]
+fn multi_cursor_item_cycle_cannot_succeed_by_filling_the_transcript() {
+    let huge = "x".repeat(MAX_CONVERSATION_BYTES * 2);
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [{"id": "turn-1", "status": "completed"}], "nextCursor": null}),
+            json!({"data": [], "nextCursor": "a"}),
+            json!({"data": [], "nextCursor": "b"}),
+            json!({"data": [{"turnId": "turn-1", "item": {"type": "agentMessage", "text": huge}}], "nextCursor": "a"}),
+        ]),
+        calls: Arc::default(),
+    };
+    let error = AppServerNamer::new(session)
+        .read_completed("source-thread")
+        .unwrap_err();
+    assert!(error.to_string().contains("repeated its pagination cursor"));
+}
+
+#[test]
+fn conversation_history_uses_one_shared_request_budget() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut replies = VecDeque::from([json!({
+        "data": [{"id": "turn-1", "status": "completed"}],
+        "nextCursor": null
+    })]);
+    for index in 0..MAX_CONVERSATION_BYTES {
+        replies.push_back(json!({"data": [], "nextCursor": format!("page-{index}")}));
+    }
+    let session = FakeSession {
+        replies,
+        calls: calls.clone(),
+    };
+    let error = AppServerNamer::new(session)
+        .read_completed("source-thread")
+        .unwrap_err();
+    assert!(error.to_string().contains("request budget"));
+    assert_eq!(calls.lock().unwrap().len(), 64);
+}
+
+#[test]
+fn conversation_history_rejects_oversized_pages_ids_and_cursors() {
+    let oversized_page = (0..101)
+        .map(|index| json!({"id": format!("turn-{index}"), "status": "completed"}))
+        .collect::<Vec<_>>();
+    for reply in [
+        json!({"data": oversized_page, "nextCursor": null}),
+        json!({"data": [{"id": "x".repeat(129), "status": "completed"}], "nextCursor": null}),
+        json!({"data": [], "nextCursor": "x".repeat(4097)}),
+    ] {
+        let session = FakeSession {
+            replies: VecDeque::from([reply]),
+            calls: Arc::default(),
+        };
+        assert!(
+            AppServerNamer::new(session)
+                .read_completed("source-thread")
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn multi_cursor_thread_list_cycle_fails_closed() {
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [], "nextCursor": "a"}),
+            json!({"data": [], "nextCursor": "b"}),
+            json!({"data": [], "nextCursor": "a"}),
+        ]),
+        calls: Arc::default(),
+    };
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+    let error = ConversationNamer::read(&mut AppServerNamer::new(session), &target).unwrap_err();
+    assert!(error.to_string().contains("repeated its pagination cursor"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rollout_store_rejects_symlinked_and_writable_trees() {
+    use std::os::unix::{fs::PermissionsExt, fs::symlink};
+
+    let scratch = Scratch::new("rollout-tree-safety");
+    let private = scratch.0.join("private");
+    fs::create_dir_all(&private).unwrap();
+    let linked = scratch.0.join("linked");
+    symlink(&private, &linked).unwrap();
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+    let mut linked_namer =
+        AppServerNamer::new(UnavailableSession).with_rollouts(RolloutStore::at(linked));
+    assert!(ConversationNamer::read(&mut linked_namer, &target).is_err());
+
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o777)).unwrap();
+    let mut writable_namer =
+        AppServerNamer::new(UnavailableSession).with_rollouts(RolloutStore::at(private));
+    assert!(ConversationNamer::read(&mut writable_namer, &target).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn wide_rollout_tree_still_detects_prefix_ambiguity() {
+    let scratch = Scratch::new("wide-rollout-tree");
+    let sessions = scratch.0.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    for index in 0..256 {
+        fs::create_dir(sessions.join(format!("branch-{index}"))).unwrap();
+    }
+    for (branch, full) in [
+        ("branch-0", "01a01001-2dbb-74e2-86ab-996b31234567"),
+        ("branch-255", "01a01001-2dbb-74e2-86ab-996b3abcdef0"),
+    ] {
+        fs::write(
+            sessions
+                .join(branch)
+                .join(format!("rollout-2026-08-21T00-00-00-{full}.jsonl")),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{full}\"}}}}\n"),
+        )
+        .unwrap();
+    }
+    let mut namer =
+        AppServerNamer::new(UnavailableSession).with_rollouts(RolloutStore::at(sessions));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+    assert!(
+        ConversationNamer::read(&mut namer, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple rollouts")
+    );
+}
+
 #[test]
 fn reads_only_completed_user_and_assistant_text_with_a_hard_bound() {
     let huge = "x".repeat(MAX_CONVERSATION_BYTES * 2);
     let session = FakeSession {
-        replies: VecDeque::from([json!({"thread": {"turns": [
-            {"status": "failed", "items": [{"type": "userMessage", "content": [{"type": "text", "text": "secret draft"}]}]},
-            {"status": "completed", "items": [
-                {"type": "userMessage", "content": [{"type": "text", "text": "make switching faster"}]},
-                {"type": "commandExecution", "command": "ignored"},
-                {"type": "agentMessage", "text": huge}
-            ]}
-        ]}})]),
+        replies: VecDeque::from([
+            json!({"data": [
+                {"id": "failed-turn", "status": "failed"},
+                {"id": "completed-turn", "status": "completed"}
+            ], "nextCursor": null}),
+            json!({"data": [
+                {"turnId": "completed-turn", "item": {"type": "userMessage", "content": [{"type": "text", "text": "make switching faster"}]}},
+                {"turnId": "completed-turn", "item": {"type": "commandExecution", "command": "ignored"}},
+                {"turnId": "completed-turn", "item": {"type": "agentMessage", "text": huge}}
+            ], "nextCursor": null}),
+        ]),
         calls: Arc::default(),
     };
     let mut namer = AppServerNamer::new(session);
@@ -85,7 +591,7 @@ fn reads_only_completed_user_and_assistant_text_with_a_hard_bound() {
 }
 
 #[test]
-fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
+fn resolves_one_truncated_thread_across_pages_after_cwd_changes() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let full = "01a01001-2dbb-74e2-86ab-996b31234567";
     let session = FakeSession {
@@ -97,11 +603,10 @@ fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
                 {"id": full, "cwd": "/work/project"}
             ], "nextCursor": null}),
             json!({"data": [], "nextCursor": null}),
-            json!({"thread": {"turns": [
-                {"status": "completed", "items": [
-                    {"type": "userMessage", "content": [{"type": "text", "text": "name this"}]}
-                ]}
-            ]}}),
+            json!({"data": [{"id": "turn-1", "status": "completed"}], "nextCursor": null}),
+            json!({"data": [
+                {"turnId": "turn-1", "item": {"type": "userMessage", "content": [{"type": "text", "text": "name this"}]}}
+            ], "nextCursor": null}),
         ]),
         calls: calls.clone(),
     };
@@ -121,12 +626,16 @@ fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
     assert!(conversation.transcript.contains("User: name this"));
     let calls = calls.lock().unwrap();
     assert_eq!(calls[0].0, "thread/list");
-    assert_eq!(calls[0].1["cwd"], "/work/project");
+    assert!(calls[0].1.get("cwd").is_none());
     assert_eq!(calls[0].1["useStateDbOnly"], true);
     assert_eq!(calls[1].1["cursor"], "page-2");
     assert_eq!(calls[2].1["useStateDbOnly"], false);
-    assert_eq!(calls[3].0, "thread/read");
+    assert_eq!(calls[3].0, "thread/turns/list");
     assert_eq!(calls[3].1["threadId"], full);
+    assert_eq!(calls[3].1["itemsView"], "notLoaded");
+    assert_eq!(calls[4].0, "thread/items/list");
+    assert_eq!(calls[4].1["threadId"], full);
+    assert!(calls[4].1.get("turnId").is_none());
 }
 
 #[test]
@@ -137,9 +646,10 @@ fn resolves_external_truncated_thread_after_state_db_miss() {
         replies: VecDeque::from([
             json!({"data": [], "nextCursor": null}),
             json!({"data": [{"id": full, "cwd": "/work/project"}], "nextCursor": null}),
-            json!({"thread": {"turns": [{"status": "completed", "items": [
-                {"type": "userMessage", "content": [{"type": "text", "text": "name this"}]}
-            ]}]}}),
+            json!({"data": [{"id": "turn-1", "status": "completed"}], "nextCursor": null}),
+            json!({"data": [
+                {"turnId": "turn-1", "item": {"type": "userMessage", "content": [{"type": "text", "text": "name this"}]}}
+            ], "nextCursor": null}),
         ]),
         calls: calls.clone(),
     };
