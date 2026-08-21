@@ -107,8 +107,20 @@ pub struct Pane {
     pub manual_name_source: Option<String>,
     /// Pane leader PID captured when the manual name was saved.
     pub manual_name_pid: Option<u32>,
+    /// Exact pane-local PID metadata retained for stale-action guards, including legacy text.
+    pub manual_name_pid_raw: String,
     /// Tmux session captured when the manual name was saved.
     pub manual_name_session: Option<SessionId>,
+    /// Exact pane-local session metadata retained for stale-action guards, including legacy text.
+    pub manual_name_session_raw: String,
+    /// A source-less manual unpin awaiting a changed exact Codex thread title.
+    pub unpin_waiting: bool,
+    /// Manual title captured before source-less unpin.
+    pub unpin_waiting_title: Option<String>,
+    /// Pane leader captured before source-less unpin.
+    pub unpin_waiting_pid: Option<u32>,
+    /// Tmux session captured before source-less unpin.
+    pub unpin_waiting_session: Option<SessionId>,
     /// Live pane leader PID used to reject stale rename/unpin actions.
     pub pane_pid: u32,
     /// Current working directory exposed by tmux.
@@ -322,7 +334,16 @@ mod tests {
 
             manual_name_pid: None,
 
+            manual_name_pid_raw: String::new(),
+
             manual_name_session: None,
+
+            manual_name_session_raw: String::new(),
+
+            unpin_waiting: false,
+            unpin_waiting_title: None,
+            unpin_waiting_pid: None,
+            unpin_waiting_session: None,
 
             pane_pid: 100,
             current_path: PathBuf::from("/work/codex-mux"),

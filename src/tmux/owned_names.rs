@@ -24,6 +24,14 @@ pub const MANUAL_NAME_SOURCE_OPTION: &str = "@codex_mux_manual_name_source";
 pub const MANUAL_NAME_PID_OPTION: &str = "@codex_mux_manual_name_pid";
 /// Tmux session retained with a manual name.
 pub const MANUAL_NAME_SESSION_OPTION: &str = "@codex_mux_manual_name_session";
+/// Pane-local marker used after source-less unpin until Codex exposes a new exact title.
+pub const UNPIN_WAITING_OPTION: &str = "@codex_mux_unpin_waiting";
+/// User title that must change before a source-less unpin can be adopted again.
+pub const UNPIN_WAITING_TITLE_OPTION: &str = "@codex_mux_unpin_waiting_title";
+/// Pane leader retained with a source-less unpin wait.
+pub const UNPIN_WAITING_PID_OPTION: &str = "@codex_mux_unpin_waiting_pid";
+/// Tmux session retained with a source-less unpin wait.
+pub const UNPIN_WAITING_SESSION_OPTION: &str = "@codex_mux_unpin_waiting_session";
 /// Transient marker proving that an unpin title restore completed.
 pub const UNPIN_READY_OPTION: &str = "@codex_mux_unpin_ready";
 /// Transient marker proving a guarded unpin completed.

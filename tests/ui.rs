@@ -23,7 +23,16 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid: 100,
         current_path: PathBuf::from(path),
@@ -183,22 +192,22 @@ fn rename_prompt_initial_c_clears_and_empty_enter_unpins_without_a_global_key() 
 }
 
 #[test]
-fn rename_prompt_explains_when_an_older_manual_name_cannot_be_safely_unpinned() {
+fn rename_prompt_allows_source_less_manual_name_to_unpin_and_wait_for_codex_identity() {
     let mut selected = pane("%21", "Pinned", "/work/legacy");
     selected.manual_name = true;
     let mut app = App::new(vec![selected], ThemeId::AdaptiveCyan, None);
     app.handle_key(key(KeyCode::Char('R')));
     let rendered = rendered_app(&app, 100, 30);
-    assert!(rendered.contains("unpin unavailable: source not retained"));
+    assert!(rendered.contains("empty Enter unpin"));
     app.handle_key(key(KeyCode::Char('c')));
-    assert_ne!(
+    assert_eq!(
         app.handle_key(key(KeyCode::Enter)),
         Some(Action::Unpin(PaneId::new("%21").unwrap()))
     );
 }
 
 #[test]
-fn rename_prompt_refuses_to_offer_unpin_for_an_invalid_retained_source() {
+fn rename_prompt_allows_invalid_legacy_source_to_unpin_without_reusing_it() {
     let mut selected = pane("%22", "Pinned", "/work/corrupt");
     selected.manual_name = true;
     selected.manual_name_source = Some("not a Codex thread".to_owned());
@@ -206,9 +215,9 @@ fn rename_prompt_refuses_to_offer_unpin_for_an_invalid_retained_source() {
     selected.manual_name_session = Some(selected.session_id.clone());
     let mut app = App::new(vec![selected], ThemeId::AdaptiveCyan, None);
     app.handle_key(key(KeyCode::Char('R')));
-    assert!(rendered_app(&app, 100, 30).contains("unpin unavailable: source not retained"));
+    assert!(rendered_app(&app, 100, 30).contains("empty Enter unpin"));
     app.handle_key(key(KeyCode::Char('c')));
-    assert_ne!(
+    assert_eq!(
         app.handle_key(key(KeyCode::Enter)),
         Some(Action::Unpin(PaneId::new("%22").unwrap()))
     );

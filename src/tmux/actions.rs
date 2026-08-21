@@ -14,7 +14,8 @@ use crate::{
     tmux::owned_names::{
         IMMEDIATE_NAMING_OPTION, MANUAL_NAME_OPTION, MANUAL_NAME_PID_OPTION,
         MANUAL_NAME_SESSION_OPTION, MANUAL_NAME_SOURCE_OPTION, RENAME_COMPLETE_OPTION,
-        UNPIN_COMPLETE_OPTION, UNPIN_READY_OPTION, clear_marker_arguments,
+        UNPIN_COMPLETE_OPTION, UNPIN_READY_OPTION, UNPIN_WAITING_OPTION, UNPIN_WAITING_PID_OPTION,
+        UNPIN_WAITING_SESSION_OPTION, UNPIN_WAITING_TITLE_OPTION, clear_marker_arguments,
     },
 };
 
@@ -148,6 +149,10 @@ where
             MANUAL_NAME_PID_OPTION,
             MANUAL_NAME_SESSION_OPTION,
             UNPIN_READY_OPTION,
+            UNPIN_WAITING_OPTION,
+            UNPIN_WAITING_TITLE_OPTION,
+            UNPIN_WAITING_PID_OPTION,
+            UNPIN_WAITING_SESSION_OPTION,
             RENAME_COMPLETE_OPTION,
         ] {
             arguments.push(OsString::from(";"));
@@ -232,24 +237,14 @@ where
 
     /// Restores the retained Codex thread title and makes the pane immediately nameable.
     pub fn unpin_pane(&self, pane: &Pane) -> Result<()> {
-        let source = pane.manual_name_source.as_deref().ok_or_else(|| {
-            MuxError::Command(
-                "this manual name predates unpin support and has no retained conversation identity"
-                    .to_owned(),
-            )
-        })?;
-        if crate::smart_naming::thread_hint(source).is_none() {
-            return Err(MuxError::Command(
-                "manual name has an invalid retained conversation identity".to_owned(),
-            ));
-        }
-        if pane.manual_name_pid != Some(pane.pane_pid)
-            || pane.manual_name_session.as_ref() != Some(&pane.session_id)
-        {
-            return Err(MuxError::Command(
-                "manual name belongs to an earlier pane process or session".to_owned(),
-            ));
-        }
+        let source = pane.manual_name_source.as_deref().filter(|source| {
+            crate::smart_naming::thread_hint(source).is_some()
+                && pane.manual_name_pid == Some(pane.pane_pid)
+                && pane.manual_name_session.as_ref() == Some(&pane.session_id)
+        });
+        let Some(source) = source else {
+            return self.unpin_without_source(pane);
+        };
         let title = pane.title.as_deref().unwrap_or_default();
         let token = operation_token();
         let condition = unpin_condition(pane, source, title, None);
@@ -301,6 +296,53 @@ where
             UNPIN_COMPLETE_OPTION,
             &token,
             "pane changed while its manual name was being unpinned",
+        )?;
+        self.run_checked(&os_strings([
+            "set-option",
+            "-pu",
+            "-t",
+            pane.id.as_str(),
+            UNPIN_COMPLETE_OPTION,
+        ]))?;
+        Ok(())
+    }
+
+    /// Relinquishes a manual title even when no conversation identity survived the pin.
+    fn unpin_without_source(&self, pane: &Pane) -> Result<()> {
+        let title = pane.title.as_deref().unwrap_or_default();
+        let token = operation_token();
+        let condition = manual_release_condition(pane, title);
+        let release = format!(
+            "set-option -p -t {p} {waiting} 1; set-option -p -t {p} {waiting_title} {title}; set-option -p -t {p} {waiting_pid} {pid}; set-option -p -t {p} {waiting_session} {session}; set-option -pu -t {p} {manual}; set-option -pu -t {p} {source}; set-option -pu -t {p} {source_pid}; set-option -pu -t {p} {source_session}; set-option -p -t {p} {immediate} 1; set-option -p -t {p} {complete} {token}",
+            p = tmux_quote(pane.id.as_str()),
+            waiting = UNPIN_WAITING_OPTION,
+            waiting_title = UNPIN_WAITING_TITLE_OPTION,
+            title = tmux_quote(title),
+            waiting_pid = UNPIN_WAITING_PID_OPTION,
+            pid = pane.pane_pid,
+            waiting_session = UNPIN_WAITING_SESSION_OPTION,
+            session = tmux_quote(pane.session_id.as_str()),
+            manual = MANUAL_NAME_OPTION,
+            source = MANUAL_NAME_SOURCE_OPTION,
+            source_pid = MANUAL_NAME_PID_OPTION,
+            source_session = MANUAL_NAME_SESSION_OPTION,
+            immediate = IMMEDIATE_NAMING_OPTION,
+            complete = UNPIN_COMPLETE_OPTION,
+            token = tmux_quote(&token),
+        );
+        self.run_checked(&os_strings([
+            "if-shell",
+            "-F",
+            "-t",
+            pane.id.as_str(),
+            &condition,
+            &release,
+        ]))?;
+        self.require_marker(
+            pane,
+            UNPIN_COMPLETE_OPTION,
+            &token,
+            "pane changed before its manual name could be unpinned",
         )?;
         self.run_checked(&os_strings([
             "set-option",
@@ -509,6 +551,37 @@ fn unpin_condition(
         .into_iter()
         .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
         .unwrap()
+}
+
+fn manual_release_condition(pane: &Pane, expected_title: &str) -> String {
+    let source = pane.manual_name_source.as_deref().unwrap_or_default();
+    [
+        format!("#{{==:#{{{MANUAL_NAME_OPTION}}},1}}"),
+        format!(
+            "#{{==:#{{{MANUAL_NAME_SOURCE_OPTION}}},{}}}",
+            tmux_format_literal(source)
+        ),
+        format!(
+            "#{{==:#{{{MANUAL_NAME_PID_OPTION}}},{}}}",
+            tmux_format_literal(&pane.manual_name_pid_raw)
+        ),
+        format!(
+            "#{{==:#{{{MANUAL_NAME_SESSION_OPTION}}},{}}}",
+            tmux_format_literal(&pane.manual_name_session_raw)
+        ),
+        format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid),
+        format!(
+            "#{{==:#{{session_id}},{}}}",
+            tmux_format_literal(pane.session_id.as_str())
+        ),
+        format!(
+            "#{{==:#{{pane_title}},{}}}",
+            tmux_format_literal(expected_title)
+        ),
+    ]
+    .into_iter()
+    .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+    .unwrap()
 }
 
 fn rename_condition(pane: &Pane) -> String {

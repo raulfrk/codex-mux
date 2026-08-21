@@ -394,7 +394,10 @@ where
                     return ComposerBoundary::RowRejected;
                 };
                 let cursor_x = usize::from(cursor_x);
-                if cursor_x == indentation || cursor_x == indentation + prompt_width {
+                if cursor_x == indentation
+                    || cursor_x == indentation + 1
+                    || cursor_x == indentation + prompt_width
+                {
                     ComposerBoundary::Exact
                 } else {
                     ComposerBoundary::CursorRejected
@@ -897,10 +900,41 @@ mod tests {
     }
 
     #[test]
+    fn indented_composer_post_glyph_boundary_used_by_ultra_and_max_opens_popup() {
+        let mut screen = [""; 11];
+        screen[10] = "    › draft";
+        let runner = Runner::with([
+            state(5, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output([]),
+            state(5, 10, true, false),
+            output(b"/dev/pts/7\x1f120\x1f40\n"),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false
+                },
+                &sleeper,
+                &codex
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Opened
+        );
+    }
+
+    #[test]
     fn indented_composer_row_at_the_wrong_cursor_column_forwards() {
         let mut screen = [""; 11];
         screen[10] = "    › draft";
-        for cursor_x in [0, 5, 7] {
+        for cursor_x in [0, 3, 7] {
             let runner = Runner::with([
                 state(cursor_x, 10, true, false),
                 output(format!("{}\n", screen.join("\n")).into_bytes()),

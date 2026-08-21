@@ -816,9 +816,16 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
         inspector,
         process.matches.clone(),
     );
+    let diagnostics = NamingDiagnostics::discover().ok();
+    let namer_diagnostics = diagnostics.clone();
     NamingWorker::spawn_logged(
         move |cancelled| {
-            AppServerProcess::spawn_with_cancel(&codex_path, cancelled).map(AppServerNamer::new)
+            AppServerProcess::spawn_with_cancel(&codex_path, cancelled).map(|session| {
+                match namer_diagnostics {
+                    Some(diagnostics) => AppServerNamer::with_diagnostics(session, diagnostics),
+                    None => AppServerNamer::new(session),
+                }
+            })
         },
         move || {
             inventory
@@ -826,7 +833,7 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
                 .map(|panes| panes.iter().filter_map(NamingTarget::from_pane).collect())
         },
         Duration::from_secs(30),
-        NamingDiagnostics::discover().ok(),
+        diagnostics,
     )
 }
 

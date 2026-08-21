@@ -141,28 +141,13 @@ struct ManualRename {
 
 impl ManualRename {
     fn for_pane(pane: &Pane) -> Self {
-        let unpin_unavailable_reason = if !pane.manual_name {
-            None
-        } else if pane
-            .manual_name_source
-            .as_deref()
-            .is_none_or(|source| crate::smart_naming::thread_hint(source).is_none())
-        {
-            Some("unpin unavailable: source not retained")
-        } else if pane.manual_name_pid != Some(pane.pane_pid)
-            || pane.manual_name_session.as_ref() != Some(&pane.session_id)
-        {
-            Some("unpin unavailable: the pane process or session changed")
-        } else {
-            None
-        };
         Self {
             pane_id: pane.id.clone(),
             title: pane.display_title(),
             error: None,
             untouched: true,
-            can_unpin: pane.manual_name && unpin_unavailable_reason.is_none(),
-            unpin_unavailable_reason,
+            can_unpin: pane.manual_name,
+            unpin_unavailable_reason: None,
         }
     }
 }
@@ -1278,7 +1263,16 @@ mod tests {
 
             manual_name_pid: None,
 
+            manual_name_pid_raw: String::new(),
+
             manual_name_session: None,
+
+            manual_name_session_raw: String::new(),
+
+            unpin_waiting: false,
+            unpin_waiting_title: None,
+            unpin_waiting_pid: None,
+            unpin_waiting_session: None,
 
             pane_pid: 100,
             current_path: PathBuf::from(format!("/work/{title}")),

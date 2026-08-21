@@ -96,6 +96,7 @@ fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
             json!({"data": [
                 {"id": full, "cwd": "/work/project"}
             ], "nextCursor": null}),
+            json!({"data": [], "nextCursor": null}),
             json!({"thread": {"turns": [
                 {"status": "completed", "items": [
                     {"type": "userMessage", "content": [{"type": "text", "text": "name this"}]}
@@ -123,8 +124,105 @@ fn resolves_one_truncated_thread_in_exact_cwd_across_pages() {
     assert_eq!(calls[0].1["cwd"], "/work/project");
     assert_eq!(calls[0].1["useStateDbOnly"], true);
     assert_eq!(calls[1].1["cursor"], "page-2");
-    assert_eq!(calls[2].0, "thread/read");
-    assert_eq!(calls[2].1["threadId"], full);
+    assert_eq!(calls[2].1["useStateDbOnly"], false);
+    assert_eq!(calls[3].0, "thread/read");
+    assert_eq!(calls[3].1["threadId"], full);
+}
+
+#[test]
+fn resolves_external_truncated_thread_after_state_db_miss() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let full = "01a01001-2dbb-74e2-86ab-996b31234567";
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [], "nextCursor": null}),
+            json!({"data": [{"id": full, "cwd": "/work/project"}], "nextCursor": null}),
+            json!({"thread": {"turns": [{"status": "completed", "items": [
+                {"type": "userMessage", "content": [{"type": "text", "text": "name this"}]}
+            ]}]}}),
+        ]),
+        calls: calls.clone(),
+    };
+    let mut namer = AppServerNamer::new(session);
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+
+    let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
+    assert_eq!(conversation.thread_id, full);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].1["useStateDbOnly"], true);
+    assert_eq!(calls[1].1["useStateDbOnly"], false);
+}
+
+#[test]
+fn external_fallback_rejects_an_ambiguous_uuid_prefix() {
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [], "nextCursor": null}),
+            json!({"data": [
+                {"id": "01a01001-2dbb-74e2-86ab-996b31234567", "cwd": "/work/project"},
+                {"id": "01a01001-2dbb-74e2-86ab-996b3abcdef0", "cwd": "/work/project"}
+            ], "nextCursor": null}),
+        ]),
+        calls: Arc::default(),
+    };
+    let mut namer = AppServerNamer::new(session);
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+
+    assert!(
+        ConversationNamer::read(&mut namer, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple threads")
+    );
+}
+
+#[test]
+fn external_fallback_rejects_a_state_and_archive_prefix_collision() {
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [
+                {"id": "01a01001-2dbb-74e2-86ab-996b31234567", "cwd": "/work/project"}
+            ], "nextCursor": null}),
+            json!({"data": [
+                {"id": "01a01001-2dbb-74e2-86ab-996b31234567", "cwd": "/work/project"},
+                {"id": "01a01001-2dbb-74e2-86ab-996b3abcdef0", "cwd": "/work/project"}
+            ], "nextCursor": null}),
+        ]),
+        calls: Arc::default(),
+    };
+    let mut namer = AppServerNamer::new(session);
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        pane_title: "01a01001-2dbb-74e2-86ab-996b3...".to_owned(),
+        thread_hint: "01a01001-2dbb-74e2-86ab-996b3".to_owned(),
+        cwd: "/work/project".into(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+    };
+
+    assert!(
+        ConversationNamer::read(&mut namer, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple threads")
+    );
 }
 
 #[test]
@@ -170,7 +268,16 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid: 100,
         current_path: "/work/project".into(),
@@ -202,7 +309,16 @@ fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid: 100,
         current_path: "/work/project".into(),
@@ -232,13 +348,79 @@ fn pane_target_rejects_a_manual_uuid_shaped_title() {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid: 100,
         current_path: "/work/project".into(),
     };
 
     assert_eq!(NamingTarget::from_pane(&pane), None);
+}
+
+#[test]
+fn source_less_unpin_waits_for_a_changed_exact_thread_title() {
+    let mut pane = Pane {
+        id: PaneId::new("%9").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        title: Some("Manual project title".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        immediate_naming: true,
+        manual_name: false,
+        manual_name_source: None,
+        manual_name_pid: None,
+        manual_name_pid_raw: String::new(),
+        manual_name_session: None,
+        manual_name_session_raw: String::new(),
+        unpin_waiting: true,
+        unpin_waiting_title: Some("Manual project title".to_owned()),
+        unpin_waiting_pid: Some(100),
+        unpin_waiting_session: Some(SessionId::new("$1").unwrap()),
+        pane_pid: 100,
+        current_path: "/work/project".into(),
+    };
+    assert_eq!(NamingTarget::from_pane(&pane), None);
+    pane.title = Some("01a01001-2dbb-74e2-86ab-996b3...".to_owned());
+    assert!(NamingTarget::from_pane(&pane).is_some());
+    pane.unpin_waiting_pid = Some(101);
+    assert_eq!(NamingTarget::from_pane(&pane), None);
+}
+
+#[test]
+fn source_less_unpin_does_not_trim_its_unchanged_manual_title_into_an_identity() {
+    let mut pane = Pane {
+        id: PaneId::new("%9").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        title: Some(" 01a01001-2dbb-74e2-86ab-996b31234567 ".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+        manual_name: false,
+        manual_name_source: None,
+        manual_name_pid: None,
+        manual_name_pid_raw: String::new(),
+        manual_name_session: None,
+        manual_name_session_raw: String::new(),
+        unpin_waiting: true,
+        unpin_waiting_title: Some(" 01a01001-2dbb-74e2-86ab-996b31234567 ".to_owned()),
+        unpin_waiting_pid: Some(100),
+        unpin_waiting_session: Some(SessionId::new("$1").unwrap()),
+        pane_pid: 100,
+        current_path: "/work/project".into(),
+    };
+
+    assert!(NamingTarget::from_pane(&pane).is_none());
+    pane.title = Some("01a01001-2dbb-74e2-86ab-996b31234567".to_owned());
+    assert!(NamingTarget::from_pane(&pane).is_some());
 }
 
 #[test]

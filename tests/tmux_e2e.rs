@@ -193,7 +193,16 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid,
         current_path: scratch.path().to_owned(),
@@ -339,7 +348,13 @@ fn manual_pane_rename_accepts_an_outside_codex_title_refresh() {
         manual_name: false,
         manual_name_source: None,
         manual_name_pid: None,
+        manual_name_pid_raw: String::new(),
         manual_name_session: None,
+        manual_name_session_raw: String::new(),
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
         pane_pid,
         current_path: scratch.path().to_owned(),
     };
@@ -418,7 +433,16 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid,
         current_path: scratch.path().to_owned(),
@@ -473,7 +497,13 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
         manual_name: false,
         manual_name_source: None,
         manual_name_pid: None,
+        manual_name_pid_raw: String::new(),
         manual_name_session: None,
+        manual_name_session_raw: String::new(),
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
         pane_pid: literal_pid,
         current_path: scratch.path().to_owned(),
     };

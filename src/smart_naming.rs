@@ -51,6 +51,9 @@ const DIAGNOSTIC_CODES: &[&str] = &[
     "naming_failed",
     "resolve_provider_unhealthy",
     "resolve_failed",
+    "thread_state_db_miss",
+    "thread_archive_cross_check",
+    "thread_resolve_not_found",
     "identity_changed",
     "name_published",
     "process_rejected",
@@ -535,7 +538,15 @@ impl NamingTarget {
         if pane.manual_name {
             return None;
         }
-        let pane_title = pane.title.as_deref()?.trim();
+        let observed_title = pane.title.as_deref()?;
+        if pane.unpin_waiting
+            && (pane.unpin_waiting_title.as_deref() == Some(observed_title)
+                || pane.unpin_waiting_pid != Some(pane.pane_pid)
+                || pane.unpin_waiting_session.as_ref() != Some(&pane.session_id))
+        {
+            return None;
+        }
+        let pane_title = observed_title.trim();
         let thread_hint = thread_hint(pane_title)?;
         Some(Self {
             pane_id: pane.id.clone(),
@@ -1070,13 +1081,26 @@ pub(crate) fn looks_like_thread_id(value: &str) -> bool {
 /// Reads completed turns and asks an ephemeral Luna thread for a short title.
 pub struct AppServerNamer<S> {
     session: S,
+    diagnostics: Option<NamingDiagnostics>,
 }
 
 impl<S: AppServerSession> AppServerNamer<S> {
     /// Wraps an initialized, version-compatible app-server session.
     #[must_use]
     pub const fn new(session: S) -> Self {
-        Self { session }
+        Self {
+            session,
+            diagnostics: None,
+        }
+    }
+
+    /// Wraps a session with fixed privacy-safe resolution diagnostics.
+    #[must_use]
+    pub const fn with_diagnostics(session: S, diagnostics: NamingDiagnostics) -> Self {
+        Self {
+            session,
+            diagnostics: Some(diagnostics),
+        }
     }
 
     fn resolve_thread_id(&mut self, target: &NamingTarget) -> Result<String> {
@@ -1084,8 +1108,26 @@ impl<S: AppServerSession> AppServerNamer<S> {
             return Ok(target.thread_hint.clone());
         }
 
+        let state_match = self.find_thread_id(target, true, None)?;
+        if state_match.is_none() {
+            log_diagnostic(&self.diagnostics, "thread_state_db_miss");
+        }
+        log_diagnostic(&self.diagnostics, "thread_archive_cross_check");
+        self.find_thread_id(target, false, state_match)?
+            .ok_or_else(|| {
+                log_diagnostic(&self.diagnostics, "thread_resolve_not_found");
+                protocol("truncated pane title did not match a thread in its working directory")
+            })
+    }
+
+    /// Finds one exact same-CWD UUID prefix in one bounded app-server source.
+    fn find_thread_id(
+        &mut self,
+        target: &NamingTarget,
+        use_state_db_only: bool,
+        mut matched: Option<String>,
+    ) -> Result<Option<String>> {
         let mut cursor: Option<String> = None;
-        let mut matched: Option<String> = None;
         for _ in 0..MAX_THREAD_LIST_PAGES {
             let response = self.session.request(
                 "thread/list",
@@ -1095,7 +1137,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
                     "limit": THREAD_LIST_PAGE_SIZE,
                     "sortKey": "updated_at",
                     "sortDirection": "desc",
-                    "useStateDbOnly": true
+                    "useStateDbOnly": use_state_db_only
                 }),
             )?;
             let threads = response["data"]
@@ -1118,9 +1160,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
 
             let next = response["nextCursor"].as_str().map(ToOwned::to_owned);
             if next.is_none() {
-                return matched.ok_or_else(|| {
-                    protocol("truncated pane title did not match a thread in its working directory")
-                });
+                return Ok(matched);
             }
             if next == cursor {
                 return Err(protocol("thread/list repeated its pagination cursor"));
@@ -1292,15 +1332,20 @@ mod transport_tests {
         let _ = fs::remove_dir_all(&root);
         let log = NamingDiagnostics::at(root.join("smart-naming.log"));
         log.event("provider_ready");
+        log.event("thread_state_db_miss");
         assert_eq!(
             log.latest().unwrap().split_whitespace().last(),
-            Some("provider_ready")
+            Some("thread_state_db_miss")
         );
         assert_eq!(
             fs::metadata(log.path()).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!fs::read_to_string(log.path()).unwrap().contains("thread"));
+        assert!(
+            !fs::read_to_string(log.path())
+                .unwrap()
+                .contains("01a01001-2dbb-74e2-86ab-996b31234567")
+        );
         fs::write(log.path(), vec![b'x'; NAMING_LOG_MAX_BYTES as usize]).unwrap();
         log.event("provider_ready");
         assert!(log.path().with_extension("log.1").exists());

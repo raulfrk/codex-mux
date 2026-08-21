@@ -105,7 +105,16 @@ fn pane(id: &str, path: &str) -> Pane {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid: 100,
         current_path: PathBuf::from(path),
@@ -489,6 +498,53 @@ fn unpin_restores_retained_thread_and_requests_immediate_naming() {
             .iter()
             .any(|arg| arg.to_string_lossy().contains("@codex_mux_name_now"))
     );
+}
+
+#[test]
+fn unpin_without_a_retained_source_relinquishes_manual_ownership_and_waits_for_codex_identity() {
+    let runner = RecordingRunner::with_outputs([ok(), operation_marker(), ok()]);
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+    let mut selected = pane("%106", "/work/project");
+    selected.manual_name = true;
+    selected.title = Some("A user-owned title".to_owned());
+
+    actions.unpin_pane(&selected).unwrap();
+
+    let commands = runner.commands();
+    let command = commands[0]
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<String>();
+    assert!(command.contains("@codex_mux_unpin_waiting"));
+    assert!(command.contains("@codex_mux_manual_name"));
+}
+
+#[test]
+fn source_less_unpin_guards_the_snapshot_manual_metadata() {
+    let runner = RecordingRunner::with_outputs([ok(), operation_marker(), ok()]);
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+    let mut selected = pane("%106", "/work/project");
+    selected.manual_name = true;
+    selected.title = Some("A user-owned title".to_owned());
+    selected.manual_name_source = Some("not-a-thread".to_owned());
+    selected.manual_name_pid = Some(99);
+    selected.manual_name_pid_raw = "not-a-pid".to_owned();
+    selected.manual_name_session = Some(SessionId::new("$8").unwrap());
+    selected.manual_name_session_raw = "not-a-session".to_owned();
+
+    actions.unpin_pane(&selected).unwrap();
+
+    let commands = runner.commands();
+    let command = commands[0]
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<String>();
+    assert!(command.contains("@codex_mux_manual_name_source"));
+    assert!(command.contains("not-a-thread"));
+    assert!(command.contains("not-a-pid"));
+    assert!(command.contains("not-a-session"));
 }
 
 #[test]

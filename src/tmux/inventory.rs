@@ -15,10 +15,9 @@ use crate::{
         CodexExecutable, Pane, PaneId, PaneProcess, ProcessInspector, SessionId, TmuxCommandRunner,
     },
 };
-
 const FIELD_SEPARATOR: u8 = 0x1f;
 const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_manual_name_source}\x1f#{@codex_mux_manual_name_pid}\x1f#{@codex_mux_manual_name_session}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_manual_name_source}\x1f#{@codex_mux_manual_name_pid}\x1f#{@codex_mux_manual_name_session}\x1f#{@codex_mux_unpin_waiting}\x1f#{@codex_mux_unpin_waiting_title}\x1f#{@codex_mux_unpin_waiting_pid}\x1f#{@codex_mux_unpin_waiting_session}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
 pub struct PaneInventory<R, I> {
@@ -134,8 +133,16 @@ where
                 manual_name: record.manual_name,
                 manual_name_source: nonempty_title(record.manual_name_source),
                 manual_name_pid: record.manual_name_pid,
+                manual_name_pid_raw: record.manual_name_pid_raw,
                 manual_name_session: record
                     .manual_name_session
+                    .and_then(|value| SessionId::new(value).ok()),
+                manual_name_session_raw: record.manual_name_session_raw,
+                unpin_waiting: record.unpin_waiting,
+                unpin_waiting_title: nonempty_title(record.unpin_waiting_title),
+                unpin_waiting_pid: record.unpin_waiting_pid,
+                unpin_waiting_session: record
+                    .unpin_waiting_session
                     .and_then(|value| SessionId::new(value).ok()),
                 pane_pid: record.pane_pid,
                 current_path: record.current_path,
@@ -205,7 +212,13 @@ struct TmuxPaneRecord {
     manual_name: bool,
     manual_name_source: String,
     manual_name_pid: Option<u32>,
+    manual_name_pid_raw: String,
     manual_name_session: Option<String>,
+    manual_name_session_raw: String,
+    unpin_waiting: bool,
+    unpin_waiting_title: String,
+    unpin_waiting_pid: Option<u32>,
+    unpin_waiting_session: Option<String>,
 }
 
 impl TmuxPaneRecord {
@@ -214,7 +227,7 @@ impl TmuxPaneRecord {
             return None;
         }
         let fields = split_fields(line);
-        if !matches!(fields.len(), 11..=17) {
+        if !matches!(fields.len(), 11..=21) {
             return None;
         }
 
@@ -259,8 +272,24 @@ impl TmuxPaneRecord {
             manual_name_pid: fields
                 .get(15)
                 .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok()),
+            manual_name_pid_raw: fields.get(15).map_or_else(String::new, |field| {
+                String::from_utf8_lossy(field).into_owned()
+            }),
             manual_name_session: fields
                 .get(16)
+                .map(|field| String::from_utf8_lossy(field).into_owned()),
+            manual_name_session_raw: fields.get(16).map_or_else(String::new, |field| {
+                String::from_utf8_lossy(field).into_owned()
+            }),
+            unpin_waiting: fields.get(17).is_some_and(|field| *field == b"1"),
+            unpin_waiting_title: fields.get(18).map_or_else(String::new, |field| {
+                String::from_utf8_lossy(field).into_owned()
+            }),
+            unpin_waiting_pid: fields
+                .get(19)
+                .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok()),
+            unpin_waiting_session: fields
+                .get(20)
                 .map(|field| String::from_utf8_lossy(field).into_owned()),
         })
     }

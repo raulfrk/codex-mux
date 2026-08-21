@@ -310,6 +310,34 @@ fn packaged_popup_renames_an_outside_started_codex_session() {
             .trim(),
         "1"
     );
+    let unpin_capture = fixture.scratch.join("outside-manual-unpin.log");
+    let mut unpin_popup = fixture.popup(&binary, &tty, (120, 40), &unpin_capture, None);
+    unpin_popup.wait_text("Pinned outside session");
+    unpin_popup.send(b"R");
+    unpin_popup.wait_text("rename session");
+    unpin_popup.send(b"c\r");
+    fixture.server.wait("outside manual pane unpinned", || {
+        !fixture
+            .server
+            .run(&["show-options", "-pv", "-t", &pane, "@codex_mux_manual_name"])
+            .status
+            .success()
+    });
+    assert_eq!(
+        fixture
+            .server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane,
+                "@codex_mux_unpin_waiting",
+            ])
+            .trim(),
+        "1"
+    );
+    unpin_popup.send(b"q");
+    assert!(unpin_popup.wait_exit().success());
     client.send(b"\x02d");
 }
 
@@ -592,6 +620,37 @@ fn installed_smart_left_opens_at_the_composer_prompt_glyph() {
     assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 4);
     client.send(b"q");
     fixture.server.wait("prompt glyph Smart Left cleanup", || {
+        smart_left_inactive(&fixture.server, &fixture.origin_pane)
+    });
+    client.send(b"\x02d");
+}
+
+#[test]
+fn installed_smart_left_opens_at_the_ultra_max_post_glyph_noop_boundary() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("smart-left-post-glyph");
+    fixture.install_smart_left(&binary);
+    let output = fixture
+        .server
+        .command()
+        .args(["respawn-pane", "-k", "-t", &fixture.origin_pane, "--"])
+        .arg(&fixture.codex)
+        .arg("smart-left-post-glyph")
+        .output()
+        .unwrap();
+    assert_success(&output, "start packaged post-glyph composer fixture");
+    fixture.server.wait("post glyph cursor", || {
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 5
+    });
+
+    let (mut client, _tty) = fixture.client("origin", (100, 32), "post-glyph-client");
+    client.send(b"\x1b[D");
+    client.wait_text("sessions");
+    assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 5);
+    client.send(b"q");
+    fixture.server.wait("post glyph Smart Left cleanup", || {
         smart_left_inactive(&fixture.server, &fixture.origin_pane)
     });
     client.send(b"\x02d");
@@ -1096,12 +1155,15 @@ fn fake_codex(scratch: &Scratch) -> PathBuf {
         r#"
 use std::{env, fs::OpenOptions, io::{Read, Write}, process::Command, thread, time::Duration};
 
-fn run_smart_left_fixture(prompt_glyph_cursor: bool) {
+fn run_smart_left_fixture(mode: &str) {
     assert!(Command::new("stty").args(["raw", "-echo"]).status().unwrap().success());
     let mut output = std::io::stdout().lock();
     let mut input = std::io::stdin().lock();
-    let mut cursor: u16 = if prompt_glyph_cursor { 0 } else { 3 };
-    let offset = if prompt_glyph_cursor { 5 } else { 7 };
+    let (mut cursor, offset, left_is_noop): (u16, u16, bool) = match mode {
+        "smart-left-prompt" => (0, 5, true),
+        "smart-left-post-glyph" => (1, 5, true),
+        _ => (3, 7, false),
+    };
     write!(output, "\x1b[2J\x1b[H    › abc\x1b[1;{}H", cursor + offset).unwrap();
     output.flush().unwrap();
     let mut byte = [0_u8; 1];
@@ -1110,7 +1172,7 @@ fn run_smart_left_fixture(prompt_glyph_cursor: bool) {
         if byte[0] != 0x1b { continue; }
         let mut tail = [0_u8; 2];
         input.read_exact(&mut tail).unwrap();
-        if tail == *b"[D" {
+        if tail == *b"[D" && !left_is_noop {
             cursor = cursor.saturating_sub(1);
             write!(output, "\x1b[1;{}H", cursor + offset).unwrap();
             output.flush().unwrap();
@@ -1126,9 +1188,9 @@ fn main() {
         writeln!(log, "arg{index}={argument}").unwrap();
     }
     writeln!(log, "---").unwrap();
-    if matches!(env::args().nth(1).as_deref(), Some("smart-left") | Some("smart-left-prompt")) {
+    if matches!(env::args().nth(1).as_deref(), Some("smart-left") | Some("smart-left-prompt") | Some("smart-left-post-glyph")) {
         drop(log);
-        run_smart_left_fixture(env::args().nth(1).as_deref() == Some("smart-left-prompt"));
+        run_smart_left_fixture(env::args().nth(1).as_deref().unwrap());
     }
     thread::sleep(Duration::from_secs(300));
 }

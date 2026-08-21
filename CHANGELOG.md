@@ -4,6 +4,14 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-21
+
+### Fixed
+
+- Resolve externally resumed, truncated Codex thread titles through bounded state and historical app-server listings, accepting only one combined exact UUID-prefix and working-directory match; Smart Naming logs fixed safe reason codes for the state miss and cross-check without recording conversation data.
+- Let empty-Enter Manual Rename unpin every current pane. When no exact source survived the pin, it safely waits for Codex to publish a changed thread title instead of guessing a conversation.
+- Recognize the post-prompt-glyph no-op composer boundary used by Ultra and Max layouts while retaining process verification and the unchanged-post-Left fence.
+
 ## [0.9.1] - 2026-08-20
 
 ### Fixed

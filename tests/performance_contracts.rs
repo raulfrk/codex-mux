@@ -174,7 +174,16 @@ fn unzoomed_switch_uses_two_exact_tmux_requests() {
 
         manual_name_pid: None,
 
+        manual_name_pid_raw: String::new(),
+
         manual_name_session: None,
+
+        manual_name_session_raw: String::new(),
+
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
 
         pane_pid: 100,
         current_path: PathBuf::from("/work/target"),
