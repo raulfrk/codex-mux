@@ -248,6 +248,37 @@ fn packaged_popup_manual_rename_relinquishes_smart_naming_ownership() {
             .trim(),
         "1"
     );
+    for (option, expected) in [
+        (
+            "@codex_mux_manual_name_source",
+            "12345678-1234-1234-1234-123456789abc".to_owned(),
+        ),
+        (
+            "@codex_mux_manual_name_pid",
+            fixture
+                .server
+                .checked(&["display-message", "-p", "-t", &pane, "#{pane_pid}"])
+                .trim()
+                .to_owned(),
+        ),
+        (
+            "@codex_mux_manual_name_session",
+            fixture
+                .server
+                .checked(&["display-message", "-p", "-t", &pane, "#{session_id}"])
+                .trim()
+                .to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .server
+                .checked(&["show-options", "-pv", "-t", &pane, option])
+                .trim(),
+            expected,
+            "manual rename did not retain {option}"
+        );
+    }
 
     let unpin_capture = fixture.scratch.join("manual-unpin.log");
     let mut unpin_popup = fixture.popup(&binary, &tty, (120, 40), &unpin_capture, None);
@@ -262,14 +293,13 @@ fn packaged_popup_manual_rename_relinquishes_smart_naming_ownership() {
             .trim()
             == "12345678-1234-1234-1234-123456789abc"
     });
-    assert!(
+    fixture.server.wait("manual ownership cleared", || {
         !fixture
             .server
             .run(&["show-options", "-pv", "-t", &pane, "@codex_mux_manual_name"])
             .status
-            .success(),
-        "unpin retained manual ownership"
-    );
+            .success()
+    });
     unpin_popup.send(b"q");
     assert!(unpin_popup.wait_exit().success());
     client.send(b"\x02d");
