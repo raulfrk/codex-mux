@@ -1,6 +1,7 @@
 use std::{
-    collections::VecDeque,
+    collections::{VecDeque, hash_map::DefaultHasher},
     fs,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
@@ -565,6 +566,7 @@ fn wide_rollout_tree_still_detects_prefix_ambiguity() {
 #[test]
 fn reads_only_completed_user_and_assistant_text_with_a_hard_bound() {
     let huge = "x".repeat(MAX_CONVERSATION_BYTES * 2);
+    let calls = Arc::new(Mutex::new(Vec::new()));
     let session = FakeSession {
         replies: VecDeque::from([
             json!({"data": [
@@ -572,12 +574,12 @@ fn reads_only_completed_user_and_assistant_text_with_a_hard_bound() {
                 {"id": "completed-turn", "status": "completed"}
             ], "nextCursor": null}),
             json!({"data": [
-                {"turnId": "completed-turn", "item": {"type": "userMessage", "content": [{"type": "text", "text": "make switching faster"}]}},
+                {"turnId": "completed-turn", "item": {"type": "agentMessage", "text": huge}},
                 {"turnId": "completed-turn", "item": {"type": "commandExecution", "command": "ignored"}},
-                {"turnId": "completed-turn", "item": {"type": "agentMessage", "text": huge}}
+                {"turnId": "completed-turn", "item": {"type": "userMessage", "content": [{"type": "text", "text": "make switching faster"}]}}
             ], "nextCursor": null}),
         ]),
-        calls: Arc::default(),
+        calls: calls.clone(),
     };
     let mut namer = AppServerNamer::new(session);
     let conversation = namer.read_completed("source-thread").unwrap();
@@ -588,6 +590,9 @@ fn reads_only_completed_user_and_assistant_text_with_a_hard_bound() {
     );
     assert!(!conversation.transcript.contains("secret draft"));
     assert!(conversation.transcript.len() <= MAX_CONVERSATION_BYTES);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].1["sortDirection"], "desc");
+    assert_eq!(calls[1].1["sortDirection"], "desc");
 }
 
 #[test]
@@ -980,6 +985,43 @@ struct CountingNamer {
     delay: Duration,
 }
 
+struct ParallelNamer {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    gate: Arc<(Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl ConversationNamer for ParallelNamer {
+    fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+        Ok(NamingConversation {
+            thread_id: target.thread_hint.clone(),
+            transcript: "recent completed exchange".to_owned(),
+        })
+    }
+
+    fn name(&mut self, _: &NamingConversation) -> Result<String> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        let (entered, ready) = &*self.gate;
+        let mut entered = entered.lock().unwrap();
+        *entered += 1;
+        if *entered == 4 {
+            ready.notify_all();
+        }
+        let (entered, _) = ready
+            .wait_timeout_while(entered, Duration::from_secs(2), |entered| *entered < 4)
+            .unwrap();
+        if *entered < 4 {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            return Err(codex_mux::MuxError::Command(
+                "parallel naming lanes did not overlap".to_owned(),
+            ));
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok("Parallel generated name".to_owned())
+    }
+}
+
 impl ConversationNamer for CountingNamer {
     fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
         self.reads.fetch_add(1, Ordering::SeqCst);
@@ -1025,6 +1067,109 @@ fn wait_until(description: &str, predicate: impl Fn() -> bool) {
         thread::yield_now();
     }
     panic!("timed out waiting for {description}");
+}
+
+#[test]
+fn parallel_worker_overlaps_independent_conversations() {
+    let mut by_lane = [None, None, None, None];
+    for suffix in 0_u64..10_000 {
+        let thread = format!("{suffix:08x}-1111-7777-8888-123456789abc");
+        let mut hasher = DefaultHasher::new();
+        thread
+            .bytes()
+            .filter(|byte| *byte != b'-')
+            .take(12)
+            .for_each(|byte| byte.hash(&mut hasher));
+        let lane = hasher.finish() as usize % by_lane.len();
+        by_lane[lane].get_or_insert(thread);
+        if by_lane.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    let targets = by_lane
+        .into_iter()
+        .enumerate()
+        .map(|(index, thread)| target(&format!("%{}", index + 1), &thread.unwrap()))
+        .collect::<Vec<_>>();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(0), std::sync::Condvar::new()));
+    let provider_active = active.clone();
+    let provider_peak = peak.clone();
+    let provider_gate = gate.clone();
+    let discoveries = Arc::new(AtomicUsize::new(0));
+    let observed_discoveries = discoveries.clone();
+    let worker = NamingWorker::spawn_parallel_logged(
+        4,
+        move |_| {
+            Ok(ParallelNamer {
+                active: provider_active.clone(),
+                peak: provider_peak.clone(),
+                gate: provider_gate.clone(),
+            })
+        },
+        move |_| {
+            observed_discoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(targets.clone())
+        },
+        Duration::from_secs(1),
+        None,
+    );
+    wait_until("four parallel names", || {
+        worker.names().lock().unwrap().len() == 4
+    });
+    worker.stop();
+    assert_eq!(peak.load(Ordering::SeqCst), 4);
+    assert!(
+        discoveries.load(Ordering::SeqCst) <= 5,
+        "parallel lanes repeated the shared initial discovery or performed extra revalidations"
+    );
+}
+
+#[test]
+fn parallel_worker_forces_fresh_discovery_before_publication() {
+    struct RemovingNamer {
+        current: Arc<Mutex<Vec<NamingTarget>>>,
+        named: Arc<AtomicUsize>,
+    }
+    impl ConversationNamer for RemovingNamer {
+        fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+            Ok(NamingConversation {
+                thread_id: target.thread_hint.clone(),
+                transcript: "completed chat".to_owned(),
+            })
+        }
+        fn name(&mut self, _: &NamingConversation) -> Result<String> {
+            self.current.lock().unwrap().clear();
+            self.named.fetch_add(1, Ordering::SeqCst);
+            Ok("Stale generated name".to_owned())
+        }
+    }
+
+    let current = Arc::new(Mutex::new(vec![target(
+        "%1",
+        "01999999-1111-7777-8888-123456789abc",
+    )]));
+    let named = Arc::new(AtomicUsize::new(0));
+    let provider_current = current.clone();
+    let provider_named = named.clone();
+    let discovered = current.clone();
+    let worker = NamingWorker::spawn_parallel_logged(
+        4,
+        move |_| {
+            Ok(RemovingNamer {
+                current: provider_current.clone(),
+                named: provider_named.clone(),
+            })
+        },
+        move |_| Ok(discovered.lock().unwrap().clone()),
+        Duration::from_secs(1),
+        None,
+    );
+    wait_until("a naming attempt", || named.load(Ordering::SeqCst) > 0);
+    thread::sleep(Duration::from_millis(50));
+    assert!(worker.names().lock().unwrap().is_empty());
+    worker.stop();
 }
 
 #[test]
@@ -1363,9 +1508,15 @@ fn fanout_resolution_does_not_hold_the_generated_names_lock() {
         Duration::from_secs(60),
     );
 
-    wait_until("fanout resolution to block", || {
-        entered.load(Ordering::Acquire)
-    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !entered.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        thread::yield_now();
+    }
+    if !entered.load(Ordering::Acquire) {
+        release.store(true, Ordering::Release);
+        worker.stop();
+        panic!("timed out waiting for fanout resolution to block");
+    }
     let names = worker.names();
     let (sender, receiver) = std::sync::mpsc::channel();
     let lock_attempt = thread::spawn(move || {

@@ -4,6 +4,14 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-21
+
+### Fixed
+
+- Configure Codex's exact `thread-id` terminal title transactionally during setup, including outside-Mux sessions, and restore the user's prior setting on removal.
+- Recover arbitrary legacy titles from the exact configured Codex process's open root rollout, including older clients delegated through their private kernel-verified app-server control-socket peer; descendant environment claims are never accepted as conversation identity.
+- Name independent conversations across four bounded workers and use the most recent completed user/assistant messages, reducing multi-pane naming latency without changing provider cooldowns.
+
 ## [0.9.3] - 2026-08-21
 
 ### Fixed

@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod cli;
+mod codex_config;
 pub mod config;
 pub mod domain;
 pub mod error;

@@ -893,7 +893,7 @@ fn packaged_new_resume_fallback_and_confirmed_close_cross_process_boundaries() {
             "{log}"
         );
         assert!(
-            log.contains("arg0=-c\narg1=tui.terminal_title=[\"thread\"]\n"),
+            log.contains("arg0=-c\narg1=tui.terminal_title=[\"thread-id\"]\n"),
             "{log}"
         );
         match expected {

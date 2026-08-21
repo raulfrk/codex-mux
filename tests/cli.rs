@@ -1,6 +1,6 @@
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -47,6 +47,12 @@ fn setup_and_remove_manage_all_three_marker_blocks() {
     fs::write(&bash, b"host bash\n").unwrap();
     fs::write(&zsh, b"host zsh\n").unwrap();
     fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::create_dir(root.join(".codex")).unwrap();
+    fs::write(
+        root.join(".codex/config.toml"),
+        "# user comment\n[tui]\nterminal_title = [\"thread-title\"]\n",
+    )
+    .unwrap();
     let mut permissions = fs::metadata(&codex).unwrap().permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&codex, permissions).unwrap();
@@ -82,6 +88,13 @@ fn setup_and_remove_manage_all_three_marker_blocks() {
             .contains("codex-mux bash")
     );
     assert!(fs::read_to_string(&zsh).unwrap().contains("codex-mux zsh"));
+    let codex_config = fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    assert!(codex_config.contains("# user comment"));
+    assert!(codex_config.contains("terminal_title = [\"thread-id\"]"));
+    assert!(
+        root.join(".local/state/codex-mux/codex-terminal-title.toml")
+            .exists()
+    );
 
     let remove = binary()
         .env("HOME", &root)
@@ -104,6 +117,14 @@ fn setup_and_remove_manage_all_three_marker_blocks() {
     assert_eq!(fs::read(&tmux).unwrap(), b"set -g status off\n");
     assert_eq!(fs::read(&bash).unwrap(), b"host bash\n");
     assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+    let codex_config = fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    assert!(codex_config.contains("# user comment"));
+    assert!(codex_config.contains("terminal_title = [\"thread-title\"]"));
+    assert!(
+        !root
+            .join(".local/state/codex-mux/codex-terminal-title.toml")
+            .exists()
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -184,6 +205,229 @@ fn explicit_process_configuration_is_embedded_and_reported() {
     assert!(stdout.contains(&format!("match-executable: {}", underlying.display())));
     assert!(stdout.contains("pane-command: codex"));
     assert!(stdout.contains("drift: none"));
+
+    fs::write(
+        root.join(".codex/config.toml"),
+        "[tui]\nterminal_title = [\"thread-title\"]\n",
+    )
+    .unwrap();
+    let drifted = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .args(["tmux", "status", "--config"])
+        .arg(&tmux)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(drifted.stdout).unwrap();
+    assert!(stdout.contains("codex-thread-id-title: drifted"));
+    assert!(stdout.contains("drift: Codex terminal-title setting"));
+    assert!(!stdout.contains("drift: none"));
+
+    fs::write(&tmux, b"set -g status off\n").unwrap();
+    let partial = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .args(["tmux", "status", "--config"])
+        .arg(&tmux)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(partial.stdout).unwrap();
+    assert!(stdout.contains("not installed:"));
+    assert!(stdout.contains("codex-thread-id-title: drifted"));
+    assert!(stdout.contains("drift: Codex terminal-title setting"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn setup_rejects_a_scalar_tui_without_changing_host_files() {
+    let root = scratch("scalar-tui");
+    let tmux_tmp = root.join("tmux-tmp");
+    fs::create_dir(&tmux_tmp).unwrap();
+    fs::create_dir(root.join(".codex")).unwrap();
+    let tmux = root.join("tmux.conf");
+    let bash = root.join("bashrc");
+    let zsh = root.join("zshrc");
+    let codex = root.join("codex");
+    fs::write(&tmux, b"host tmux\n").unwrap();
+    fs::write(&bash, b"host bash\n").unwrap();
+    fs::write(&zsh, b"host zsh\n").unwrap();
+    fs::write(root.join(".codex/config.toml"), b"tui = \"custom\"\n").unwrap();
+    fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+
+    let setup = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .arg("--codex")
+        .arg(&codex)
+        .arg("setup")
+        .arg("--tmux-config")
+        .arg(&tmux)
+        .arg("--bash-config")
+        .arg(&bash)
+        .arg("--zsh-config")
+        .arg(&zsh)
+        .output()
+        .unwrap();
+    assert!(!setup.status.success());
+    assert!(String::from_utf8_lossy(&setup.stderr).contains("tui setting must be a table"));
+    assert_eq!(fs::read(&tmux).unwrap(), b"host tmux\n");
+    assert_eq!(fs::read(&bash).unwrap(), b"host bash\n");
+    assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+    assert_eq!(
+        fs::read(root.join(".codex/config.toml")).unwrap(),
+        b"tui = \"custom\"\n"
+    );
+    assert!(
+        !root
+            .join(".local/state/codex-mux/codex-terminal-title.toml")
+            .exists()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn setup_rejects_a_symlinked_codex_config_without_changing_it() {
+    let root = scratch("symlinked-codex-config");
+    let tmux_tmp = root.join("tmux-tmp");
+    fs::create_dir(&tmux_tmp).unwrap();
+    fs::create_dir(root.join(".codex")).unwrap();
+    let tmux = root.join("tmux.conf");
+    let bash = root.join("bashrc");
+    let zsh = root.join("zshrc");
+    let codex = root.join("codex");
+    let target = root.join("managed-config.toml");
+    let config = root.join(".codex/config.toml");
+    fs::write(&tmux, b"host tmux\n").unwrap();
+    fs::write(&bash, b"host bash\n").unwrap();
+    fs::write(&zsh, b"host zsh\n").unwrap();
+    fs::write(&target, b"[tui]\nterminal_title = [\"thread-title\"]\n").unwrap();
+    symlink(&target, &config).unwrap();
+    fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+
+    let setup = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .arg("--codex")
+        .arg(&codex)
+        .arg("setup")
+        .arg("--tmux-config")
+        .arg(&tmux)
+        .arg("--bash-config")
+        .arg(&bash)
+        .arg("--zsh-config")
+        .arg(&zsh)
+        .output()
+        .unwrap();
+    assert!(!setup.status.success());
+    assert!(String::from_utf8_lossy(&setup.stderr).contains("must not be a symlink"));
+    assert!(
+        fs::symlink_metadata(&config)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"[tui]\nterminal_title = [\"thread-title\"]\n"
+    );
+    assert_eq!(fs::read(&tmux).unwrap(), b"host tmux\n");
+    assert_eq!(fs::read(&bash).unwrap(), b"host bash\n");
+    assert_eq!(fs::read(&zsh).unwrap(), b"host zsh\n");
+    assert!(!root.join(".config/codex-mux/config.toml").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn status_reports_managed_config_or_state_symlink_replacement_as_drift() {
+    let root = scratch("status-symlink-drift");
+    let tmux_tmp = root.join("tmux-tmp");
+    fs::create_dir(&tmux_tmp).unwrap();
+    fs::create_dir(root.join(".codex")).unwrap();
+    let tmux = root.join("tmux.conf");
+    let bash = root.join("bashrc");
+    let zsh = root.join("zshrc");
+    let codex = root.join("codex");
+    fs::write(&tmux, b"host tmux\n").unwrap();
+    fs::write(&bash, b"host bash\n").unwrap();
+    fs::write(&zsh, b"host zsh\n").unwrap();
+    fs::write(root.join(".codex/config.toml"), b"[tui]\n").unwrap();
+    fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+    let setup = binary()
+        .env("HOME", &root)
+        .env("TMUX_TMPDIR", &tmux_tmp)
+        .env_remove("TMUX")
+        .arg("--codex")
+        .arg(&codex)
+        .args(["setup", "--tmux-config"])
+        .arg(&tmux)
+        .arg("--bash-config")
+        .arg(&bash)
+        .arg("--zsh-config")
+        .arg(&zsh)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let status = || {
+        binary()
+            .env("HOME", &root)
+            .env("TMUX_TMPDIR", &tmux_tmp)
+            .env_remove("TMUX")
+            .args(["tmux", "status", "--config"])
+            .arg(&tmux)
+            .output()
+            .unwrap()
+    };
+    let config = root.join(".codex/config.toml");
+    let config_target = root.join("managed-config-target.toml");
+    fs::rename(&config, &config_target).unwrap();
+    symlink(&config_target, &config).unwrap();
+    let output = status();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("codex-thread-id-title: unreadable"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("drift: Codex terminal-title ownership is unreadable"));
+    assert!(!stdout.contains("drift: none"));
+    fs::remove_file(&config).unwrap();
+    fs::rename(&config_target, &config).unwrap();
+
+    let state = root.join(".local/state/codex-mux/codex-terminal-title.toml");
+    let state_target = root.join("managed-state-target.toml");
+    fs::rename(&state, &state_target).unwrap();
+    symlink(&state_target, &state).unwrap();
+    let output = status();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("codex-thread-id-title: unreadable"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("drift: Codex terminal-title ownership is unreadable"));
+    assert!(!stdout.contains("drift: none"));
+    assert!(
+        fs::symlink_metadata(&state)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -290,6 +534,16 @@ fn setup_conflict_leaves_all_host_configuration_bytes_unchanged() {
     assert!(
         !root.join(".config/codex-mux/config.toml").exists(),
         "failed setup left persisted process configuration"
+    );
+    assert!(
+        !root.join(".codex/config.toml").exists(),
+        "failed setup left Codex terminal-title configuration"
+    );
+    assert!(
+        !root
+            .join(".local/state/codex-mux/codex-terminal-title.toml")
+            .exists(),
+        "failed setup left Codex terminal-title ownership state"
     );
     fs::remove_dir_all(root).unwrap();
 }

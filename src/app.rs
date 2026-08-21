@@ -20,6 +20,7 @@ use crossterm::event::{self, Event};
 use crate::{
     MuxError, Result,
     cli::{Cli, Command, ConfigPathArgs, InstallArgs, RemoveArgs, SetupArgs, TmuxCommand},
+    codex_config,
     config::{
         MatchScope, PermissionPreset, ProcessSettings, ThemePreference, XdgThemeStore,
         no_color_requested, validate_process_settings,
@@ -37,7 +38,7 @@ use crate::{
     shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
     smart_naming::{
         AppServerNamer, AppServerProcess, NamingDiagnostics, NamingTarget, NamingWorker,
-        RolloutStore,
+        ProcessRolloutStore, RolloutStore,
     },
     tmux::{
         actions::TmuxActions,
@@ -230,9 +231,17 @@ fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Resul
     } else {
         None
     };
+    let codex_title = match codex_config::CodexTitleTransaction::install() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            restore_process_snapshot(process_snapshot.as_ref())?;
+            return Err(error);
+        }
+    };
     let mut shells = match ShellTransaction::prepare_install(shell_paths.clone()) {
         Ok(shells) => shells,
         Err(error) => {
+            codex_title.rollback()?;
             restore_process_snapshot(process_snapshot.as_ref())?;
             return Err(install_error(error));
         }
@@ -240,6 +249,7 @@ fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Resul
     let shell_outcomes = match shells.apply() {
         Ok(outcomes) => outcomes,
         Err(error) => {
+            codex_title.rollback()?;
             restore_process_snapshot(process_snapshot.as_ref())?;
             return Err(install_error(error));
         }
@@ -254,8 +264,10 @@ fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Resul
         Ok(outcome) => outcome,
         Err(error) => {
             let rollback = rollback_aggregate(&mut shells, &tmux_snapshot, &mut reloader, &error);
+            let codex_rollback = codex_title.rollback();
             let process_rollback = restore_process_snapshot(process_snapshot.as_ref());
             rollback?;
+            codex_rollback?;
             process_rollback?;
             return Err(install_error(error));
         }
@@ -274,6 +286,9 @@ fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Resul
     }
     if tmux_outcome.reloaded {
         println!("reloaded running tmux server");
+    }
+    if codex_title.changed() {
+        println!("configured Codex terminal titles to expose exact thread IDs");
     }
     println!("open a new Bash/Zsh shell or source its startup file to activate shell Smart Left");
     Ok(())
@@ -295,6 +310,21 @@ fn run_remove(arguments: RemoveArgs) -> Result<()> {
             return Err(install_error(error));
         }
     };
+    let codex_restored = match codex_config::uninstall() {
+        Ok(restored) => restored,
+        Err(error) => {
+            rollback_aggregate(
+                &mut shells,
+                &tmux_snapshot,
+                &mut reloader,
+                &InstallError::InvalidValue {
+                    field: "Codex terminal-title restoration",
+                    reason: error.to_string(),
+                },
+            )?;
+            return Err(error);
+        }
+    };
     print_shell_outcomes(&shell_outcomes, "removed");
     if removed {
         println!("removed codex-mux binding from {}", tmux_path.display());
@@ -303,6 +333,9 @@ fn run_remove(arguments: RemoveArgs) -> Result<()> {
             "codex-mux binding was not installed in {}",
             tmux_path.display()
         );
+    }
+    if codex_restored {
+        println!("restored the prior Codex terminal-title setting");
     }
     Ok(())
 }
@@ -820,8 +853,12 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
     let diagnostics = NamingDiagnostics::discover().ok();
     let namer_diagnostics = diagnostics.clone();
     let rollouts = RolloutStore::discover().ok();
-    NamingWorker::spawn_logged(
+    let process_rollouts = ProcessRolloutStore::discover(&process.matches).ok();
+    NamingWorker::spawn_parallel_logged(
+        4,
         move |cancelled| {
+            let namer_diagnostics = namer_diagnostics.clone();
+            let rollouts = rollouts.clone();
             AppServerProcess::spawn_with_cancel(&codex_path, cancelled.clone()).map(|session| {
                 let namer = match namer_diagnostics {
                     Some(diagnostics) => AppServerNamer::with_diagnostics(session, diagnostics),
@@ -835,10 +872,37 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
                 }
             })
         },
-        move || {
-            inventory
-                .discover()
-                .map(|panes| panes.iter().filter_map(NamingTarget::from_pane).collect())
+        move |cancelled| {
+            let panes = inventory.discover()?;
+            let unresolved = panes
+                .iter()
+                .filter(|pane| NamingTarget::from_pane(pane).is_none())
+                .cloned()
+                .collect::<Vec<_>>();
+            let recovered = match process_rollouts.as_ref() {
+                Some(store) => store
+                    .resolve_all_cancellable(&unresolved, &cancelled)?
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, thread)| {
+                        thread.map(|thread| (unresolved[index].id.clone(), thread))
+                    })
+                    .collect::<HashMap<_, _>>(),
+                None => HashMap::new(),
+            };
+            panes
+                .iter()
+                .map(|pane| {
+                    if let Some(target) = NamingTarget::from_pane(pane) {
+                        return Ok(Some(target));
+                    }
+                    Ok(recovered
+                        .get(&pane.id)
+                        .cloned()
+                        .and_then(|thread| NamingTarget::from_verified_thread(pane, thread)))
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(|targets| targets.into_iter().flatten().collect())
         },
         Duration::from_secs(30),
         diagnostics,
@@ -1080,8 +1144,24 @@ fn show_status(arguments: ConfigPathArgs, process_arguments: &ProcessArguments) 
     let preference = process_preference(process_arguments)?;
     let expected = executable_paths(&resolve_process(process_arguments, preference.as_ref())?)?;
     let report = status(&path, &expected).map_err(install_error)?;
+    let codex_title_status = codex_config::status();
     if !report.installed {
         println!("not installed: {}", report.path.display());
+        match codex_title_status {
+            Ok(Some(true)) => {
+                println!("codex-thread-id-title: installed");
+                println!("drift: Codex title integration remains installed");
+            }
+            Ok(Some(false)) => {
+                println!("codex-thread-id-title: drifted");
+                println!("drift: Codex terminal-title setting");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                println!("codex-thread-id-title: unreadable ({error})");
+                println!("drift: Codex terminal-title ownership");
+            }
+        }
         return Ok(());
     }
     println!("installed: {}", report.path.display());
@@ -1138,10 +1218,31 @@ fn show_status(arguments: ConfigPathArgs, process_arguments: &ProcessArguments) 
             diagnostics.latest().as_deref().unwrap_or("<none>")
         );
     }
-    if report.drift.is_empty() {
+    let codex_drift = match codex_title_status {
+        Ok(Some(true)) => {
+            println!("codex-thread-id-title: installed");
+            None
+        }
+        Ok(Some(false)) => {
+            println!("codex-thread-id-title: drifted");
+            Some("Codex terminal-title setting".to_owned())
+        }
+        Ok(None) => {
+            println!("codex-thread-id-title: not installed");
+            None
+        }
+        Err(error) => {
+            println!("codex-thread-id-title: unreadable ({error})");
+            Some("Codex terminal-title ownership is unreadable".to_owned())
+        }
+    };
+    if report.drift.is_empty() && codex_drift.is_none() {
         println!("drift: none");
     } else {
         for drift in report.drift {
+            println!("drift: {drift}");
+        }
+        if let Some(drift) = codex_drift {
             println!("drift: {drift}");
         }
     }

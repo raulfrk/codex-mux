@@ -14,7 +14,7 @@ use std::{
 use codex_mux::{
     Result,
     domain::{CodexExecutable, CommandOutput, Pane, PaneId, SessionId, TmuxCommandRunner},
-    smart_naming::GeneratedName,
+    smart_naming::{GeneratedName, ProcessRolloutStore},
     tmux::{actions::TmuxActions, owned_names::OwnedTmuxNames},
 };
 
@@ -36,6 +36,111 @@ impl TmuxCommandRunner for SocketRunner {
             status: output.status.code(),
         })
     }
+}
+
+#[test]
+fn arbitrary_title_wrapper_recovers_from_the_underlying_process_rollout_fd() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("wrapper-rollout-identity");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let sessions = scratch.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let thread_id = "01a01001-2dbb-74e2-86ab-996b31234567";
+    let rollout = sessions.join(format!("rollout-2026-08-21T00-00-00-{thread_id}.jsonl"));
+    fs::write(
+        &rollout,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"source\":\"cli\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+    let helper_source = scratch.join("rollout-holder.rs");
+    let helper = scratch.join("codex-underlying");
+    fs::write(
+        &helper_source,
+        r#"use std::{fs::OpenOptions, thread, time::Duration};
+fn main() {
+    let path = std::env::args_os().nth(1).unwrap();
+    let _rollout = OpenOptions::new().read(true).append(true).open(path).unwrap();
+    thread::sleep(Duration::from_secs(60));
+}
+"#,
+    )
+    .unwrap();
+    let compile = Command::new("rustc")
+        .args(["--edition=2021"])
+        .arg(&helper_source)
+        .arg("-o")
+        .arg(&helper)
+        .output()
+        .unwrap();
+    assert_success(&compile, "compile post-exec rollout holder");
+    let wrapper = scratch.join("codex-wrapper");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n'{}' '{}' &\nwait\n",
+            helper.display(),
+            rollout.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane_id = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    server.checked(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        &pane_id,
+        "-c",
+        path(scratch.path()),
+        path(&wrapper),
+    ]);
+    server.checked(&["select-pane", "-t", &pane_id, "-T", "c"]);
+    let pane = Pane {
+        id: PaneId::new(&pane_id).unwrap(),
+        session_id: SessionId::new(
+            server
+                .checked(&["display-message", "-p", "-t", &pane_id, "#{session_id}"])
+                .trim(),
+        )
+        .unwrap(),
+        title: Some("c".to_owned()),
+        generated_title: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+        manual_name: false,
+        manual_name_source: None,
+        manual_name_pid: None,
+        manual_name_pid_raw: String::new(),
+        manual_name_session: None,
+        manual_name_session_raw: String::new(),
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
+        pane_pid: server
+            .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_pid}"])
+            .trim()
+            .parse()
+            .unwrap(),
+        current_path: scratch.path().to_owned(),
+    };
+    let underlying = CodexExecutable::new(helper).unwrap();
+    let store = ProcessRolloutStore::at(&[underlying], &sessions).unwrap();
+    server.wait_until("wrapper rollout identity", || {
+        store.resolve(&pane).ok().flatten().as_deref() == Some(thread_id)
+    });
 }
 
 #[test]
@@ -727,6 +832,7 @@ fn installer_cli_loads_a_real_prefix_binding_with_responsive_geometry() {
     let status = String::from_utf8(status.stdout).unwrap();
     assert!(status.contains("installed:"));
     assert!(status.contains("key: a"));
+    assert!(status.contains("codex-thread-id-title: not installed"));
     assert!(status.contains("drift: none"));
 
     let binding = server.checked(&["list-keys", "-T", "prefix", "a"]);
@@ -1534,7 +1640,7 @@ fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
             "{log}"
         );
         assert!(
-            log.contains("arg0=-c\narg1=tui.terminal_title=[\"thread\"]\n"),
+            log.contains("arg0=-c\narg1=tui.terminal_title=[\"thread-id\"]\n"),
             "launch did not preserve direct config arguments: {log}"
         );
         assert!(

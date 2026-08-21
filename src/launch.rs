@@ -6,7 +6,7 @@ use crate::domain::{CodexExecutable, InvocationContext, Pane};
 
 /// Codex configuration override that exposes the supported thread identifier
 /// through the terminal title.
-pub const TERMINAL_TITLE_CONFIG: &str = "tui.terminal_title=[\"thread\"]";
+pub const TERMINAL_TITLE_CONFIG: &str = "tui.terminal_title=[\"thread-id\"]";
 
 /// Interactive Codex launch selected by the user.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

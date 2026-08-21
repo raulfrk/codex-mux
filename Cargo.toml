@@ -1,6 +1,6 @@
 [package]
 name = "codex-mux"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -14,7 +14,8 @@ crossterm = "0.28.1"
 flate2 = "1.1.2"
 ratatui = "0.29.0"
 regex = "1.11.1"
-rustix = { version = "0.38.44", features = ["fs", "process"] }
+rustix = { version = "0.38.44", features = ["fs", "param", "process"] }
+rustix-net = { package = "rustix", version = "1.1.4", features = ["net"] }
 semver = "1.0.26"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
@@ -22,6 +23,7 @@ sha2 = "0.10.9"
 tar = "0.4.44"
 thiserror = "2.0.12"
 toml = "0.8.20"
+toml_edit = "0.22.24"
 ureq = { version = "2.12.1", default-features = false, features = ["tls"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.0"

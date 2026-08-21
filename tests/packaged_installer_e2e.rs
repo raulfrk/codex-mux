@@ -68,6 +68,10 @@ fn packaged_cli_round_trips_real_tmux_and_preserves_host_bytes() {
     assert_success(&status, "status after packaged install");
     let status_text = String::from_utf8_lossy(&status.stdout);
     assert!(status_text.contains("key: C-g"), "{status_text}");
+    assert!(
+        status_text.contains("codex-thread-id-title: not installed"),
+        "{status_text}"
+    );
     assert!(status_text.contains("drift: none"), "{status_text}");
     assert_eq!(fs::read(&config).unwrap(), installed);
 

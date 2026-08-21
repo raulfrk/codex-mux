@@ -167,7 +167,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codex-mux"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "clap",
  "crossterm",
@@ -175,6 +175,7 @@ dependencies = [
  "ratatui",
  "regex",
  "rustix 0.38.44",
+ "rustix 1.1.4",
  "semver",
  "serde",
  "serde_json",
@@ -182,6 +183,7 @@ dependencies = [
  "tar",
  "thiserror",
  "toml",
+ "toml_edit",
  "unicode-segmentation",
  "unicode-width 0.2.0",
  "ureq",

@@ -17,12 +17,18 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::{fd::OwnedFd, unix::ffi::OsStrExt};
+use std::os::{
+    fd::{AsRawFd, OwnedFd},
+    unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, MetadataExt},
+    },
+};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::domain::{Pane, PaneId};
+use crate::domain::{CodexExecutable, Pane, PaneId};
 use crate::{MuxError, Result};
 
 /// Codex model used exclusively for background session naming.
@@ -44,6 +50,10 @@ const MAX_HISTORY_REQUESTS: usize = 64;
 const MAX_HISTORY_ENTRIES: usize = MAX_HISTORY_REQUESTS * THREAD_TURNS_PAGE_SIZE as usize;
 const MAX_HISTORY_ID_BYTES: usize = 128;
 const MAX_CURSOR_BYTES: usize = 4096;
+const MAX_PROCESS_ENTRIES: usize = 100_000;
+const MAX_PROCESS_FDS: usize = 512;
+const MAX_PROCESS_SCAN_FDS: usize = 8_192;
+const MAX_PROCESS_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 /// Interval between reconsidering an existing smart title.
 pub const NAMING_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Cooldown before retrying a failed naming attempt or restarting an unhealthy provider.
@@ -576,6 +586,403 @@ impl NamingTarget {
             immediate_naming: pane.immediate_naming,
         })
     }
+
+    /// Builds a target from an independently verified exact thread identity.
+    #[must_use]
+    pub fn from_verified_thread(pane: &Pane, thread_id: String) -> Option<Self> {
+        if pane.manual_name || !looks_like_thread_id(&thread_id) {
+            return None;
+        }
+        let pane_title = pane.title.as_deref()?.trim().to_owned();
+        Some(Self {
+            pane_id: pane.id.clone(),
+            pane_title,
+            thread_hint: thread_id,
+            cwd: pane.current_path.clone(),
+            generated_name: pane.generated_title.clone(),
+            generated_at_unix: pane.generated_at_unix,
+            immediate_naming: pane.immediate_naming,
+        })
+    }
+}
+
+/// Verified Codex shell-snapshot identity source for panes whose visible title
+/// is not itself a thread identifier.
+#[derive(Clone, Debug)]
+#[cfg(test)]
+pub struct ShellSnapshotStore {
+    root: PathBuf,
+}
+
+/// Exact root-session identity inherited by model-spawned shell/tool processes.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
+pub struct ProcessEnvironmentStore;
+
+#[cfg(test)]
+impl ProcessEnvironmentStore {
+    /// Resolves one exact `CODEX_SESSION_ID` from readable descendants of the
+    /// tmux pane process whose inherited `TMUX_PANE` still names this pane.
+    pub fn resolve(self, pane: &Pane) -> Result<Option<String>> {
+        let first = process_environment_threads(pane)?;
+        let second = process_environment_threads(pane)?;
+        if first != second {
+            return Ok(None);
+        }
+        match first.len() {
+            0 => Ok(None),
+            1 => Ok(first.into_iter().next()),
+            _ => Err(protocol(
+                "live pane descendants expose multiple Codex session IDs",
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+fn process_environment_threads(pane: &Pane) -> Result<HashSet<String>> {
+    let mut processes = HashMap::new();
+    let directory = fs::read_dir("/proc").map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("/proc"),
+        source,
+    })?;
+    for (index, entry) in directory.enumerate() {
+        if index >= 100_000 {
+            return Err(protocol(
+                "process environment discovery exceeded its entry limit",
+            ));
+        }
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Ok(identity) = process_stat_identity(pid) {
+            processes.insert(pid, identity);
+        }
+    }
+    let Some(root_identity) = processes.get(&pane.pane_pid).copied() else {
+        return Ok(HashSet::new());
+    };
+    let parents = processes
+        .iter()
+        .map(|(&pid, &(parent, _))| (pid, parent))
+        .collect::<HashMap<_, _>>();
+    let mut matched = HashSet::new();
+    for (&pid, &identity) in &processes {
+        if pid == pane.pane_pid || !descends_from(pid, pane.pane_pid, &parents) {
+            continue;
+        }
+        let Some((observed_pane, thread_id)) = process_identity_environment(pid)? else {
+            continue;
+        };
+        if observed_pane != pane.id.as_str() || !looks_like_thread_id(&thread_id) {
+            continue;
+        }
+        // Re-read the candidate's current parent and prove its current chain
+        // against the same bounded snapshot before accepting its environment.
+        let current_identity = match process_stat_identity(pid) {
+            Ok(identity) => identity,
+            Err(_) => continue,
+        };
+        if identity != current_identity || !descends_from(pid, pane.pane_pid, &parents) {
+            continue;
+        }
+        matched.insert(thread_id);
+    }
+    if process_stat_identity(pane.pane_pid).ok() != Some(root_identity) {
+        return Ok(HashSet::new());
+    }
+    Ok(matched)
+}
+
+fn process_stat_identity(pid: u32) -> Result<(u32, u64)> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = fs::read_to_string(&path).map_err(|source| MuxError::Filesystem { path, source })?;
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| protocol("process stat is malformed"))?;
+    let mut fields = fields.split_whitespace();
+    let parent = fields
+        .nth(1)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| protocol("process parent is malformed"))?;
+    let started = fields
+        .nth(17)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| protocol("process start time is malformed"))?;
+    Ok((parent, started))
+}
+
+fn descends_from(mut pid: u32, root: u32, parents: &HashMap<u32, u32>) -> bool {
+    let mut visited = HashSet::new();
+    for _ in 0..128 {
+        if pid == root {
+            return true;
+        }
+        if !visited.insert(pid) {
+            return false;
+        }
+        let Some(parent) = parents.get(&pid).copied() else {
+            return false;
+        };
+        if parent == 0 || parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+fn revalidate_descendant(
+    mut pid: u32,
+    identity: (u32, u64),
+    root: u32,
+    root_identity: (u32, u64),
+    snapshot: &HashMap<u32, (u32, u64)>,
+) -> bool {
+    let mut expected = identity;
+    let mut visited = HashSet::new();
+    while pid != root {
+        if !visited.insert(pid)
+            || snapshot.get(&pid).copied() != Some(expected)
+            || process_stat_identity(pid).ok() != Some(expected)
+        {
+            return false;
+        }
+        pid = expected.0;
+        let Some(next) = snapshot.get(&pid).copied() else {
+            return false;
+        };
+        expected = next;
+    }
+    expected == root_identity && process_stat_identity(root).ok() == Some(root_identity)
+}
+
+#[cfg(test)]
+fn process_identity_environment(pid: u32) -> Result<Option<(String, String)>> {
+    let path = PathBuf::from(format!("/proc/{pid}/environ"));
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(source) => return Err(MuxError::Filesystem { path, source }),
+    };
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| MuxError::Filesystem {
+            path: path.clone(),
+            source,
+        })?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(protocol("process environment exceeded its byte limit"));
+    }
+    let mut pane = None;
+    let mut session = None;
+    for field in bytes.split(|byte| *byte == 0) {
+        if let Some(value) = field.strip_prefix(b"TMUX_PANE=") {
+            pane = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+        } else if let Some(value) = field.strip_prefix(b"CODEX_SESSION_ID=") {
+            session = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+        }
+    }
+    Ok(pane.zip(session))
+}
+
+#[cfg(test)]
+impl ShellSnapshotStore {
+    /// Discovers the snapshot directory from the daemon's Codex home.
+    pub fn discover() -> Result<Self> {
+        let root = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .ok_or_else(|| protocol("Codex home is unavailable"))?
+            .join("shell_snapshots");
+        Ok(Self { root })
+    }
+
+    #[cfg(test)]
+    /// Constructs a store at an explicit directory for deterministic tests.
+    pub fn at(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// Returns one exact root-session UUID only when all matching snapshot
+    /// evidence for the live pane agrees.
+    pub fn resolve(&self, pane: &Pane) -> Result<Option<String>> {
+        #[cfg(unix)]
+        use rustix::fs::{Dir, FileType, Mode, OFlags, open, openat};
+
+        let process_started = linux_process_started_unix(pane.pane_pid)?;
+        let directory = match open(
+            &self.root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => {
+                return Err(protocol(&format!(
+                    "cannot open shell snapshot directory: {error}"
+                )));
+            }
+        };
+        let directory_file = fs::File::from(directory);
+        validate_snapshot_directory(&directory_file)?;
+        let directory: OwnedFd = directory_file.into();
+        let entries = Dir::read_from(&directory)
+            .map_err(|error| protocol(&format!("cannot read shell snapshot directory: {error}")))?;
+        let mut matched: Option<String> = None;
+        for (index, entry) in entries.enumerate() {
+            if index >= 10_000 {
+                return Err(protocol(
+                    "shell snapshot discovery exceeded its entry limit",
+                ));
+            }
+            let entry = entry.map_err(|error| {
+                protocol(&format!("cannot read a shell snapshot entry: {error}"))
+            })?;
+            if entry.file_type() != FileType::RegularFile {
+                continue;
+            }
+            let name = entry.file_name();
+            let path = self.root.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            let Some(thread_id) = snapshot_thread_id(&path) else {
+                continue;
+            };
+            let file = openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| protocol(&format!("cannot open shell snapshot: {error}")))?;
+            let file = fs::File::from(file);
+            let metadata = file.metadata().map_err(|source| MuxError::Filesystem {
+                path: path.clone(),
+                source,
+            })?;
+            if !safe_snapshot_metadata(&metadata, process_started) {
+                continue;
+            }
+            let mut observed_pane = None;
+            for line in BufReader::new(file).lines().take(20_000) {
+                let line = line.map_err(|source| MuxError::Filesystem {
+                    path: path.clone(),
+                    source,
+                })?;
+                if let Some(value) = line.strip_prefix("export TMUX_PANE=") {
+                    observed_pane = shell_snapshot_literal(value);
+                    break;
+                }
+            }
+            if observed_pane.as_deref() != Some(pane.id.as_str()) {
+                continue;
+            }
+            if matched
+                .as_deref()
+                .is_some_and(|existing| existing != thread_id)
+            {
+                return Err(protocol(
+                    "live pane matches multiple shell snapshot threads",
+                ));
+            }
+            matched = Some(thread_id.to_owned());
+        }
+        Ok(matched)
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+fn validate_snapshot_directory(directory: &fs::File) -> Result<()> {
+    let metadata = directory
+        .metadata()
+        .map_err(|source| MuxError::Filesystem {
+            path: PathBuf::from("shell_snapshots"),
+            source,
+        })?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(protocol("shell snapshot directory is not trusted"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+fn safe_snapshot_metadata(metadata: &fs::Metadata, process_started: u64) -> bool {
+    metadata.is_file()
+        && metadata.uid() == rustix::process::geteuid().as_raw()
+        && metadata.nlink() == 1
+        && metadata.mode() & 0o022 == 0
+        && metadata.len() <= 1024 * 1024
+        && !metadata.mtime().is_negative()
+        && metadata.mtime() as u64 >= process_started
+}
+
+#[cfg(test)]
+fn snapshot_thread_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let thread = name.split_once('.')?.0;
+    looks_like_thread_id(thread).then_some(thread)
+}
+
+#[cfg(test)]
+fn shell_snapshot_literal(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(value) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return (!value.contains('\'')).then(|| value.to_owned());
+    }
+    value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '%' | '_' | '-'))
+        .then(|| value.to_owned())
+}
+
+#[cfg(test)]
+fn linux_process_started_unix(pid: u32) -> Result<u64> {
+    let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = fs::read_to_string(&stat_path).map_err(|source| MuxError::Filesystem {
+        path: stat_path,
+        source,
+    })?;
+    let after_comm = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| protocol("pane process stat is malformed"))?;
+    let start_ticks = after_comm
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| protocol("pane process start time is malformed"))?;
+    let proc_stat = fs::read_to_string("/proc/stat").map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("/proc/stat"),
+        source,
+    })?;
+    let boot = proc_stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| protocol("system boot time is unavailable"))?;
+    let ticks = rustix::param::clock_ticks_per_second();
+    Ok(boot.saturating_add(start_ticks / ticks))
 }
 
 pub(crate) fn thread_hint(title: &str) -> Option<&str> {
@@ -652,6 +1059,7 @@ pub struct NamingWorker {
     thread: Option<JoinHandle<()>>,
     names: GeneratedNames,
     cancelled: Arc<AtomicBool>,
+    children: Vec<NamingWorker>,
 }
 
 enum NamingCommand {
@@ -659,7 +1067,86 @@ enum NamingCommand {
     Wake,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiscoveryPhase {
+    Scan,
+    Revalidate,
+}
+
 impl NamingWorker {
+    /// Starts a bounded set of independent provider lanes while preserving one
+    /// merged publication surface for the daemon coordinator.
+    pub fn spawn_parallel_logged<N, F, D>(
+        lanes: usize,
+        start_namer: F,
+        discover: D,
+        poll_interval: Duration,
+        diagnostics: Option<NamingDiagnostics>,
+    ) -> Self
+    where
+        N: ConversationNamer,
+        F: Fn(Arc<AtomicBool>) -> Result<N> + Send + Sync + 'static,
+        D: FnMut(Arc<AtomicBool>) -> Result<Vec<NamingTarget>> + Send + 'static,
+    {
+        let lanes = lanes.clamp(1, 8);
+        let start_namer = Arc::new(start_namer);
+        let discover = Arc::new(Mutex::new(discover));
+        let discovery_cancelled = Arc::new(AtomicBool::new(false));
+        let discovery_cache = Arc::new(Mutex::new(None::<(Vec<NamingTarget>, HashSet<usize>)>));
+        let children = (0..lanes)
+            .map(|lane| {
+                let start_namer = start_namer.clone();
+                let discover = discover.clone();
+                let diagnostics = diagnostics.clone();
+                let discovery_cancelled = discovery_cancelled.clone();
+                let discovery_cache = discovery_cache.clone();
+                Self::spawn_logged_phased(
+                    move |cancelled| start_namer(cancelled),
+                    move |phase| {
+                        if discovery_cancelled.load(Ordering::Acquire) {
+                            return Err(MuxError::Cancelled);
+                        }
+                        let mut cache = discovery_cache.lock().unwrap();
+                        let refresh = phase == DiscoveryPhase::Revalidate
+                            || cache.as_ref().is_none_or(|(_, seen)| seen.len() == lanes);
+                        if refresh {
+                            let targets = discover.lock().unwrap()(discovery_cancelled.clone())?;
+                            *cache = Some((targets, HashSet::new()));
+                        }
+                        let (targets, seen) = cache.as_mut().expect("discovery cache initialized");
+                        seen.insert(lane);
+                        Ok(targets
+                            .iter()
+                            .filter(|target| {
+                                let mut hasher = DefaultHasher::new();
+                                // Full UUIDs and legacy truncated UUID titles for the same
+                                // conversation must enter the same lane so one provider owns
+                                // their exact-ID deduplication and fanout.
+                                target
+                                    .thread_hint
+                                    .bytes()
+                                    .filter(|byte| *byte != b'-')
+                                    .take(12)
+                                    .for_each(|byte| byte.hash(&mut hasher));
+                                hasher.finish() as usize % lanes == lane
+                            })
+                            .cloned()
+                            .collect())
+                    },
+                    poll_interval,
+                    diagnostics,
+                )
+            })
+            .collect();
+        Self {
+            commands: None,
+            thread: None,
+            names: Arc::new(Mutex::new(HashMap::new())),
+            cancelled: discovery_cancelled,
+            children,
+        }
+    }
+
     /// Starts a worker that continuously discovers existing and future targets.
     pub fn spawn<N, F, D>(start_namer: F, discover: D, poll_interval: Duration) -> Self
     where
@@ -679,7 +1166,7 @@ impl NamingWorker {
     /// Starts a worker with privacy-safe operational event logging.
     pub fn spawn_logged<N, F, D>(
         start_namer: F,
-        discover: D,
+        mut discover: D,
         poll_interval: Duration,
         diagnostics: Option<NamingDiagnostics>,
     ) -> Self
@@ -687,6 +1174,20 @@ impl NamingWorker {
         N: ConversationNamer,
         F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
+    {
+        Self::spawn_logged_phased(start_namer, move |_| discover(), poll_interval, diagnostics)
+    }
+
+    fn spawn_logged_phased<N, F, D>(
+        start_namer: F,
+        discover: D,
+        poll_interval: Duration,
+        diagnostics: Option<NamingDiagnostics>,
+    ) -> Self
+    where
+        N: ConversationNamer,
+        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        D: FnMut(DiscoveryPhase) -> Result<Vec<NamingTarget>> + Send + 'static,
     {
         Self::spawn_with_retry_intervals(
             start_namer,
@@ -701,7 +1202,7 @@ impl NamingWorker {
 
     fn spawn_with_intervals<N, F, D>(
         start_namer: F,
-        discover: D,
+        mut discover: D,
         poll_interval: Duration,
         refresh_interval: Duration,
         retry_interval: Duration,
@@ -713,7 +1214,7 @@ impl NamingWorker {
     {
         Self::spawn_with_retry_intervals(
             start_namer,
-            discover,
+            move |_| discover(),
             poll_interval,
             refresh_interval,
             retry_interval,
@@ -734,7 +1235,7 @@ impl NamingWorker {
     where
         N: ConversationNamer,
         F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
-        D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
+        D: FnMut(DiscoveryPhase) -> Result<Vec<NamingTarget>> + Send + 'static,
     {
         let (commands, command_receiver) = mpsc::channel();
         let names: GeneratedNames = Arc::new(Mutex::new(HashMap::new()));
@@ -756,7 +1257,7 @@ impl NamingWorker {
                     CommandSignal::Stop => break,
                     CommandSignal::Wake | CommandSignal::None => {}
                 }
-                let Ok(targets) = discover() else {
+                let Ok(targets) = discover(DiscoveryPhase::Scan) else {
                     log_diagnostic(&diagnostics, "discovery_failed");
                     if wait_for_stop(&command_receiver, poll_interval) {
                         break;
@@ -896,7 +1397,7 @@ impl NamingWorker {
                         CommandSignal::Wake => continue 'worker,
                         CommandSignal::None => {}
                     }
-                    let Ok(current) = discover() else {
+                    let Ok(current) = discover(DiscoveryPhase::Revalidate) else {
                         continue;
                     };
                     let mut matching_groups =
@@ -956,17 +1457,28 @@ impl NamingWorker {
             thread: Some(thread),
             names,
             cancelled,
+            children: Vec::new(),
         }
     }
 
     /// Returns the shared generated-name snapshot.
     #[must_use]
     pub fn names(&self) -> GeneratedNames {
+        if !self.children.is_empty() {
+            let mut merged = self.names.lock().unwrap();
+            merged.clear();
+            for child in &self.children {
+                merged.extend(child.names.lock().unwrap().clone());
+            }
+        }
         self.names.clone()
     }
 
     /// Wakes discovery early after a pane acquires an exact resumed thread.
     pub fn trigger(&self) {
+        for child in &self.children {
+            child.trigger();
+        }
         if let Some(commands) = &self.commands {
             let _ = commands.send(NamingCommand::Wake);
         }
@@ -975,6 +1487,9 @@ impl NamingWorker {
     /// Reports whether the worker lane ended, including provider startup failure.
     #[must_use]
     pub fn is_finished(&self) -> bool {
+        if !self.children.is_empty() {
+            return self.children.iter().any(Self::is_finished);
+        }
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
@@ -985,6 +1500,9 @@ impl NamingWorker {
 
     fn shutdown(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+        for child in self.children.drain(..) {
+            child.stop();
+        }
         if let Some(commands) = self.commands.take() {
             let _ = commands.send(NamingCommand::Stop);
         }
@@ -1094,6 +1612,920 @@ pub(crate) fn looks_like_thread_id(value: &str) -> bool {
                 character.is_ascii_hexdigit()
             }
         })
+}
+
+/// Kernel-bound resolver for the root rollout currently held by an exact
+/// configured Codex process in a pane's process tree.
+#[derive(Clone, Debug)]
+pub struct ProcessRolloutStore {
+    executables: Vec<(u64, u64)>,
+    rollout_root: PathBuf,
+}
+
+struct ProcessScanBudget<'a> {
+    cancelled: &'a AtomicBool,
+    fds: usize,
+    bytes: u64,
+}
+
+impl<'a> ProcessScanBudget<'a> {
+    fn new(cancelled: &'a AtomicBool) -> Self {
+        Self {
+            cancelled,
+            fds: 0,
+            bytes: 0,
+        }
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(MuxError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn fd(&mut self) -> Result<()> {
+        self.checkpoint()?;
+        self.fds += 1;
+        if self.fds > MAX_PROCESS_SCAN_FDS {
+            return Err(protocol(
+                "process rollout discovery exceeded its descriptor budget",
+            ));
+        }
+        Ok(())
+    }
+
+    fn bytes(&mut self, count: u64) -> Result<()> {
+        self.checkpoint()?;
+        self.bytes = self.bytes.saturating_add(count);
+        if self.bytes > MAX_PROCESS_SCAN_BYTES {
+            return Err(protocol(
+                "process rollout discovery exceeded its byte budget",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ProcessRolloutStore {
+    /// Captures the configured executable identities and Codex sessions root.
+    pub fn discover(executables: &[CodexExecutable]) -> Result<Self> {
+        let rollout_root = RolloutStore::discover()?.root;
+        Self::at(executables, rollout_root)
+    }
+
+    /// Uses an explicit rollout root, primarily for hermetic integration tests.
+    pub fn at(executables: &[CodexExecutable], rollout_root: impl Into<PathBuf>) -> Result<Self> {
+        let executables = executables
+            .iter()
+            .map(|executable| {
+                let path = executable.as_path();
+                let metadata = fs::metadata(path).map_err(|source| MuxError::Filesystem {
+                    path: path.to_owned(),
+                    source,
+                })?;
+                Ok((metadata.dev(), metadata.ino()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            executables,
+            rollout_root: rollout_root.into(),
+        })
+    }
+
+    /// Resolves one exact non-subagent rollout identity or fails closed.
+    pub fn resolve(&self, pane: &Pane) -> Result<Option<String>> {
+        let cancelled = AtomicBool::new(false);
+        self.resolve_cancellable(pane, &cancelled)
+    }
+
+    pub(crate) fn resolve_cancellable(
+        &self,
+        pane: &Pane,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<String>> {
+        self.resolve_with_socket_diagnostics(
+            pane,
+            unix_socket_diagnostics(Some(cancelled)),
+            cancelled,
+        )
+    }
+
+    pub(crate) fn resolve_all_cancellable(
+        &self,
+        panes: &[Pane],
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<Option<String>>> {
+        let mut budget = ProcessScanBudget::new(cancelled);
+        let processes = process_snapshot(&mut budget)?;
+        let diagnostics = match unix_socket_diagnostics(Some(cancelled)) {
+            Ok(diagnostics) => {
+                budget.bytes(diagnostics.scanned_bytes)?;
+                Some(diagnostics)
+            }
+            Err(MuxError::Cancelled) => return Err(MuxError::Cancelled),
+            Err(_) => None,
+        };
+        let needs_peer = match diagnostics.as_ref() {
+            Some(diagnostics) => {
+                self.has_peer_candidates(panes, &processes, diagnostics, &mut budget)?
+            }
+            None => false,
+        };
+        let fresh_diagnostics = fresh_socket_diagnostics(needs_peer, &mut budget)?;
+        let proc_unix = fresh_diagnostics
+            .as_ref()
+            .map(|_| read_bounded_proc_unix(&mut budget))
+            .transpose()?;
+        panes
+            .iter()
+            .map(|pane| {
+                self.resolve_in_snapshot(
+                    pane,
+                    &processes,
+                    diagnostics.as_ref(),
+                    fresh_diagnostics.as_ref(),
+                    proc_unix.as_deref(),
+                    &mut budget,
+                )
+            })
+            .collect()
+    }
+
+    fn resolve_with_socket_diagnostics(
+        &self,
+        pane: &Pane,
+        diagnostics: Result<UnixSocketDiagnostics>,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<String>> {
+        let mut budget = ProcessScanBudget::new(cancelled);
+        let processes = process_snapshot(&mut budget)?;
+        let diagnostics = diagnostics
+            .ok()
+            .map(|diagnostics| {
+                budget.bytes(diagnostics.scanned_bytes)?;
+                Ok(diagnostics)
+            })
+            .transpose()?;
+        let needs_peer = match diagnostics.as_ref() {
+            Some(diagnostics) => self.has_peer_candidates(
+                std::slice::from_ref(pane),
+                &processes,
+                diagnostics,
+                &mut budget,
+            )?,
+            None => false,
+        };
+        let fresh_diagnostics = fresh_socket_diagnostics(needs_peer, &mut budget)?;
+        let proc_unix = fresh_diagnostics
+            .as_ref()
+            .map(|_| read_bounded_proc_unix(&mut budget))
+            .transpose()?;
+        self.resolve_in_snapshot(
+            pane,
+            &processes,
+            diagnostics.as_ref(),
+            fresh_diagnostics.as_ref(),
+            proc_unix.as_deref(),
+            &mut budget,
+        )
+    }
+
+    fn has_peer_candidates(
+        &self,
+        panes: &[Pane],
+        processes: &HashMap<u32, (u32, u64)>,
+        diagnostics: &UnixSocketDiagnostics,
+        budget: &mut ProcessScanBudget<'_>,
+    ) -> Result<bool> {
+        let parents = processes
+            .iter()
+            .map(|(&pid, &(parent, _))| (pid, parent))
+            .collect::<HashMap<_, _>>();
+        for &pid in processes.keys() {
+            if !self.executable_matches(pid)
+                || !panes
+                    .iter()
+                    .any(|pane| descends_from(pid, pane.pane_pid, &parents))
+            {
+                continue;
+            }
+            if process_socket_inodes(pid, budget)?
+                .iter()
+                .any(|inode| diagnostics.peers.contains_key(inode))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn resolve_in_snapshot(
+        &self,
+        pane: &Pane,
+        processes: &HashMap<u32, (u32, u64)>,
+        diagnostics: Option<&UnixSocketDiagnostics>,
+        fresh_diagnostics: Option<&UnixSocketDiagnostics>,
+        proc_unix: Option<&str>,
+        budget: &mut ProcessScanBudget<'_>,
+    ) -> Result<Option<String>> {
+        let Some(root_identity) = processes.get(&pane.pane_pid).copied() else {
+            return Ok(None);
+        };
+        let parents = processes
+            .iter()
+            .map(|(&pid, &(parent, _))| (pid, parent))
+            .collect::<HashMap<_, _>>();
+        let candidates = processes
+            .iter()
+            .filter(|(pid, _)| {
+                descends_from(**pid, pane.pane_pid, &parents) && self.executable_matches(**pid)
+            })
+            .map(|(&pid, &identity)| (pid, identity))
+            .collect::<Vec<_>>();
+        // Direct rollout descriptors are authoritative without sock_diag.
+        // Netlink is optional evidence used only for legacy control peers.
+        let mut peer_inodes = HashSet::new();
+        if let Some(diagnostics) = diagnostics {
+            for (pid, _) in &candidates {
+                for inode in process_socket_inodes(*pid, budget)? {
+                    if let Some(peer) = diagnostics.peers.get(&inode) {
+                        peer_inodes.insert(*peer);
+                    }
+                }
+            }
+        }
+        let peer_owners = if peer_inodes.is_empty() {
+            HashMap::new()
+        } else {
+            process_socket_owners(processes, &peer_inodes, budget)?
+        };
+        let mut matched = HashSet::new();
+        let mut direct_candidates = Vec::new();
+        for (pid, identity) in candidates {
+            let identities = self.process_rollouts(pid, budget)?;
+            if !revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
+                || !self.executable_matches(pid)
+            {
+                continue;
+            }
+            if !identities.is_empty() {
+                direct_candidates.push((pid, identity));
+            }
+
+            // Older Codex clients delegate the active thread to a private
+            // app-server control peer. Follow only kernel-reported Unix peer
+            // inodes, then require that peer to own the exact private control
+            // socket before considering its rollout descriptors.
+            let Some(diagnostics) = diagnostics else {
+                continue;
+            };
+            let sockets = process_socket_inodes(pid, budget)?;
+            for (candidate_inode, peer_inode) in sockets
+                .iter()
+                .filter_map(|inode| diagnostics.peers.get(inode).map(|peer| (*inode, *peer)))
+            {
+                for &peer_pid in peer_owners.get(&peer_inode).into_iter().flatten() {
+                    let Some(&peer_identity) = processes.get(&peer_pid) else {
+                        continue;
+                    };
+                    let Some(fresh) = fresh_diagnostics else {
+                        continue;
+                    };
+                    let Some(proc_unix) = proc_unix else {
+                        continue;
+                    };
+                    if process_stat_identity(peer_pid).ok() != Some(peer_identity)
+                        || !revalidate_descendant(
+                            pid,
+                            identity,
+                            pane.pane_pid,
+                            root_identity,
+                            processes,
+                        )
+                        || !process_socket_inodes(pid, budget)?.contains(&candidate_inode)
+                        || !process_socket_inodes(peer_pid, budget)?.contains(&peer_inode)
+                        || fresh.peers.get(&candidate_inode) != Some(&peer_inode)
+                        || !self.peer_is_private_control_connection(
+                            peer_pid, peer_inode, fresh, proc_unix, budget,
+                        )?
+                    {
+                        continue;
+                    }
+                    let peer_rollouts = self.process_rollouts(peer_pid, budget)?;
+                    if process_stat_identity(peer_pid).ok() != Some(peer_identity)
+                        || !revalidate_descendant(
+                            pid,
+                            identity,
+                            pane.pane_pid,
+                            root_identity,
+                            processes,
+                        )
+                        || !process_socket_inodes(pid, budget)?.contains(&candidate_inode)
+                        || !process_socket_inodes(peer_pid, budget)?.contains(&peer_inode)
+                        || !self.peer_is_private_control_connection(
+                            peer_pid, peer_inode, fresh, proc_unix, budget,
+                        )?
+                    {
+                        continue;
+                    }
+                    matched.extend(peer_rollouts);
+                }
+            }
+        }
+        for (pid, identity) in direct_candidates {
+            if revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
+                && self.executable_matches(pid)
+            {
+                let rollouts = self.process_rollouts(pid, budget)?;
+                if revalidate_descendant(pid, identity, pane.pane_pid, root_identity, processes)
+                    && self.executable_matches(pid)
+                {
+                    matched.extend(rollouts);
+                }
+            }
+        }
+        budget.checkpoint()?;
+        if process_stat_identity(pane.pane_pid).ok() != Some(root_identity) {
+            return Ok(None);
+        }
+        match matched.len() {
+            0 => Ok(None),
+            1 => Ok(matched.into_iter().next()),
+            _ => Err(protocol(
+                "pane Codex processes hold multiple root conversation rollouts",
+            )),
+        }
+    }
+
+    fn executable_matches(&self, pid: u32) -> bool {
+        let path = PathBuf::from(format!("/proc/{pid}/exe"));
+        fs::metadata(path).ok().is_some_and(|metadata| {
+            self.executables
+                .iter()
+                .any(|identity| *identity == (metadata.dev(), metadata.ino()))
+        })
+    }
+
+    fn private_control_server_matches(
+        &self,
+        pid: u32,
+        codex_home: &Path,
+        budget: &mut ProcessScanBudget<'_>,
+    ) -> Result<bool> {
+        if self.executable_matches(pid) {
+            return Ok(true);
+        }
+        let Ok(executable) = fs::read_link(format!("/proc/{pid}/exe")) else {
+            return Ok(false);
+        };
+        let releases = codex_home.join("packages/standalone/releases");
+        let Ok(relative) = executable.strip_prefix(&releases) else {
+            return Ok(false);
+        };
+        let components = relative.components().collect::<Vec<_>>();
+        if components.len() != 3
+            || components[1].as_os_str() != "bin"
+            || components[2].as_os_str() != "codex"
+        {
+            return Ok(false);
+        }
+        let euid = rustix::process::geteuid().as_raw();
+        let trusted_path = [
+            codex_home.to_path_buf(),
+            codex_home.join("packages"),
+            codex_home.join("packages/standalone"),
+            releases,
+            executable.parent().unwrap().parent().unwrap().to_path_buf(),
+            executable.parent().unwrap().to_path_buf(),
+        ]
+        .iter()
+        .all(|directory| {
+            fs::symlink_metadata(directory)
+                .ok()
+                .is_some_and(|metadata| {
+                    metadata.is_dir() && metadata.uid() == euid && metadata.mode() & 0o022 == 0
+                })
+        });
+        let trusted_executable = fs::symlink_metadata(&executable)
+            .ok()
+            .is_some_and(|metadata| {
+                let running = fs::metadata(format!("/proc/{pid}/exe")).ok();
+                metadata.is_file()
+                    && metadata.uid() == euid
+                    && metadata.mode() & 0o022 == 0
+                    && metadata.mode() & 0o111 != 0
+                    && running.as_ref().is_some_and(|running| {
+                        running.dev() == metadata.dev() && running.ino() == metadata.ino()
+                    })
+            });
+        let command_path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+        budget.bytes(64 * 1024 + 1)?;
+        let mut command = Vec::new();
+        let command_ok = fs::File::open(&command_path)
+            .and_then(|file| file.take(64 * 1024 + 1).read_to_end(&mut command))
+            .is_ok()
+            && command.len() <= 64 * 1024;
+        if !command_ok {
+            return Ok(false);
+        }
+        let arguments = command
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .collect::<Vec<_>>();
+        Ok(trusted_path
+            && trusted_executable
+            && arguments.get(1).copied() == Some(b"app-server")
+            && arguments.get(2).copied() == Some(b"--listen")
+            && arguments.get(3).copied() == Some(b"unix://"))
+    }
+
+    fn peer_is_private_control_connection(
+        &self,
+        pid: u32,
+        peer_inode: u32,
+        sockets: &UnixSocketDiagnostics,
+        proc_unix: &str,
+        budget: &mut ProcessScanBudget<'_>,
+    ) -> Result<bool> {
+        let Some(codex_home) = self.rollout_root.parent() else {
+            return Ok(false);
+        };
+        let expected = codex_home
+            .join("app-server-control")
+            .join("app-server-control.sock");
+        let private_socket = fs::symlink_metadata(&expected)
+            .ok()
+            .is_some_and(|metadata| {
+                metadata.file_type().is_socket()
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.mode() & 0o022 == 0
+            });
+        if !private_socket {
+            return Ok(false);
+        }
+        if !self.private_control_server_matches(pid, codex_home, budget)? {
+            return Ok(false);
+        }
+        let euid = rustix::process::geteuid().as_raw();
+        if [
+            codex_home,
+            expected.parent().expect("control socket parent"),
+        ]
+        .iter()
+        .any(|directory| {
+            !fs::symlink_metadata(directory)
+                .ok()
+                .is_some_and(|metadata| {
+                    metadata.is_dir() && metadata.uid() == euid && metadata.mode() & 0o022 == 0
+                })
+        }) {
+            return Ok(false);
+        }
+        if sockets.names.get(&peer_inode).map(Vec::as_slice)
+            != Some(expected.as_os_str().as_bytes())
+        {
+            return Ok(false);
+        }
+        let sockets = process_socket_inodes(pid, budget)?;
+        let mut exact_peer = false;
+        let mut owned_listener = false;
+        for line in proc_unix.lines().skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let inode = fields
+                .get(6)
+                .and_then(|inode| inode.parse::<u32>().ok())
+                .unwrap_or_default();
+            let expected_path = fields
+                .get(7)
+                .is_some_and(|path| Path::new(path) == expected);
+            exact_peer |= inode == peer_inode && sockets.contains(&inode) && expected_path;
+            owned_listener |=
+                fields.get(5) == Some(&"01") && sockets.contains(&inode) && expected_path;
+        }
+        Ok(exact_peer
+            && owned_listener
+            && self.private_control_server_matches(pid, codex_home, budget)?)
+    }
+
+    fn process_rollouts(
+        &self,
+        pid: u32,
+        budget: &mut ProcessScanBudget<'_>,
+    ) -> Result<HashSet<String>> {
+        let directory_path = PathBuf::from(format!("/proc/{pid}/fd"));
+        let directory = match fs::read_dir(&directory_path) {
+            Ok(directory) => directory,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(HashSet::new());
+            }
+            Err(source) => {
+                return Err(MuxError::Filesystem {
+                    path: directory_path,
+                    source,
+                });
+            }
+        };
+        let mut matched = HashSet::new();
+        for (index, entry) in directory.enumerate() {
+            budget.fd()?;
+            if index >= MAX_PROCESS_FDS {
+                return Err(protocol("Codex process exceeded the descriptor scan limit"));
+            }
+            let Ok(entry) = entry else { continue };
+            let Some(before) = fd_info(pid, &entry.file_name()) else {
+                continue;
+            };
+            if before.flags & 0o2_002_003 != 0o2_002_002 {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(mut file) = fs::File::open(&path) else {
+                continue;
+            };
+            if file.metadata().ok().map(|metadata| metadata.ino()) != Some(before.ino) {
+                continue;
+            }
+            let actual = match fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+                Ok(actual) => actual,
+                Err(_) => continue,
+            };
+            if !actual.starts_with(&self.rollout_root) {
+                continue;
+            }
+            let Some(thread_id) = rollout_thread_id(&actual) else {
+                continue;
+            };
+            validate_rollout_file(&file, &actual)?;
+            if rollout_is_root_identity(&mut file, &actual, &thread_id, budget)?
+                && fd_info(pid, &entry.file_name()) == Some(before)
+            {
+                matched.insert(thread_id);
+            }
+        }
+        Ok(matched)
+    }
+}
+
+fn process_snapshot(budget: &mut ProcessScanBudget<'_>) -> Result<HashMap<u32, (u32, u64)>> {
+    let mut processes = HashMap::new();
+    let directory = fs::read_dir("/proc").map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("/proc"),
+        source,
+    })?;
+    for (index, entry) in directory.enumerate() {
+        budget.checkpoint()?;
+        if index >= MAX_PROCESS_ENTRIES {
+            return Err(protocol("process discovery exceeded its entry limit"));
+        }
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        if let Ok(identity) = process_stat_identity(pid) {
+            processes.insert(pid, identity);
+        }
+    }
+    Ok(processes)
+}
+
+fn read_bounded_proc_unix(budget: &mut ProcessScanBudget<'_>) -> Result<String> {
+    let path = PathBuf::from("/proc/net/unix");
+    let file = fs::File::open(&path).map_err(|source| MuxError::Filesystem {
+        path: path.clone(),
+        source,
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROCESS_SCAN_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| MuxError::Filesystem {
+            path: path.clone(),
+            source,
+        })?;
+    budget.bytes(bytes.len() as u64)?;
+    if bytes.len() as u64 > MAX_PROCESS_SCAN_BYTES {
+        return Err(protocol("/proc/net/unix exceeded the process byte budget"));
+    }
+    String::from_utf8(bytes).map_err(|_| protocol("/proc/net/unix was not valid UTF-8"))
+}
+
+fn fresh_socket_diagnostics(
+    enabled: bool,
+    budget: &mut ProcessScanBudget<'_>,
+) -> Result<Option<UnixSocketDiagnostics>> {
+    if !enabled {
+        return Ok(None);
+    }
+    match unix_socket_diagnostics(Some(budget.cancelled)) {
+        Ok(diagnostics) => {
+            budget.bytes(diagnostics.scanned_bytes)?;
+            Ok(Some(diagnostics))
+        }
+        Err(MuxError::Cancelled) => Err(MuxError::Cancelled),
+        Err(_) => Ok(None),
+    }
+}
+
+fn process_socket_inodes(pid: u32, budget: &mut ProcessScanBudget<'_>) -> Result<HashSet<u32>> {
+    let path = PathBuf::from(format!("/proc/{pid}/fd"));
+    let directory = match fs::read_dir(&path) {
+        Ok(directory) => directory,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(HashSet::new());
+        }
+        Err(source) => return Err(MuxError::Filesystem { path, source }),
+    };
+    let mut sockets = HashSet::new();
+    for (index, entry) in directory.enumerate() {
+        budget.fd()?;
+        if index >= MAX_PROCESS_FDS {
+            return Err(protocol("process exceeded the descriptor scan limit"));
+        }
+        let Ok(entry) = entry else { continue };
+        let Some(before) = fd_info(pid, &entry.file_name()) else {
+            continue;
+        };
+        if before.flags & 0o2_000_000 != 0o2_000_000 {
+            continue;
+        }
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let Some(target) = target.to_str() else {
+            continue;
+        };
+        let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if inode as u64 != before.ino || fd_info(pid, &entry.file_name()) != Some(before) {
+            continue;
+        }
+        sockets.insert(inode);
+    }
+    Ok(sockets)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FdInfo {
+    flags: u32,
+    ino: u64,
+}
+
+fn fd_info(pid: u32, fd: &std::ffi::OsStr) -> Option<FdInfo> {
+    let fd = fd.to_str()?;
+    let contents = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    let flags = contents.lines().find_map(|line| {
+        line.strip_prefix("flags:\t")
+            .and_then(|flags| u32::from_str_radix(flags, 8).ok())
+    })?;
+    let ino = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("ino:\t").and_then(|ino| ino.parse().ok()))?;
+    Some(FdInfo { flags, ino })
+}
+
+fn process_socket_owners(
+    processes: &HashMap<u32, (u32, u64)>,
+    wanted: &HashSet<u32>,
+    budget: &mut ProcessScanBudget<'_>,
+) -> Result<HashMap<u32, Vec<u32>>> {
+    let mut owners = HashMap::<u32, Vec<u32>>::new();
+    let mut visited = 0usize;
+    for &pid in processes.keys() {
+        let Ok(directory) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for entry in directory {
+            budget.fd()?;
+            visited += 1;
+            if visited > MAX_PROCESS_ENTRIES {
+                return Err(protocol("socket owner discovery exceeded its entry limit"));
+            }
+            let Ok(entry) = entry else { continue };
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            let Some(target) = target.to_str() else {
+                continue;
+            };
+            let Some(inode) = target
+                .strip_prefix("socket:[")
+                .and_then(|value| value.strip_suffix(']'))
+                .and_then(|value| value.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if wanted.contains(&inode) {
+                owners.entry(inode).or_default().push(pid);
+            }
+        }
+    }
+    Ok(owners)
+}
+
+struct UnixSocketDiagnostics {
+    peers: HashMap<u32, u32>,
+    names: HashMap<u32, Vec<u8>>,
+    scanned_bytes: u64,
+}
+
+fn unix_socket_diagnostics(cancelled: Option<&AtomicBool>) -> Result<UnixSocketDiagnostics> {
+    use rustix_net::net::{
+        AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType, bind,
+        netlink::{SOCK_DIAG, SocketAddrNetlink},
+        recv, sendto, socket_with,
+        sockopt::{Timeout, set_socket_timeout},
+    };
+
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_DUMP: u16 = 0x300;
+    const NLMSG_DONE: u16 = 3;
+    const NLMSG_ERROR: u16 = 2;
+    const UNIX_DIAG_PEER: u16 = 2;
+    const UNIX_DIAG_NAME: u16 = 0;
+    const UDIAG_SHOW_NAME: u32 = 1;
+    const UDIAG_SHOW_PEER: u32 = 4;
+
+    let socket = socket_with(
+        AddressFamily::NETLINK,
+        SocketType::RAW,
+        SocketFlags::CLOEXEC,
+        Some(SOCK_DIAG),
+    )
+    .map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("netlink sock_diag"),
+        source: source.into(),
+    })?;
+    bind(&socket, &SocketAddrNetlink::new(0, 0)).map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("netlink sock_diag"),
+        source: source.into(),
+    })?;
+    set_socket_timeout(&socket, Timeout::Recv, Some(Duration::from_millis(250))).map_err(
+        |source| MuxError::Filesystem {
+            path: PathBuf::from("netlink sock_diag"),
+            source: source.into(),
+        },
+    )?;
+    let mut request = Vec::with_capacity(40);
+    request.extend_from_slice(&40_u32.to_ne_bytes());
+    request.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    request.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+    request.extend_from_slice(&1_u32.to_ne_bytes());
+    request.extend_from_slice(&0_u32.to_ne_bytes());
+    request.push(1); // AF_UNIX
+    request.push(0);
+    request.extend_from_slice(&0_u16.to_ne_bytes());
+    request.extend_from_slice(&u32::MAX.to_ne_bytes());
+    request.extend_from_slice(&0_u32.to_ne_bytes());
+    request.extend_from_slice(&(UDIAG_SHOW_NAME | UDIAG_SHOW_PEER).to_ne_bytes());
+    request.extend_from_slice(&u32::MAX.to_ne_bytes());
+    request.extend_from_slice(&u32::MAX.to_ne_bytes());
+    sendto(
+        &socket,
+        &request,
+        SendFlags::empty(),
+        &SocketAddrNetlink::new(0, 0),
+    )
+    .map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("netlink sock_diag"),
+        source: source.into(),
+    })?;
+
+    let mut peers = HashMap::new();
+    let mut names = HashMap::new();
+    let mut scanned_bytes = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for _ in 0..256 {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(MuxError::Cancelled);
+        }
+        let (_, received) = recv(&socket, &mut buffer, RecvFlags::empty()).map_err(|source| {
+            MuxError::Filesystem {
+                path: PathBuf::from("netlink sock_diag"),
+                source: source.into(),
+            }
+        })?;
+        scanned_bytes = scanned_bytes.saturating_add(received as u64);
+        if scanned_bytes > MAX_PROCESS_SCAN_BYTES {
+            return Err(protocol(
+                "netlink sock_diag exceeded the process byte budget",
+            ));
+        }
+        let mut offset = 0usize;
+        while offset + 16 <= received {
+            let length =
+                u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+            let kind = u16::from_ne_bytes(buffer[offset + 4..offset + 6].try_into().unwrap());
+            if length < 16 || offset + length > received {
+                return Err(protocol("netlink sock_diag returned a malformed frame"));
+            }
+            if kind == NLMSG_DONE {
+                return Ok(UnixSocketDiagnostics {
+                    peers,
+                    names,
+                    scanned_bytes,
+                });
+            }
+            if kind == NLMSG_ERROR {
+                return Err(protocol("netlink sock_diag returned an error"));
+            }
+            if kind == SOCK_DIAG_BY_FAMILY && length >= 32 {
+                let inode =
+                    u32::from_ne_bytes(buffer[offset + 20..offset + 24].try_into().unwrap());
+                let mut attribute = offset + 32;
+                while attribute + 4 <= offset + length {
+                    let attr_len =
+                        u16::from_ne_bytes(buffer[attribute..attribute + 2].try_into().unwrap())
+                            as usize;
+                    let attr_kind = u16::from_ne_bytes(
+                        buffer[attribute + 2..attribute + 4].try_into().unwrap(),
+                    );
+                    if attr_len < 4 || attribute + attr_len > offset + length {
+                        return Err(protocol("netlink sock_diag returned a malformed attribute"));
+                    }
+                    if attr_kind == UNIX_DIAG_PEER && attr_len >= 8 {
+                        let peer = u32::from_ne_bytes(
+                            buffer[attribute + 4..attribute + 8].try_into().unwrap(),
+                        );
+                        peers.insert(inode, peer);
+                    }
+                    if attr_kind == UNIX_DIAG_NAME && attr_len > 4 {
+                        let mut name = buffer[attribute + 4..attribute + attr_len].to_vec();
+                        if name.last() == Some(&0) {
+                            name.pop();
+                        }
+                        names.insert(inode, name);
+                    }
+                    attribute += (attr_len + 3) & !3;
+                }
+            }
+            offset += (length + 3) & !3;
+        }
+    }
+    Err(protocol("netlink sock_diag exceeded its response limit"))
+}
+
+fn rollout_is_root_identity(
+    file: &mut fs::File,
+    path: &Path,
+    expected: &str,
+    budget: &mut ProcessScanBudget<'_>,
+) -> Result<bool> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| MuxError::Filesystem {
+            path: path.to_owned(),
+            source,
+        })?;
+    let mut reader = BufReader::new(file.take(MAX_ROLLOUT_IDENTITY_BYTES + 1));
+    let mut line = Vec::new();
+    let mut total = 0_u64;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| MuxError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        if read == 0 {
+            return Ok(false);
+        }
+        total += read as u64;
+        budget.bytes(read as u64)?;
+        if total > MAX_ROLLOUT_IDENTITY_BYTES {
+            return Err(protocol("rollout identity exceeded its byte limit"));
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if value["type"] != "session_meta" {
+            continue;
+        }
+        return Ok(
+            value.pointer("/payload/id").and_then(Value::as_str) == Some(expected)
+                && value.pointer("/payload/source/subagent").is_none(),
+        );
+    }
 }
 
 /// Bounded, local source of authoritative Codex thread identity and completed items.
@@ -1400,11 +2832,11 @@ fn read_rollout_transcript(
         let mut partial = Vec::new();
         let _ = reader.read_until(b'\n', &mut partial);
     }
-    let mut transcript = String::new();
+    let mut transcript = RecentTranscript::default();
     let mut seen_item_ids = HashSet::new();
     let mut legacy_assistant_for_pair: Option<String> = None;
     let mut line = Vec::new();
-    while transcript.len() < MAX_CONVERSATION_BYTES {
+    loop {
         ensure_not_cancelled(cancelled)?;
         line.clear();
         let read = reader
@@ -1433,7 +2865,7 @@ fn read_rollout_transcript(
                     _ => None,
                 };
                 if let Some(role) = role {
-                    append_rollout_content(&mut transcript, role, &item["content"]);
+                    transcript.push_content(role, &item["content"]);
                 }
             } else if value["type"] == "event_msg" {
                 let payload = &value["payload"];
@@ -1444,7 +2876,7 @@ fn read_rollout_transcript(
                 };
                 if let Some(role) = role {
                     if let Some(message) = payload["message"].as_str() {
-                        append_bounded(&mut transcript, role, message);
+                        transcript.push(role, message);
                         if role == "Assistant" {
                             legacy_assistant_for_pair = Some(message.to_owned());
                         }
@@ -1463,14 +2895,14 @@ fn read_rollout_transcript(
                         .zip(paired_legacy_assistant.as_deref())
                         .is_some_and(|(response, legacy)| response == legacy);
                 if id_is_new && !duplicates_legacy {
-                    append_rollout_content(&mut transcript, "Assistant", &payload["content"]);
+                    transcript.push_content("Assistant", &payload["content"]);
                 }
             }
         }
     }
     Ok(NamingConversation {
         thread_id: thread_id.to_owned(),
-        transcript,
+        transcript: transcript.render(),
     })
 }
 
@@ -1484,18 +2916,78 @@ fn rollout_single_text(content: &Value) -> Option<&str> {
         .flatten()
 }
 
-fn append_rollout_content(transcript: &mut String, role: &str, content: &Value) {
-    if let Some(text) = content.as_str() {
-        append_bounded(transcript, role, text);
-        return;
-    }
-    let Some(parts) = content.as_array() else {
-        return;
-    };
-    for part in parts {
-        if let Some(text) = part["text"].as_str() {
-            append_bounded(transcript, role, text);
+#[derive(Default)]
+struct RecentTranscript {
+    messages: VecDeque<String>,
+    bytes: usize,
+}
+
+impl RecentTranscript {
+    fn format_message(role: &str, text: &str) -> Option<String> {
+        let mut message = format!("{role}: ");
+        for character in text.chars() {
+            if message.len() + character.len_utf8() + 1 > MAX_CONVERSATION_BYTES / 2 {
+                break;
+            }
+            message.push(character);
         }
+        message.push('\n');
+        if message.trim() == format!("{role}:") {
+            return None;
+        }
+        Some(message)
+    }
+
+    fn push(&mut self, role: &str, text: &str) {
+        let Some(message) = Self::format_message(role, text) else {
+            return;
+        };
+        while self.bytes + message.len() > MAX_CONVERSATION_BYTES {
+            let Some(removed) = self.messages.pop_front() else {
+                break;
+            };
+            self.bytes -= removed.len();
+        }
+        if message.len() <= MAX_CONVERSATION_BYTES {
+            self.bytes += message.len();
+            self.messages.push_back(message);
+        }
+    }
+
+    fn push_newest_first(&mut self, role: &str, text: &str) {
+        let Some(message) = Self::format_message(role, text) else {
+            return;
+        };
+        if self.bytes + message.len() <= MAX_CONVERSATION_BYTES {
+            self.bytes += message.len();
+            self.messages.push_back(message);
+        }
+    }
+
+    fn push_content(&mut self, role: &str, content: &Value) {
+        if let Some(text) = content.as_str() {
+            self.push(role, text);
+            return;
+        }
+        let Some(parts) = content.as_array() else {
+            return;
+        };
+        let text = parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            self.push(role, &text);
+        }
+    }
+
+    fn render(self) -> String {
+        self.messages.into_iter().collect()
+    }
+
+    fn render_reversed(self) -> String {
+        self.messages.into_iter().rev().collect()
     }
 }
 
@@ -1655,7 +3147,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
 
     /// Reads structured completed turns through the bounded paginated API.
     pub fn read_completed(&mut self, thread_id: &str) -> Result<NamingConversation> {
-        let mut transcript = String::new();
+        let mut transcript = RecentTranscript::default();
         let mut completed_turns = HashSet::new();
         let mut request_budget = MAX_HISTORY_REQUESTS;
         let mut cursor: Option<String> = None;
@@ -1670,7 +3162,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
                     "cursor": cursor,
                     "limit": THREAD_TURNS_PAGE_SIZE,
                     "itemsView": "notLoaded",
-                    "sortDirection": "asc"
+                    "sortDirection": "desc"
                 }),
             )?;
             let turns = response["data"]
@@ -1719,7 +3211,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
         )?;
         Ok(NamingConversation {
             thread_id: thread_id.to_owned(),
-            transcript,
+            transcript: transcript.render_reversed(),
         })
     }
 
@@ -1727,7 +3219,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
         &mut self,
         thread_id: &str,
         completed_turns: &HashSet<String>,
-        transcript: &mut String,
+        transcript: &mut RecentTranscript,
         request_budget: &mut usize,
     ) -> Result<()> {
         let mut cursor: Option<String> = None;
@@ -1740,7 +3232,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
                     "threadId": thread_id,
                     "cursor": cursor,
                     "limit": THREAD_TURNS_PAGE_SIZE,
-                    "sortDirection": "asc"
+                    "sortDirection": "desc"
                 }),
             )?;
             let items = response["data"]
@@ -1765,16 +3257,19 @@ impl<S: AppServerSession> AppServerNamer<S> {
                 match item["type"].as_str() {
                     Some("userMessage") => {
                         if let Some(content) = item["content"].as_array() {
-                            for input in content {
-                                if let Some(text) = input["text"].as_str() {
-                                    append_bounded(transcript, "User", text);
-                                }
+                            let text = content
+                                .iter()
+                                .filter_map(|input| input["text"].as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !text.is_empty() {
+                                transcript.push_newest_first("User", &text);
                             }
                         }
                     }
                     Some("agentMessage") => {
                         if let Some(text) = item["text"].as_str() {
-                            append_bounded(transcript, "Assistant", text);
+                            transcript.push_newest_first("Assistant", text);
                         }
                     }
                     _ => {}
@@ -1786,7 +3281,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
                     return Err(protocol("thread/items/list repeated its pagination cursor"));
                 }
             }
-            if transcript.len() >= MAX_CONVERSATION_BYTES || next.is_none() {
+            if transcript.bytes >= MAX_CONVERSATION_BYTES || next.is_none() {
                 return Ok(());
             }
             cursor = next;
@@ -1900,24 +3395,6 @@ fn bounded_cursor(value: &Value) -> Result<Option<String>> {
     Ok(Some(cursor.to_owned()))
 }
 
-fn append_bounded(target: &mut String, role: &str, text: &str) {
-    if target.len() >= MAX_CONVERSATION_BYTES {
-        return;
-    }
-    let prefix = format!("{role}: ");
-    if target.len() + prefix.len() + 1 >= MAX_CONVERSATION_BYTES {
-        return;
-    }
-    target.push_str(&prefix);
-    for character in text.chars() {
-        if target.len() + character.len_utf8() > MAX_CONVERSATION_BYTES - 1 {
-            break;
-        }
-        target.push(character);
-    }
-    target.push('\n');
-}
-
 fn validate_name(title: &str) -> Result<String> {
     let title = title.trim();
     let valid = !title.is_empty()
@@ -1949,6 +3426,411 @@ fn protocol(message: &str) -> MuxError {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    static PROCESS_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[ignore]
+    fn post_exec_descriptor_holder_helper() {
+        let Ok(mode) = env::var("CODEX_MUX_DESCRIPTOR_HELPER") else {
+            return;
+        };
+        let _rollout = (mode == "rollout").then(|| {
+            fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(env::var_os("CODEX_MUX_HELPER_PATH").unwrap())
+                .unwrap()
+        });
+        let _socket = (mode == "socket").then(|| {
+            std::os::unix::net::UnixStream::connect(env::var_os("CODEX_MUX_HELPER_PATH").unwrap())
+                .unwrap()
+        });
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    fn snapshot_pane(title: &str) -> Pane {
+        Pane {
+            id: PaneId::new("%4242").unwrap(),
+            session_id: crate::domain::SessionId::new("$1").unwrap(),
+            title: Some(title.to_owned()),
+            generated_title: None,
+            generated_at_unix: None,
+            immediate_naming: false,
+            manual_name: false,
+            manual_name_source: None,
+            manual_name_pid: None,
+            manual_name_pid_raw: String::new(),
+            manual_name_session: None,
+            manual_name_session_raw: String::new(),
+            unpin_waiting: false,
+            unpin_waiting_title: None,
+            unpin_waiting_pid: None,
+            unpin_waiting_session: None,
+            pane_pid: std::process::id(),
+            current_path: PathBuf::from("/tmp"),
+        }
+    }
+
+    #[test]
+    fn transcript_budget_retains_recent_messages_in_chronological_order() {
+        let mut chronological = RecentTranscript::default();
+        chronological.push("User", &"old-one ".repeat(MAX_CONVERSATION_BYTES));
+        chronological.push("Assistant", &"old-two ".repeat(MAX_CONVERSATION_BYTES));
+        chronological.push("User", &format!("recent question {}", "q".repeat(4_000)));
+        chronological.push("Assistant", &format!("recent answer {}", "a".repeat(4_000)));
+        chronological.push("User", &format!("recent followup {}", "f".repeat(4_000)));
+        let rendered = chronological.render();
+        assert!(!rendered.contains("old-one"));
+        assert!(!rendered.contains("old-two"));
+        assert!(rendered.find("recent question") < rendered.find("recent answer"));
+
+        let mut newest_first = RecentTranscript::default();
+        newest_first
+            .push_newest_first("Assistant", &format!("newest answer {}", "a".repeat(4_000)));
+        newest_first.push_newest_first("User", &format!("newest question {}", "q".repeat(4_000)));
+        newest_first.push_newest_first(
+            "Assistant",
+            &format!("older answer {}", "o".repeat(MAX_CONVERSATION_BYTES)),
+        );
+        let rendered = newest_first.render_reversed();
+        assert!(!rendered.contains("older answer"));
+        assert!(rendered.find("newest question") < rendered.find("newest answer"));
+    }
+
+    #[test]
+    fn shell_snapshot_resolves_arbitrary_title_to_exact_thread() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-mux-shell-snapshot-{}-{}",
+            std::process::id(),
+            unix_seconds(SystemTime::now())
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let thread_id = "01a01001-2dbb-74e2-86ab-996b31234567";
+        fs::write(
+            root.join(format!("{thread_id}.123.sh")),
+            "export OTHER='private'\nexport TMUX_PANE='%4242'\n",
+        )
+        .unwrap();
+        let store = ShellSnapshotStore::at(root.clone());
+        let pane = snapshot_pane("c");
+        assert_eq!(store.resolve(&pane).unwrap().as_deref(), Some(thread_id));
+        let target =
+            NamingTarget::from_verified_thread(&pane, store.resolve(&pane).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(target.thread_hint, thread_id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shell_snapshot_rejects_ambiguous_or_untrusted_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "codex-mux-shell-snapshot-reject-{}-{}",
+            std::process::id(),
+            unix_seconds(SystemTime::now())
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for thread_id in [
+            "01a01001-2dbb-74e2-86ab-996b31234567",
+            "01a01001-2dbb-74e2-86ab-996b37654321",
+        ] {
+            fs::write(
+                root.join(format!("{thread_id}.123.sh")),
+                "export TMUX_PANE='%4242'\n",
+            )
+            .unwrap();
+        }
+        let store = ShellSnapshotStore::at(root.clone());
+        assert!(store.resolve(&snapshot_pane("c")).is_err());
+
+        for entry in fs::read_dir(&root).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let path = root.join("01a01001-2dbb-74e2-86ab-996b31234567.123.sh");
+        fs::write(&path, "export TMUX_PANE='%4242'\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(store.resolve(&snapshot_pane("c")).unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn descendant_environment_is_only_an_untrusted_identity_claim() {
+        let _serial = PROCESS_ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let thread_id = "01a01001-2dbb-74e2-86ab-996b31234567";
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env("TMUX_PANE", "%4242")
+            .env("CODEX_SESSION_ID", thread_id)
+            .spawn()
+            .unwrap();
+        let pane = snapshot_pane("c");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let resolved = loop {
+            match ProcessEnvironmentStore.resolve(&pane).unwrap() {
+                Some(resolved) => break Some(resolved),
+                None if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                None => break None,
+            }
+        };
+        let sleep = fs::metadata("/usr/bin/sleep").unwrap();
+        let trusted = ProcessRolloutStore {
+            executables: vec![(sleep.dev(), sleep.ino())],
+            rollout_root: PathBuf::from("/nonexistent-codex-mux-rollouts"),
+        };
+        assert_eq!(trusted.resolve(&pane).unwrap(), None);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(resolved.as_deref(), Some(thread_id));
+        assert!(NamingTarget::from_pane(&pane).is_none());
+    }
+
+    #[test]
+    fn exact_descendant_rollout_fd_resolves_only_the_root_thread() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = PROCESS_ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "codex-mux-rollout-fd-{}-{}",
+            std::process::id(),
+            unix_seconds(SystemTime::now())
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let thread_id = "01a01001-2dbb-74e2-86ab-996b31234567";
+        let rollout = root.join(format!("rollout-2026-08-21T00-00-00-{thread_id}.jsonl"));
+        fs::write(
+            &rollout,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"source\":\"cli\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+        let executable = root.join("descriptor-helper");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = fs::metadata(&executable).unwrap();
+        let store = ProcessRolloutStore {
+            executables: vec![(metadata.dev(), metadata.ino())],
+            rollout_root: root.clone(),
+        };
+        let pane = snapshot_pane("c");
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            store.resolve_cancellable(&pane, &cancelled),
+            Err(MuxError::Cancelled)
+        ));
+        let mut inherited = Command::new(&executable)
+            .args([
+                "smart_naming::transport_tests::post_exec_descriptor_holder_helper",
+                "--exact",
+                "--ignored",
+            ])
+            .env("CODEX_MUX_DESCRIPTOR_HELPER", "none")
+            .stdin(fs::File::open(&rollout).unwrap())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(store.resolve(&pane).unwrap(), None);
+        let _ = inherited.kill();
+        let _ = inherited.wait();
+
+        let mut child = Command::new(&executable)
+            .args([
+                "smart_naming::transport_tests::post_exec_descriptor_holder_helper",
+                "--exact",
+                "--ignored",
+            ])
+            .env("CODEX_MUX_DESCRIPTOR_HELPER", "rollout")
+            .env("CODEX_MUX_HELPER_PATH", &rollout)
+            .stdin(fs::File::open(&rollout).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let resolved = loop {
+            match store
+                .resolve_with_socket_diagnostics(
+                    &pane,
+                    Err(protocol("sock_diag is unavailable")),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+            {
+                Some(resolved) => break Some(resolved),
+                None if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                None => break None,
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(resolved.as_deref(), Some(thread_id));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_control_socket_peer_resolves_a_legacy_client_thread() {
+        use std::os::unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        };
+
+        let _serial = PROCESS_ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let codex_home = std::env::temp_dir().join(format!(
+            "codex-mux-control-peer-{}-{}",
+            std::process::id(),
+            unix_seconds(SystemTime::now())
+        ));
+        let root = codex_home.join("sessions");
+        let control = codex_home.join("app-server-control");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&control).unwrap();
+        let socket_path = control.join("app-server-control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let thread_id = "01a01001-2dbb-74e2-86ab-996b31234567";
+        let rollout = root.join(format!("rollout-2026-08-21T00-00-00-{thread_id}.jsonl"));
+        fs::write(
+            &rollout,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread_id}\",\"source\":\"cli\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+        let held_rollout = fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        let executable = codex_home.join("descriptor-helper");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = fs::metadata(&executable).unwrap();
+        let untrusted_store = ProcessRolloutStore {
+            executables: vec![(metadata.dev(), metadata.ino())],
+            rollout_root: root.clone(),
+        };
+
+        // A peer that merely happens to live in the control-server process is
+        // not authoritative unless this exact connection names the private
+        // control socket.
+        let (unrelated_client, unrelated_server) = UnixStream::pair().unwrap();
+        let unrelated_client: OwnedFd = unrelated_client.into();
+        let mut unrelated_child = Command::new(&executable)
+            .args([
+                "smart_naming::transport_tests::post_exec_descriptor_holder_helper",
+                "--exact",
+                "--ignored",
+            ])
+            .env("CODEX_MUX_DESCRIPTOR_HELPER", "none")
+            .stdout(Stdio::from(unrelated_client))
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(untrusted_store.resolve(&snapshot_pane("c")).unwrap(), None);
+        let _ = unrelated_child.kill();
+        let _ = unrelated_child.wait();
+        drop(unrelated_server);
+
+        let mut child = Command::new(&executable)
+            .args([
+                "smart_naming::transport_tests::post_exec_descriptor_holder_helper",
+                "--exact",
+                "--ignored",
+            ])
+            .env("CODEX_MUX_DESCRIPTOR_HELPER", "socket")
+            .env("CODEX_MUX_HELPER_PATH", &socket_path)
+            .spawn()
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut pane = snapshot_pane("c");
+        pane.pane_pid = child.id();
+        assert_eq!(untrusted_store.resolve(&pane).unwrap(), None);
+        let peer_executable = fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        let store = ProcessRolloutStore {
+            executables: vec![
+                (metadata.dev(), metadata.ino()),
+                (peer_executable.dev(), peer_executable.ino()),
+            ],
+            rollout_root: root.clone(),
+        };
+        let server_inode = fs::metadata(format!("/proc/self/fd/{}", server.as_raw_fd()))
+            .unwrap()
+            .ino() as u32;
+        let cancelled = AtomicBool::new(false);
+        let mut budget = ProcessScanBudget::new(&cancelled);
+        let client_inode = *process_socket_inodes(child.id(), &mut budget)
+            .unwrap()
+            .iter()
+            .find(|inode| {
+                unix_socket_diagnostics(None).unwrap().peers.get(inode) == Some(&server_inode)
+            })
+            .unwrap();
+        let sockets = unix_socket_diagnostics(None).unwrap();
+        assert_eq!(sockets.peers.get(&client_inode), Some(&server_inode));
+        assert_eq!(
+            sockets.names.get(&server_inode).map(Vec::as_slice),
+            Some(socket_path.as_os_str().as_bytes())
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let resolved = loop {
+            match store.resolve(&pane).unwrap() {
+                Some(resolved) => break Some(resolved),
+                None if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                None => break None,
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        drop((held_rollout, listener, server));
+        assert_eq!(resolved.as_deref(), Some(thread_id));
+        fs::remove_dir_all(codex_home).unwrap();
+    }
+
+    #[test]
+    fn descendant_environment_fails_closed_on_conflicting_sessions() {
+        let _serial = PROCESS_ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let mut children = [
+            "01a01001-2dbb-74e2-86ab-996b31234567",
+            "01a01001-2dbb-74e2-86ab-996b37654321",
+        ]
+        .map(|thread_id| {
+            Command::new("sleep")
+                .arg("30")
+                .env("TMUX_PANE", "%4242")
+                .env("CODEX_SESSION_ID", thread_id)
+                .spawn()
+                .unwrap()
+        });
+        for child in &children {
+            for _ in 0..100 {
+                if process_identity_environment(child.id()).unwrap().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(process_identity_environment(child.id()).unwrap().is_some());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            let result = ProcessEnvironmentStore.resolve(&snapshot_pane("c"));
+            if result.is_err() || std::time::Instant::now() >= deadline {
+                break result;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(result.is_err());
+    }
 
     #[test]
     fn diagnostics_are_private_bounded_and_contain_only_reason_codes() {
@@ -2109,7 +3991,7 @@ mod transport_tests {
         let retry_interval = Duration::from_millis(40);
         let worker = NamingWorker::spawn_with_retry_intervals(
             move |_| Ok(FailingNamer(observed)),
-            move || Ok(vec![target.clone()]),
+            move |_| Ok(vec![target.clone()]),
             Duration::from_millis(1),
             Duration::from_millis(10),
             retry_interval,
@@ -2155,7 +4037,7 @@ mod transport_tests {
         let target = target_created_at(0);
         let worker = NamingWorker::spawn_with_retry_intervals(
             move |_| Ok(PendingNamer(observed)),
-            move || Ok(vec![target.clone()]),
+            move |_| Ok(vec![target.clone()]),
             Duration::from_millis(1),
             Duration::from_millis(10),
             Duration::from_millis(40),
