@@ -812,14 +812,11 @@ fn render_block(
         "--invoking-path".to_owned(),
         shell_format("pane_current_path"),
     ]);
-    let command = command.join(" ");
-    let command = tmux_word(&command);
-    let compact = "#{||:#{<:#{client_width},90},#{<:#{client_height},28}}";
-    let width = format!("#{{?{compact},100%,80%}}");
-    let height = format!("#{{?{compact},100%,70%}}");
-    let popup = tmux_word(&format!(
-        "display-popup -E -w '{width}' -h '{height}' {command}"
-    ));
+    command.push("open-popup".to_owned());
+    let popup_binding = format!(
+        "bind-key {key} run-shell -b {}",
+        tmux_word(&command.join(" "))
+    );
     let smart_binding = if smart_left {
         render_smart_left_binding(executables)
     } else {
@@ -849,7 +846,7 @@ fn render_block(
             .expect("writing to a String cannot fail");
     }
     format!(
-        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{LAUNCH_FIELD}{}\n{MATCH_SCOPE_FIELD}{}\n{matches}{pane_commands}{match_regexes}{pane_regexes}{SMART_LEFT_FIELD}{smart_left}\nbind-key {key} run-shell -C {popup}\n{smart_binding}{END_MARKER}\n",
+        "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{LAUNCH_FIELD}{}\n{MATCH_SCOPE_FIELD}{}\n{matches}{pane_commands}{match_regexes}{pane_regexes}{SMART_LEFT_FIELD}{smart_left}\n{popup_binding}\n{smart_binding}{END_MARKER}\n",
         executables.mux.display(),
         executables.codex.display(),
         executables.codex.display(),

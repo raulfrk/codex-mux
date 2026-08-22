@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "../packaged_gate.rs"]
+mod packaged_gate;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(25);
@@ -17,6 +20,9 @@ pub fn packaged_binary() -> Option<PathBuf> {
     let path = match std::env::var_os("CODEX_MUX_E2E_BINARY") {
         Some(path) => PathBuf::from(path),
         None => {
+            packaged_gate::missing_binary_is_allowed(
+                std::env::var("CODEX_MUX_REQUIRE_PACKAGED_E2E").as_deref() == Ok("1"),
+            );
             eprintln!(
                 "skipping packaged theme E2E: CODEX_MUX_E2E_BINARY is set only by the required E2E driver"
             );

@@ -321,6 +321,8 @@ impl TmuxPaneRecord {
                 b"queued" => Some(AutoNameStatus::Queued),
                 b"generating" => Some(AutoNameStatus::Generating),
                 b"success" => Some(AutoNameStatus::Succeeded),
+                b"failed" => Some(AutoNameStatus::Failed),
+                b"cancelled" => Some(AutoNameStatus::Cancelled),
                 _ => None,
             }),
             auto_name_started_at_unix_nanos: fields

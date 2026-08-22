@@ -12,6 +12,7 @@ use packaged_support::{Pty, Scratch, Server, assert_success, require_prerequisit
 
 #[test]
 fn packaged_binary_renders_server_wide_rows_rebuilds_and_handles_navigation_sizes() {
+    let _evidence = journey_evidence::journey(&["quit"]);
     let Some(binary) = require_prerequisites() else {
         return;
     };
@@ -327,6 +328,7 @@ fn packaged_popup_manual_rename_relinquishes_smart_naming_ownership() {
 
 #[test]
 fn packaged_popup_renames_an_outside_started_codex_session() {
+    let _evidence = journey_evidence::journey(&["rename", "unpin"]);
     let Some(binary) = require_prerequisites() else {
         return;
     };
@@ -393,6 +395,7 @@ fn packaged_popup_renames_an_outside_started_codex_session() {
 
 #[test]
 fn packaged_enter_switches_exact_client_cross_session_and_zooms() {
+    let _evidence = journey_evidence::journey(&["activate"]);
     let Some(binary) = require_prerequisites() else {
         return;
     };
@@ -505,10 +508,10 @@ fn packaged_detach_mutate_reconnect_rebuilds_and_switches_exact_new_client() {
     fixture.install_binding(&binary, "a");
     let (mut old_client, old_tty) = fixture.client("origin", (120, 40), "old-client");
     old_client.send(b"\x02a");
-    old_client.wait_text("Commands");
+    old_client.wait_text("codex-mux");
     wait(
         "installed popup process",
-        || process_count(&binary) == 1,
+        || process_with_argument_count(&binary, &old_tty) >= 1,
         || format!("packaged process count={}", process_count(&binary)),
     );
     fixture
@@ -517,7 +520,7 @@ fn packaged_detach_mutate_reconnect_rebuilds_and_switches_exact_new_client() {
     let _ = old_client.wait_exit();
     wait(
         "popup process to die with disconnected client",
-        || process_count(&binary) == 0,
+        || process_with_argument_count(&binary, &old_tty) == 0,
         || format!("packaged process count={}", process_count(&binary)),
     );
     assert!(
@@ -580,7 +583,7 @@ fn installed_prefix_key_opens_the_extracted_binary_popup() {
 
     let (mut client, _tty) = fixture.client("origin", (120, 40), "prefix-client");
     client.send(b"\x02a");
-    client.wait_text("Commands");
+    client.wait_text("codex-mux");
     let screen = client.wait_text("Prefix");
     assert!(
         screen.contains("Prefix"),
@@ -594,6 +597,7 @@ fn installed_prefix_key_opens_the_extracted_binary_popup() {
 
 #[test]
 fn installed_leader_a_popup_launches_a_selected_profile() {
+    let _evidence = journey_evidence::journey(&["launch-profile"]);
     let Some(binary) = require_prerequisites() else {
         return;
     };
@@ -603,7 +607,7 @@ fn installed_leader_a_popup_launches_a_selected_profile() {
     let (mut client, _tty) = fixture.client("origin", (120, 40), "prefix-profile-client");
 
     client.send(b"\x02a");
-    client.wait_text("Commands");
+    client.wait_text("codex-mux");
     client.send(b"n");
     client.wait_text("launch profile");
     client.send(b"s");
@@ -616,6 +620,32 @@ fn installed_leader_a_popup_launches_a_selected_profile() {
             .any(|command| command == "codex-e2e")
     });
     fixture.assert_profile_window_is_immediately_after_origin();
+    client.send(b"\x02d");
+}
+
+#[test]
+fn packaged_profile_edit_persists_through_the_real_popup_flow() {
+    let _evidence = journey_evidence::journey(&["persist-profiles"]);
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("persist-profile");
+    let (mut client, tty) = fixture.client("origin", (120, 40), "persist-profile-client");
+    let capture = fixture.scratch.join("persist-profile.log");
+    let mut popup = fixture.popup(&binary, &tty, (120, 40), &capture, None);
+
+    popup.wait_text("Commands");
+    popup.send(b"re");
+    popup.wait_text("edit profile");
+    popup.send(b"\r");
+    popup.wait_text("launch profile");
+    let preference = wait_file(
+        &fixture.scratch.join("xdg/codex-mux/config.toml"),
+        "[[profiles]]",
+    );
+    assert!(preference.contains("name = \"standard\""), "{preference}");
+    popup.send(b"qq");
+    assert!(popup.wait_exit().success());
     client.send(b"\x02d");
 }
 
@@ -730,6 +760,50 @@ fn installed_smart_left_opens_at_the_ultra_max_post_glyph_noop_boundary() {
     fixture.server.wait("post glyph Smart Left cleanup", || {
         smart_left_inactive(&fixture.server, &fixture.origin_pane)
     });
+    client.send(b"\x02d");
+}
+
+#[test]
+fn installed_max_ultra_journey_repeatedly_opens_leader_a_and_smart_left() {
+    let Some(binary) = require_prerequisites() else {
+        return;
+    };
+    let fixture = Fixture::new("max-ultra-entry-paths");
+    fixture.install_smart_left(&binary);
+    let output = fixture
+        .server
+        .command()
+        .args(["respawn-pane", "-k", "-t", &fixture.origin_pane, "--"])
+        .arg(&fixture.codex)
+        .arg("smart-left-post-glyph")
+        .output()
+        .unwrap();
+    assert_success(&output, "start max/ultra reasoning-mode fixture");
+    fixture.server.wait("max/ultra post-glyph boundary", || {
+        pane_cursor_x(&fixture.server, &fixture.origin_pane) == 5
+    });
+
+    let (mut client, tty) = fixture.client("origin", (100, 32), "max-ultra-entry-client");
+    for _ in 0..2 {
+        let before = client.capture_len();
+        client.send(b"\x02a");
+        client.wait_appended_text(before, "codex-mux");
+        client.send(b"q");
+        fixture.server.wait("Leader+A popup cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+                && popup_inactive(&fixture.server, &tty)
+        });
+
+        let before = client.capture_len();
+        client.send(b"\x1b[D");
+        client.wait_appended_text(before, "codex-mux");
+        assert_eq!(pane_cursor_x(&fixture.server, &fixture.origin_pane), 5);
+        client.send(b"q");
+        fixture.server.wait("Smart Left popup cleanup", || {
+            smart_left_inactive(&fixture.server, &fixture.origin_pane)
+                && popup_inactive(&fixture.server, &tty)
+        });
+    }
     client.send(b"\x02d");
 }
 
@@ -957,6 +1031,7 @@ fn packaged_setup_drives_prompt_aware_bash_and_zsh_then_remove_restores_files() 
 
 #[test]
 fn packaged_new_resume_fallback_and_confirmed_close_cross_process_boundaries() {
+    let _evidence = journey_evidence::journey(&["new", "resume", "close"]);
     let Some(binary) = require_prerequisites() else {
         return;
     };
@@ -1025,14 +1100,11 @@ fn packaged_action_failure_restores_terminal_and_does_not_escape_sandbox() {
     let capture = fixture.scratch.join("failure.log");
     let before = fixture.scratch.join("failure-before");
     let after = fixture.scratch.join("failure-after");
-    let mut popup = fixture.popup(
-        &binary,
-        "/dev/pts/definitely-missing",
-        (120, 40),
-        &capture,
-        Some((&before, &after)),
-    );
+    let (mut client, tty) = fixture.client("origin", (120, 40), "failure-client");
+    let mut popup = fixture.popup(&binary, &tty, (120, 40), &capture, Some((&before, &after)));
     popup.wait_text("Failure target");
+    fixture.server.checked(&["detach-client", "-P", "-t", &tty]);
+    let _ = client.wait_exit();
     popup.send(b"\r");
     assert!(!popup.wait_exit().success());
     let output = fs::read_to_string(&capture).unwrap();
@@ -1306,8 +1378,10 @@ impl Fixture {
             text(cwd).to_owned(),
         ];
         let tmux = self.server.environment();
-        let home = std::env::var("HOME").unwrap();
-        let xdg = std::env::var("XDG_CONFIG_HOME").unwrap();
+        let home = text(self.scratch.path()).to_owned();
+        let xdg_path = self.scratch.join("xdg");
+        fs::create_dir_all(&xdg_path).unwrap();
+        let xdg = text(&xdg_path).to_owned();
         Pty::binary(
             binary,
             &arguments,
@@ -1432,16 +1506,19 @@ fn pane_cursor_x(server: &Server, pane: &str) -> u16 {
 }
 
 fn smart_left_inactive(server: &Server, pane: &str) -> bool {
-    server
-        .run(&[
-            "show-options",
-            "-pqv",
-            "-t",
-            pane,
-            "@codex_mux_smart_left_active",
-        ])
-        .stdout
-        .is_empty()
+    let output = server.run(&[
+        "show-options",
+        "-pqv",
+        "-t",
+        pane,
+        "@codex_mux_smart_left_active",
+    ]);
+    output.status.success() && output.stdout.is_empty()
+}
+
+fn popup_inactive(server: &Server, client_tty: &str) -> bool {
+    let output = server.run(&["display-message", "-p", "-c", client_tty, "#{popup_active}"]);
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() != "1"
 }
 
 fn process_count(executable: &Path) -> usize {
@@ -1459,6 +1536,22 @@ fn process_count(executable: &Path) -> usize {
         .count()
 }
 
+fn process_with_argument_count(executable: &Path, expected_argument: &str) -> usize {
+    let expected = executable.canonicalize().unwrap();
+    fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            fs::read_link(entry.path().join("exe")).is_ok_and(|candidate| candidate == expected)
+                && fs::read(entry.path().join("cmdline")).is_ok_and(|command| {
+                    command
+                        .split(|byte| *byte == 0)
+                        .any(|argument| argument == expected_argument.as_bytes())
+                })
+        })
+        .count()
+}
+
 fn wait_file(path: &Path, expected: &str) -> String {
     wait(
         &format!("{expected:?} in {}", path.display()),
@@ -1471,3 +1564,4 @@ fn wait_file(path: &Path, expected: &str) -> String {
 fn text(path: &Path) -> &str {
     path.to_str().expect("packaged E2E paths must be UTF-8")
 }
+mod journey_evidence;

@@ -82,6 +82,9 @@ pub enum Command {
     /// Internal entrypoint used by the marker-managed Smart Left binding.
     #[command(hide = true)]
     SmartLeft,
+    /// Internal entrypoint that opens the responsive popup for the prefix binding.
+    #[command(hide = true)]
+    OpenPopup,
     /// Internal tmux-server-scoped smart-naming daemon.
     #[command(hide = true)]
     SmartNamingWorker,
@@ -91,6 +94,9 @@ pub enum Command {
     /// Internal authenticated shutdown for the tmux-server-scoped naming daemon.
     #[command(hide = true)]
     SmartNamingStop,
+    /// Internal release gate for the exact candidate's shared naming runtime.
+    #[command(hide = true)]
+    AuthenticatedNamingJourney,
 }
 
 /// Optional exact release selected by the self-update command.

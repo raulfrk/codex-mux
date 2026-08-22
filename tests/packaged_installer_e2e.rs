@@ -62,7 +62,7 @@ fn packaged_cli_round_trips_real_tmux_and_preserves_host_bytes() {
     assert_eq!(count(&installed, BEGIN.as_bytes()), 1);
     let live = server.run(&["list-keys", "-T", "prefix", "C-g"]);
     assert_success(&live, "inspect installed live binding");
-    assert!(String::from_utf8_lossy(&live.stdout).contains("display-popup"));
+    assert!(String::from_utf8_lossy(&live.stdout).contains("open-popup"));
 
     let status = invoke_status(&binary, &scratch, server.path(), &environment, &codex);
     assert_success(&status, "status after packaged install");

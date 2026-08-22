@@ -1,13 +1,13 @@
 use std::{
     env, fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     thread,
     time::Instant,
 };
 
 use codex_mux::smart_naming::{
-    AppServerNamer, AppServerProcess, NAMING_BASE_INSTRUCTIONS, NamingConversation,
+    AppServerNamer, NAMING_BASE_INSTRUCTIONS, NamingConversation, SharedAppServer,
     prepare_naming_conversation,
 };
 use serde_json::json;
@@ -191,24 +191,15 @@ fn live_luna_eval_corpus_scores_accuracy_format_and_latency() {
     );
     let results = Arc::new(Mutex::new(Vec::new()));
     let failures = Arc::new(Mutex::new(Vec::new()));
+    let app_server = SharedAppServer::spawn(&codex).expect("shared Codex app-server starts");
 
     thread::scope(|scope| {
         for lane in 0..4 {
-            let codex = codex.clone();
+            let session = app_server.session(Arc::new(AtomicBool::new(false)));
             let results = results.clone();
             let failures = failures.clone();
             scope.spawn(move || {
-                let process = match AppServerProcess::spawn(&codex) {
-                    Ok(process) => process,
-                    Err(error) => {
-                        failures
-                            .lock()
-                            .unwrap()
-                            .push(format!("lane {lane}: {error}"));
-                        return;
-                    }
-                };
-                let mut namer = AppServerNamer::new(process);
+                let mut namer = AppServerNamer::new(session);
                 for case in EVALS.iter().copied().skip(lane).step_by(4) {
                     let prepared = prepare_naming_conversation(&source(case));
                     let started = Instant::now();

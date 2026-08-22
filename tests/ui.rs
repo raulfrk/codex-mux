@@ -253,6 +253,28 @@ fn auto_name_progress_survives_modal_close_and_reopen() {
 }
 
 #[test]
+fn auto_name_progress_does_not_invent_a_timeout_from_elapsed_time() {
+    let mut selected = pane("%7", "project session", "/work/project");
+    selected.immediate_naming = true;
+    selected.auto_name_status = Some(AutoNameStatus::Generating);
+    selected.auto_name_started_at_unix_nanos = Some(1);
+    let app = App::new(vec![selected], ThemeId::AdaptiveCyan, None);
+
+    let rendered = rendered_app(&app, 100, 30);
+    assert!(rendered.contains("AUTO-NAMING · generating"));
+    assert!(!rendered.contains("AUTO-NAME FAILED"));
+}
+
+#[test]
+fn auto_name_failure_is_rendered_only_from_worker_owned_terminal_state() {
+    let mut selected = pane("%7", "project session", "/work/project");
+    selected.auto_name_status = Some(AutoNameStatus::Failed);
+    let app = App::new(vec![selected], ThemeId::AdaptiveCyan, None);
+
+    assert!(rendered_app(&app, 100, 30).contains("AUTO-NAME FAILED · timed out"));
+}
+
+#[test]
 fn rename_prompt_allows_source_less_manual_name_to_unpin_and_wait_for_codex_identity() {
     let mut selected = pane("%21", "Pinned", "/work/legacy");
     selected.manual_name = true;

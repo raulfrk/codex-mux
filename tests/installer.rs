@@ -558,9 +558,8 @@ fn rendered_binding_loads_in_a_disposable_tmux_server() {
     assert!(listed.status.success());
     assert!(root_left.status.success());
     let binding = String::from_utf8(listed.stdout).unwrap();
-    assert!(binding.contains("display-popup"));
+    assert!(binding.contains("open-popup"));
     assert!(binding.contains("codex-mux"));
-    assert!(binding.contains("client_width"));
     assert!(binding.contains("q:pane_current_path"));
     let smart_binding = String::from_utf8(root_left.stdout).unwrap();
     assert!(smart_binding.contains("smart-left"));

@@ -1313,12 +1313,12 @@ fn thread_created_at(created_at_unix: u64, suffix: &str) -> String {
 }
 
 fn wait_until(description: &str, predicate: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if predicate() {
             return;
         }
-        thread::yield_now();
+        thread::sleep(Duration::from_millis(1));
     }
     panic!("timed out waiting for {description}");
 }

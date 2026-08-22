@@ -8,9 +8,12 @@ use std::{
     fs::OpenOptions,
     hash::{Hash, Hasher},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{DirBuilderExt, MetadataExt},
+    },
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, mpsc},
+    sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -37,8 +40,8 @@ use crate::{
     linux_process::LinuxProcessInspector,
     shell_integration::{ShellKind, ShellOutcome, ShellTransaction},
     smart_naming::{
-        AppServerNamer, AppServerProcess, NamingDiagnostics, NamingTarget, NamingWorker,
-        ProcessRolloutStore, RolloutStore,
+        AppServerNamer, AppServerSession, NamingConversation, NamingDiagnostics, NamingTarget,
+        NamingWorker, ProcessRolloutStore, RolloutStore, SharedAppServer,
     },
     tmux::{
         actions::TmuxActions,
@@ -182,14 +185,69 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Remove(arguments)) => run_remove(arguments),
         Some(Command::Tmux(tmux)) => run_tmux_command(tmux.command, process_arguments),
         Some(Command::SmartLeft) => run_smart_left(&cli, &process_arguments),
+        Some(Command::OpenPopup) => run_open_popup(&cli, &process_arguments),
         Some(Command::SmartNamingWorker) => run_smart_naming_worker(&process_arguments),
         Some(Command::SmartNamingStart) => {
             let preference = process_preference(&process_arguments)?;
             ensure_naming_daemon(&resolve_process(&process_arguments, preference.as_ref())?)
         }
         Some(Command::SmartNamingStop) => stop_naming_daemon(),
+        Some(Command::AuthenticatedNamingJourney) => {
+            run_authenticated_naming_journey(&process_arguments)
+        }
         None => run_interactive(cli, &process_arguments),
     }
+}
+
+fn run_authenticated_naming_journey(process_arguments: &ProcessArguments) -> Result<()> {
+    if env::var("CODEX_MUX_RUN_AUTHENTICATED_JOURNEYS").as_deref() != Ok("1") {
+        return Err(MuxError::InvalidValue {
+            field: "authenticated naming journey",
+            message: "requires CODEX_MUX_RUN_AUTHENTICATED_JOURNEYS=1".to_owned(),
+        });
+    }
+    let preference = process_preference(process_arguments)?;
+    let process = resolve_process(process_arguments, preference.as_ref())?;
+    let server = SharedAppServer::spawn(process.launch.as_path())?;
+    let started = Instant::now();
+    let titles = thread::scope(|scope| {
+        [
+            "Maintain the resident Codex Mux runtime and realistic tmux journeys.",
+            "Support launcher wrappers and supervisors without basename matching.",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, transcript)| {
+            let session = server.session(Arc::new(AtomicBool::new(false)));
+            scope.spawn(move || {
+                AppServerNamer::new(session).generate_name(&NamingConversation {
+                    thread_id: format!("authenticated-candidate-{index}"),
+                    transcript: transcript.to_owned(),
+                    activity: "repository: codex-mux".to_owned(),
+                })
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .map_err(|_| MuxError::Command("authenticated naming lane panicked".to_owned()))?
+        })
+        .collect::<Result<Vec<_>>>()
+    })?;
+    if titles.len() != 2 || titles.iter().any(|title| title.trim().is_empty()) {
+        return Err(MuxError::Command(
+            "authenticated naming journey returned an invalid title".to_owned(),
+        ));
+    }
+    if started.elapsed() >= Duration::from_secs(30) {
+        return Err(MuxError::Command(
+            "authenticated naming journey exceeded 30 seconds".to_owned(),
+        ));
+    }
+    println!("authenticated-naming-journey titles={}", titles.len());
+    Ok(())
 }
 
 fn run_setup(arguments: SetupArgs, process_arguments: ProcessArguments) -> Result<()> {
@@ -622,12 +680,49 @@ fn run_smart_left(cli: &Cli, process_arguments: &ProcessArguments) -> Result<()>
     Ok(())
 }
 
+fn run_open_popup(cli: &Cli, process_arguments: &ProcessArguments) -> Result<()> {
+    let context = invocation_context(cli)?;
+    let preference = process_preference(process_arguments)?;
+    let process = resolve_process(process_arguments, preference.as_ref())?;
+    let mux = env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|source| MuxError::Filesystem {
+            path: PathBuf::from("current executable"),
+            source,
+        })?;
+    let runner = SystemTmuxRunner::default();
+    let inspector = LinuxProcessInspector::with_matcher(
+        process.matches.clone(),
+        process.match_scope,
+        &process.match_command_regexes,
+    )?;
+    SmartLeftProbe::with_process_matcher(
+        &runner,
+        &inspector,
+        &SystemSleeper,
+        &mux,
+        &process.launch,
+        SmartLeftMatcher {
+            pane_commands: &process.pane_commands,
+            match_executables: &process.matches,
+            pane_command_regexes: &process.pane_command_regexes,
+            match_scope: match process.match_scope {
+                MatchScope::Foreground => "foreground",
+                MatchScope::PaneTree => "pane-tree",
+                MatchScope::PaneTty => "pane-tty",
+            },
+            match_command_regexes: &process.match_command_regexes,
+        },
+    )
+    .open_popup(&context)
+}
+
 fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()> {
     let context = invocation_context(&cli)?;
     let runner = SystemTmuxRunner::default();
-    if !invocation_context_is_current(&runner, &context) {
+    if let Some(reason) = invocation_context_mismatch(&runner, &context) {
         if let Ok(diagnostics) = NamingDiagnostics::smart_left() {
-            diagnostics.event("client_context_changed");
+            diagnostics.event(reason);
         }
         return Ok(());
     }
@@ -870,34 +965,51 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
     })
 }
 
+#[cfg(test)]
 fn invocation_context_is_current(
     runner: &impl crate::domain::TmuxCommandRunner,
     context: &InvocationContext,
 ) -> bool {
+    invocation_context_mismatch(runner, context).is_none()
+}
+
+fn invocation_context_mismatch(
+    runner: &impl crate::domain::TmuxCommandRunner,
+    context: &InvocationContext,
+) -> Option<&'static str> {
     let output = runner.run(&[
         OsString::from("list-clients"),
         OsString::from("-F"),
         OsString::from("#{client_tty}\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}"),
     ]);
-    let Ok(output) = output else { return false };
+    let Ok(output) = output else {
+        return Some("client_preflight_read_failed");
+    };
     if output.status != Some(0) {
-        return false;
+        return Some("client_preflight_command_failed");
     }
-    output
+    let fields = output
         .stdout
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .any(|line| {
-            let Ok(line) = std::str::from_utf8(line) else {
-                return false;
-            };
+        .find_map(|line| {
+            let line = std::str::from_utf8(line).ok()?;
             let fields = line.split('\x1f').collect::<Vec<_>>();
-            fields.len() == 4
-                && fields[0] == context.client_id.as_str()
-                && fields[1] == context.session_id.as_str()
-                && fields[2] == context.window_id.as_str()
-                && fields[3] == context.pane_id.as_str()
-        })
+            (fields.len() == 4 && fields[0] == context.client_id.as_str()).then_some(fields)
+        });
+    let Some(fields) = fields else {
+        return Some("client_preflight_client_missing");
+    };
+    if fields[1] != context.session_id.as_str() {
+        return Some("client_preflight_session_changed");
+    }
+    if fields[2] != context.window_id.as_str() {
+        return Some("client_preflight_window_changed");
+    }
+    if fields[3] != context.pane_id.as_str() {
+        return Some("client_preflight_pane_changed");
+    }
+    None
 }
 
 fn configured_codex_executables(
@@ -933,12 +1045,27 @@ fn start_naming_worker(process: &ResolvedProcessConfig) -> NamingWorker {
     let namer_diagnostics = diagnostics.clone();
     let rollouts = RolloutStore::discover().ok();
     let process_rollouts = ProcessRolloutStore::discover(&process.matches).ok();
+    let shared_app_server = Arc::new(Mutex::new(None::<SharedAppServer>));
     NamingWorker::spawn_parallel_logged(
         4,
         move |cancelled| {
             let namer_diagnostics = namer_diagnostics.clone();
             let rollouts = rollouts.clone();
-            AppServerProcess::spawn_with_cancel(&codex_path, cancelled.clone()).map(|session| {
+            let session = {
+                let mut shared = shared_app_server.lock().unwrap();
+                if shared.as_ref().is_none_or(|server| {
+                    !server
+                        .session(Arc::new(AtomicBool::new(false)))
+                        .is_healthy()
+                }) {
+                    *shared = Some(SharedAppServer::spawn(&codex_path)?);
+                }
+                shared
+                    .as_ref()
+                    .expect("shared app-server initialized")
+                    .session(cancelled.clone())
+            };
+            Ok({
                 let namer = match namer_diagnostics {
                     Some(diagnostics) => AppServerNamer::with_diagnostics(session, diagnostics),
                     None => AppServerNamer::new(session),
@@ -1153,6 +1280,13 @@ fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
             .clone();
         if names != applied_names || last_name_reconcile.elapsed() >= Duration::from_secs(2) {
             let panes = verification_inventory.discover().unwrap_or_default();
+            let now_unix_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            owned_names.expire_auto_name_requests(&panes, now_unix_nanos);
             owned_names.mark_auto_name_generating(&panes);
             let (verified_names, invalid_volatile) =
                 verify_volatile_generated_names(&names, &panes, verification_rollouts.as_ref());
@@ -1626,20 +1760,27 @@ fn invocation_context(cli: &Cli) -> Result<InvocationContext> {
             message: "is required when opening the interactive popup from tmux".to_owned(),
         })
     };
-    let current_path = cli
+    let supplied_path = cli
         .invoking_path
         .clone()
         .ok_or_else(|| MuxError::InvalidValue {
             field: "invoking path",
             message: "is required when opening the interactive popup from tmux".to_owned(),
         })?;
-    if !current_path.is_absolute() {
+    if !supplied_path.is_absolute() {
         return Err(MuxError::InvalidValue {
             field: "invoking path",
             message: "must be absolute".to_owned(),
         });
     }
     let pane_id = PaneId::new(required(&cli.invoking_pane, "invoking pane")?)?;
+    let client_id = ClientId::new(required(&cli.client, "tmux client")?)?;
+    if let Some(mut context) =
+        live_invocation_context(&SystemTmuxRunner::default(), &client_id, &pane_id)
+    {
+        context.current_path = supplied_path;
+        return Ok(context);
+    }
     let window_id = match cli.invoking_window.clone() {
         Some(window) => WindowId::new(window)?,
         None => {
@@ -1662,12 +1803,51 @@ fn invocation_context(cli: &Cli) -> Result<InvocationContext> {
         }
     };
     Ok(InvocationContext {
-        client_id: ClientId::new(required(&cli.client, "tmux client")?)?,
+        client_id,
         pane_id,
         session_id: SessionId::new(required(&cli.invoking_session, "invoking session")?)?,
         window_id,
-        current_path,
+        current_path: supplied_path,
     })
+}
+
+fn live_invocation_context(
+    runner: &impl crate::domain::TmuxCommandRunner,
+    client_id: &ClientId,
+    pane_id: &PaneId,
+) -> Option<InvocationContext> {
+    let output = runner
+        .run(&[
+            OsString::from("list-clients"),
+            OsString::from("-F"),
+            OsString::from(
+                "#{client_tty}\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_current_path}",
+            ),
+        ])
+        .ok()?;
+    if output.status != Some(0) {
+        return None;
+    }
+    output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .find_map(|line| {
+            let fields = line.split(|byte| *byte == b'\x1f').collect::<Vec<_>>();
+            if fields.len() != 5
+                || fields[0] != client_id.as_str().as_bytes()
+                || fields[3] != pane_id.as_str().as_bytes()
+            {
+                return None;
+            }
+            Some(InvocationContext {
+                client_id: client_id.clone(),
+                pane_id: pane_id.clone(),
+                session_id: SessionId::new(String::from_utf8(fields[1].to_vec()).ok()?).ok()?,
+                window_id: WindowId::new(String::from_utf8(fields[2].to_vec()).ok()?).ok()?,
+                current_path: PathBuf::from(std::ffi::OsString::from_vec(fields[4].to_vec())),
+            })
+        })
 }
 
 fn run_tmux_command(command: TmuxCommand, process_arguments: ProcessArguments) -> Result<()> {
@@ -2332,7 +2512,7 @@ mod tests {
     use super::{
         PaneRefreshWorker, configured_codex_executables, filter_names_by_authoritative_threads,
         force_stop_naming_daemon, invocation_context, invocation_context_is_current,
-        linux_process_start_time, parse_naming_server_identity,
+        linux_process_start_time, live_invocation_context, parse_naming_server_identity,
     };
     use crate::cli::Cli;
     use crate::{
@@ -2379,6 +2559,25 @@ mod tests {
             &output(b"malformed\n"),
             &context
         ));
+    }
+
+    #[test]
+    fn live_client_and_pane_authoritatively_recover_shell_corrupted_session_metadata() {
+        let runner = ContextRunner(CommandOutput {
+            stdout: b"/dev/pts/7\x1f$2\x1f@3\x1f%4\x1f/work/project\n".to_vec(),
+            stderr: Vec::new(),
+            status: Some(0),
+        });
+        let context = live_invocation_context(
+            &runner,
+            &ClientId::new("/dev/pts/7").unwrap(),
+            &PaneId::new("%4").unwrap(),
+        )
+        .expect("exact client and pane recover a coherent context");
+
+        assert_eq!(context.session_id.as_str(), "$2");
+        assert_eq!(context.window_id.as_str(), "@3");
+        assert_eq!(context.current_path, PathBuf::from("/work/project"));
     }
 
     #[test]

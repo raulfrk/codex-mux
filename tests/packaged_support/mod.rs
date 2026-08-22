@@ -8,11 +8,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "../packaged_gate.rs"]
+mod packaged_gate;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const TIMEOUT: Duration = Duration::from_secs(8);
 
 pub fn require_prerequisites() -> Option<PathBuf> {
     let Some(binary) = std::env::var_os("CODEX_MUX_E2E_BINARY").map(PathBuf::from) else {
+        packaged_gate::missing_binary_is_allowed(
+            std::env::var("CODEX_MUX_REQUIRE_PACKAGED_E2E").as_deref() == Ok("1"),
+        );
         eprintln!(
             "CODEX_MUX_E2E_BINARY is unset; skipping packaged runtime E2E (scripts/e2e.sh supplies it)"
         );
@@ -282,6 +288,22 @@ impl Pty {
         );
         let bytes = fs::read(&self.capture).expect("read PTY capture after complete frame");
         String::from_utf8_lossy(&bytes[previous..]).into_owned()
+    }
+
+    pub fn wait_appended_text(&self, previous: u64, expected: &str) -> String {
+        let previous = usize::try_from(previous).expect("PTY capture length fits usize");
+        wait(
+            &format!("appended PTY text containing {expected:?}"),
+            || {
+                fs::read(&self.capture).is_ok_and(|bytes| {
+                    String::from_utf8_lossy(bytes.get(previous..).unwrap_or_default())
+                        .contains(expected)
+                })
+            },
+            || fs::read_to_string(&self.capture).unwrap_or_default(),
+        );
+        let bytes = fs::read(&self.capture).expect("read appended PTY capture");
+        String::from_utf8_lossy(bytes.get(previous..).unwrap_or_default()).into_owned()
     }
 
     pub fn wait_exit(&mut self) -> std::process::ExitStatus {

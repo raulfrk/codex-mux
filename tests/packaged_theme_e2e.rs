@@ -36,6 +36,7 @@ fn every_persisted_theme_renders_the_same_session_and_action_data() {
 
 #[test]
 fn picker_live_previews_every_theme_and_enter_persists_atomically_then_reloads() {
+    let _evidence = journey_evidence::journey(&["theme"]);
     let Some(binary) = packaged_binary() else {
         return;
     };
@@ -170,3 +171,4 @@ fn no_color_forces_monochrome_disables_picker_and_preserves_ember_bytes() {
     );
     assert_eq!(fs::read(fixture.config_path()).unwrap(), original);
 }
+mod journey_evidence;

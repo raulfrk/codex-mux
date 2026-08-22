@@ -157,6 +157,7 @@ fn worker_is_singleton_and_survives_its_launcher_until_persisted_disable() {
 
 #[test]
 fn persisted_disable_force_stops_a_blocked_owned_daemon_and_its_provider_only() {
+    let _evidence = journey_evidence::journey(&["smart-naming-toggle"]);
     let root = scratch();
     private_runtime(&root);
     fs::write(root.join("tmux.sock"), b"fixture").unwrap();
@@ -421,3 +422,4 @@ fn disable_interrupts_late_provider_retry_backoff() {
         .status();
     fs::remove_dir_all(root).unwrap();
 }
+mod journey_evidence;

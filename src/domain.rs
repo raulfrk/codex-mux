@@ -153,6 +153,10 @@ pub enum AutoNameStatus {
     Generating,
     /// Fresh generated metadata was written for the guarded pane identity.
     Succeeded,
+    /// The worker exhausted the bounded request deadline without publishing a name.
+    Failed,
+    /// The request was superseded or stopped before it could publish a name.
+    Cancelled,
 }
 
 impl Pane {

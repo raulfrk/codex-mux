@@ -480,7 +480,8 @@ where
             })
     }
 
-    fn open_popup(&self, context: &InvocationContext) -> Result<()> {
+    /// Opens the same responsive popup used after a successful Smart Left probe.
+    pub fn open_popup(&self, context: &InvocationContext) -> Result<()> {
         let dimensions = self.run_checked(vec![
             OsString::from("list-clients"),
             OsString::from("-F"),

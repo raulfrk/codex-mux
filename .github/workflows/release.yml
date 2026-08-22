@@ -54,6 +54,11 @@ jobs:
         run: rustup target add "${{ matrix.target }}" --toolchain 1.85.0
       - name: Build locked release binary
         run: cargo +1.85.0 build --locked --release --target "${{ matrix.target }}"
+      - name: Verify authenticated x86 release candidate
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: >-
+          sha256sum --check --strict
+          release-candidate-x86_64.sha256
       - name: Package deterministic archive
         run: >-
           scripts/package-release.sh

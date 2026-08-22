@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
+    time::Duration,
 };
 
 use crate::{
@@ -12,6 +13,7 @@ use crate::{
 };
 
 const SEPARATOR: char = '\x1f';
+const AUTO_NAME_REQUEST_DEADLINE: Duration = Duration::from_secs(3 * 60);
 const OWNER_OPTION: &str = "@codex_mux_generated_name";
 const THREAD_OPTION: &str = "@codex_mux_generated_thread";
 const SOURCE_TITLE_OPTION: &str = "@codex_mux_generated_source_title";
@@ -129,6 +131,9 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
                 .get(13)
                 .is_some_and(|status| matches!(*status, "recovering" | "queued" | "generating"));
         let request_token = fields.get(15).filter(|token| !token.is_empty()).copied();
+        if generated.auto_name_token.is_some() && !forced_pending {
+            return Ok(());
+        }
         if forced_pending
             && (request_token.is_none() || generated.auto_name_token.as_deref() != request_token)
         {
@@ -245,7 +250,10 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
             let status = match status {
                 AutoNameStatus::RecoveringIdentity => "recovering",
                 AutoNameStatus::Queued => "queued",
-                AutoNameStatus::Generating | AutoNameStatus::Succeeded => continue,
+                AutoNameStatus::Generating
+                | AutoNameStatus::Succeeded
+                | AutoNameStatus::Failed
+                | AutoNameStatus::Cancelled => continue,
             };
             let condition = [
                 format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid),
@@ -271,6 +279,74 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
                 "set-option -p -t {} {} generating",
                 tmux_quote(pane.id.as_str()),
                 AUTO_NAME_STATUS_OPTION,
+            );
+            let _ = self.run([
+                "if-shell",
+                "-F",
+                "-t",
+                pane.id.as_str(),
+                &condition,
+                &mutation,
+            ]);
+        }
+    }
+
+    /// Ends overdue explicit requests while preserving their terminal status for the UI.
+    pub fn expire_auto_name_requests(&self, panes: &[Pane], now_unix_nanos: u64) {
+        let deadline_nanos = AUTO_NAME_REQUEST_DEADLINE.as_nanos();
+        for pane in panes.iter().filter(|pane| {
+            pane.immediate_naming
+                && matches!(
+                    pane.auto_name_status,
+                    Some(
+                        AutoNameStatus::RecoveringIdentity
+                            | AutoNameStatus::Queued
+                            | AutoNameStatus::Generating
+                    )
+                )
+                && pane.auto_name_started_at_unix_nanos.is_some_and(|started| {
+                    u128::from(now_unix_nanos.saturating_sub(started)) >= deadline_nanos
+                })
+        }) {
+            let (Some(token), Some(started), Some(status)) = (
+                pane.auto_name_token.as_deref(),
+                pane.auto_name_started_at_unix_nanos,
+                pane.auto_name_status,
+            ) else {
+                continue;
+            };
+            let status = match status {
+                AutoNameStatus::RecoveringIdentity => "recovering",
+                AutoNameStatus::Queued => "queued",
+                AutoNameStatus::Generating => "generating",
+                AutoNameStatus::Succeeded | AutoNameStatus::Failed | AutoNameStatus::Cancelled => {
+                    continue;
+                }
+            };
+            let clauses = [
+                format!("#{{==:#{{pane_pid}},{}}}", pane.pane_pid),
+                format!(
+                    "#{{==:#{{session_id}},{}}}",
+                    tmux_format_literal(pane.session_id.as_str())
+                ),
+                format!("#{{==:#{{{IMMEDIATE_NAMING_OPTION}}},1}}"),
+                format!(
+                    "#{{==:#{{{AUTO_NAME_STATUS_OPTION}}},{}}}",
+                    tmux_format_literal(status)
+                ),
+                format!("#{{==:#{{{AUTO_NAME_STARTED_OPTION}}},{started}}}"),
+                format!(
+                    "#{{==:#{{{AUTO_NAME_TOKEN_OPTION}}},{}}}",
+                    tmux_format_literal(token)
+                ),
+            ];
+            let condition = clauses
+                .into_iter()
+                .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+                .expect("auto-name expiry condition has clauses");
+            let pane_id = tmux_quote(pane.id.as_str());
+            let mutation = format!(
+                "set-option -p -t {pane_id} {AUTO_NAME_STATUS_OPTION} failed; set-option -pu -t {pane_id} {IMMEDIATE_NAMING_OPTION}"
             );
             let _ = self.run([
                 "if-shell",
@@ -676,8 +752,8 @@ mod tests {
             Some("request-token"),
         ));
 
-        let calls = calls(&runner);
-        let (condition, mutation) = if_shell(&calls);
+        let recorded_calls = calls(&runner);
+        let (condition, mutation) = if_shell(&recorded_calls);
         assert!(condition.contains(IMMEDIATE_NAMING_OPTION));
         assert!(condition.contains(AUTO_NAME_STATUS_OPTION));
         assert!(condition.contains("generating"));
@@ -704,6 +780,20 @@ mod tests {
                 .reconcile(&names_with_token("Cached title", Some("old-token")))
         );
 
+        assert_eq!(calls(&runner).len(), 1);
+    }
+
+    #[test]
+    fn late_forced_result_cannot_publish_after_request_failed() {
+        let base = state(THREAD, "/work/project", "", "", "", "", "");
+        let prefix = base.strip_suffix("\x1f\x1f\n").unwrap();
+        let current = format!("{prefix}\x1f\x1f\x1ffailed\x1f1000000000\x1frequest-token\n");
+        let runner = FakeRunner::with_states(&[&current]);
+
+        assert!(
+            !OwnedTmuxNames::new(runner.clone())
+                .reconcile(&names_with_token("Late title", Some("request-token"),))
+        );
         assert_eq!(calls(&runner).len(), 1);
     }
 
@@ -738,8 +828,8 @@ mod tests {
 
         OwnedTmuxNames::new(runner.clone()).mark_auto_name_generating(std::slice::from_ref(&pane));
 
-        let calls = calls(&runner);
-        let (condition, mutation) = if_shell(&calls);
+        let recorded_calls = calls(&runner);
+        let (condition, mutation) = if_shell(&recorded_calls);
         assert!(condition.contains(IMMEDIATE_NAMING_OPTION));
         assert!(condition.contains(AUTO_NAME_STATUS_OPTION));
         assert!(condition.contains("recovering"));
@@ -748,6 +838,52 @@ mod tests {
         assert!(condition.contains(AUTO_NAME_TOKEN_OPTION));
         assert!(condition.contains("request-token"));
         assert!(mutation.contains("generating"));
+    }
+
+    #[test]
+    fn overdue_forced_request_fails_only_under_its_exact_identity_and_token() {
+        let runner = FakeRunner::with_states(&[]);
+        let mut pane = Pane {
+            id: PaneId::new("%7").unwrap(),
+            session_id: crate::domain::SessionId::new("$1").unwrap(),
+            title: Some(THREAD.to_owned()),
+            generated_title: None,
+            generated_thread_id: None,
+            generated_source_stable: false,
+            generated_at_unix: None,
+            immediate_naming: true,
+            auto_name_status: Some(AutoNameStatus::Generating),
+            auto_name_started_at_unix_nanos: Some(1_000_000_000),
+            auto_name_token: Some("request-token".to_owned()),
+            manual_name: false,
+            manual_name_source: None,
+            manual_name_pid: None,
+            manual_name_pid_raw: String::new(),
+            manual_name_session: None,
+            manual_name_session_raw: String::new(),
+            unpin_waiting: false,
+            unpin_waiting_title: None,
+            unpin_waiting_pid: None,
+            unpin_waiting_session: None,
+            pane_pid: 77,
+            current_path: "/work/project".into(),
+        };
+
+        OwnedTmuxNames::new(runner.clone())
+            .expire_auto_name_requests(std::slice::from_ref(&pane), 181_000_000_001);
+        let recorded_calls = calls(&runner);
+        let (condition, mutation) = if_shell(&recorded_calls);
+        assert!(condition.contains("request-token"));
+        assert!(condition.contains("generating"));
+        assert!(condition.contains("pane_pid"));
+        assert!(condition.contains("session_id"));
+        assert!(mutation.contains("failed"));
+        assert!(mutation.contains(IMMEDIATE_NAMING_OPTION));
+
+        pane.auto_name_started_at_unix_nanos = Some(2_000_000_000);
+        let fresh = FakeRunner::with_states(&[]);
+        OwnedTmuxNames::new(fresh.clone()).expire_auto_name_requests(&[pane], 181_999_999_999);
+        assert!(calls(&fresh).is_empty());
     }
 
     #[test]

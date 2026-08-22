@@ -509,6 +509,7 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
 
 #[test]
 fn forced_auto_name_progresses_to_success_in_real_tmux() {
+    let _evidence = journey_evidence::journey(&["force-auto-name"]);
     let _serial = serial_tmux_test();
     if !tools_available() {
         return;
@@ -1123,13 +1124,8 @@ fn installer_cli_loads_a_real_prefix_binding_with_responsive_geometry() {
 
     let binding = server.checked(&["list-keys", "-T", "prefix", "a"]);
     for literal in [
-        "client_width",
-        "client_height",
-        "run-shell -C",
-        "display-popup -E",
-        "100%",
-        "80%",
-        "70%",
+        "run-shell -b",
+        "open-popup",
         "--client",
         "--invoking-pane",
         "--invoking-session",
@@ -2400,3 +2396,4 @@ fn client_fields(server: &TmuxServer, target: &str) -> (String, String) {
 fn path(path: &Path) -> &str {
     path.to_str().expect("E2E paths are valid UTF-8")
 }
+mod journey_evidence;

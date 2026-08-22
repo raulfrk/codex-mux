@@ -25,7 +25,6 @@ use crate::{
 };
 
 const MAX_MANUAL_TITLE_CHARS: usize = 80;
-const AUTO_NAME_DEADLINE_SECS: u64 = 90;
 
 /// Responsive rendering profile selected from the terminal dimensions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +80,43 @@ pub enum Action {
     PersistTheme(ThemeId),
     /// Leave the popup without changing tmux state.
     Quit,
+}
+
+/// Closed production inventory of every user-visible action kind.
+pub const PUBLIC_ACTION_KINDS: &[&str] = &[
+    "activate",
+    "new",
+    "launch-profile",
+    "persist-profiles",
+    "smart-naming-toggle",
+    "resume",
+    "close",
+    "rename",
+    "unpin",
+    "force-auto-name",
+    "theme",
+    "quit",
+];
+
+impl Action {
+    /// Stable journey-evidence identifier for this action.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Activate(_) => "activate",
+            Self::New => "new",
+            Self::LaunchProfile(_) => "launch-profile",
+            Self::PersistProfiles(_) => "persist-profiles",
+            Self::PersistSmartNaming(_) => "smart-naming-toggle",
+            Self::Resume => "resume",
+            Self::Close(_) => "close",
+            Self::Rename(_, _) => "rename",
+            Self::Unpin(_) => "unpin",
+            Self::AutoName(_) => "force-auto-name",
+            Self::PersistTheme(_) => "theme",
+            Self::Quit => "quit",
+        }
+    }
 }
 
 /// Per-invocation policy controlling whether colored themes may be selected.
@@ -1236,15 +1272,7 @@ fn auto_name_badge(status: Option<AutoNameStatus>, started: Option<u64>) -> Opti
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let elapsed_nanos = started.map(|started| now_nanos.saturating_sub(u128::from(started)));
-    let timed_out = elapsed_nanos
-        .is_some_and(|elapsed| elapsed >= Duration::from_secs(AUTO_NAME_DEADLINE_SECS).as_nanos());
-    if status == AutoNameStatus::Succeeded && timed_out {
-        return None;
-    }
-    if timed_out && status != AutoNameStatus::Succeeded {
-        return Some("AUTO-NAME FAILED · timed out".to_owned());
-    }
+    let _elapsed_nanos = started.map(|started| now_nanos.saturating_sub(u128::from(started)));
     let spinner =
         ["◐", "◓", "◑", "◒"][((now_nanos / Duration::from_millis(250).as_nanos()) as usize) % 4];
     Some(match status {
@@ -1254,6 +1282,8 @@ fn auto_name_badge(status: Option<AutoNameStatus>, started: Option<u64>) -> Opti
         AutoNameStatus::Queued => format!("{spinner} AUTO-NAMING · queued"),
         AutoNameStatus::Generating => format!("{spinner} AUTO-NAMING · generating"),
         AutoNameStatus::Succeeded => "✓ AUTO-NAMED".to_owned(),
+        AutoNameStatus::Failed => "AUTO-NAME FAILED · timed out".to_owned(),
+        AutoNameStatus::Cancelled => "AUTO-NAME CANCELLED".to_owned(),
     })
 }
 

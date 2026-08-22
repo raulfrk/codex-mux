@@ -4,13 +4,13 @@ use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -73,6 +73,8 @@ const NAMING_LOG_MAX_BYTES: u64 = 256 * 1024;
 const DIAGNOSTIC_CODES: &[&str] = &[
     "worker_start",
     "provider_start_failed",
+    "provider_restart_failed",
+    "provider_restarted",
     "provider_ready",
     "discovery_failed",
     "read_provider_unhealthy",
@@ -526,6 +528,348 @@ impl Drop for AppServerProcess {
         if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.join();
         }
+    }
+}
+
+type AppServerReply = std::result::Result<Value, String>;
+
+/// One multiplexed Codex app-server shared by independent naming lanes.
+pub struct SharedAppServer {
+    inner: Arc<SharedAppServerInner>,
+}
+
+struct SharedAppServerInner {
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    responses: Mutex<HashMap<u64, SyncSender<AppServerReply>>>,
+    notifications: Mutex<NotificationState>,
+    healthy: AtomicBool,
+    next_id: AtomicU64,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    stderr_reader: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct NotificationState {
+    waiters: HashMap<(String, String), SyncSender<AppServerReply>>,
+    pending: VecDeque<Value>,
+    abandoned_threads: VecDeque<String>,
+}
+
+impl NotificationState {
+    fn abandon_thread(&mut self, thread_id: &str) {
+        if self
+            .abandoned_threads
+            .iter()
+            .any(|abandoned| abandoned == thread_id)
+        {
+            return;
+        }
+        if self.abandoned_threads.len() == 256 {
+            self.abandoned_threads.pop_front();
+        }
+        self.abandoned_threads.push_back(thread_id.to_owned());
+    }
+
+    fn route(
+        &mut self,
+        method: &str,
+        thread_id: &str,
+        message: Value,
+    ) -> Option<(SyncSender<AppServerReply>, Value)> {
+        if method == "turn/completed"
+            && self
+                .abandoned_threads
+                .iter()
+                .any(|abandoned| abandoned == thread_id)
+        {
+            self.abandoned_threads
+                .retain(|abandoned| abandoned != thread_id);
+            return None;
+        }
+        let key = (method.to_owned(), thread_id.to_owned());
+        if let Some(waiter) = self.waiters.remove(&key) {
+            return Some((waiter, message));
+        }
+        if method == "turn/completed" {
+            if self.pending.len() == 64 {
+                self.pending.pop_front();
+            }
+            self.pending.push_back(message);
+        }
+        None
+    }
+}
+
+/// A cancellation-scoped logical session on a shared app-server transport.
+pub struct SharedAppServerSession {
+    inner: Arc<SharedAppServerInner>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SharedAppServer {
+    /// Starts and initializes one app-server process for all naming lanes.
+    pub fn spawn(codex: &Path) -> Result<Self> {
+        let mut child = app_server_command(codex)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| MuxError::Filesystem {
+                path: codex.to_owned(),
+                source,
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| protocol("app-server stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| protocol("app-server stdout unavailable"))?;
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| protocol("app-server stderr unavailable"))?;
+        let inner = Arc::new(SharedAppServerInner {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            responses: Mutex::new(HashMap::new()),
+            notifications: Mutex::new(NotificationState::default()),
+            healthy: AtomicBool::new(true),
+            next_id: AtomicU64::new(1),
+            reader: Mutex::new(None),
+            stderr_reader: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&inner);
+        *inner.reader.lock().unwrap() = Some(thread::spawn(move || {
+            shared_app_server_reader(stdout, &weak);
+        }));
+        *inner.stderr_reader.lock().unwrap() = Some(thread::spawn(move || {
+            drain_app_server_stderr(stderr_pipe);
+        }));
+        let hub = Self { inner };
+        let mut session = hub.session(Arc::new(AtomicBool::new(false)));
+        let result = session.request_with_timeout(
+            "initialize",
+            json!({
+                "clientInfo": {"name": "codex-mux", "title": "codex-mux smart naming", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {"experimentalApi": true}
+            }),
+            Duration::from_secs(15),
+        )?;
+        let _ = result;
+        session.write_notification(&json!({"method": "initialized"}))?;
+        Ok(hub)
+    }
+
+    /// Creates an independent logical client whose cancellation does not stop the hub.
+    #[must_use]
+    pub fn session(&self, cancelled: Arc<AtomicBool>) -> SharedAppServerSession {
+        SharedAppServerSession {
+            inner: self.inner.clone(),
+            cancelled,
+        }
+    }
+}
+
+fn drain_app_server_stderr(mut stderr: impl Read) {
+    let _ = io::copy(&mut stderr, &mut io::sink());
+}
+
+impl Clone for SharedAppServer {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+fn shared_app_server_reader(stdout: impl Read, weak: &Weak<SharedAppServerInner>) {
+    let mut reader = BufReader::new(stdout);
+    while let Some(message) = read_app_server_message(&mut reader) {
+        let Some(inner) = weak.upgrade() else { return };
+        let message = match message {
+            Ok(message) => message,
+            Err(detail) => {
+                inner.fail(&detail);
+                return;
+            }
+        };
+        if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if let Some(waiter) = inner.responses.lock().unwrap().remove(&id) {
+                let _ = waiter.send(Ok(message));
+            }
+            continue;
+        }
+        let Some(method) = message
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(thread_id) = message
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let mut notifications = inner.notifications.lock().unwrap();
+        if let Some((waiter, message)) = notifications.route(&method, &thread_id, message) {
+            let _ = waiter.send(Ok(message));
+        }
+    }
+    if let Some(inner) = weak.upgrade() {
+        inner.fail("app-server output closed unexpectedly");
+    }
+}
+
+impl SharedAppServerInner {
+    fn fail(&self, detail: &str) {
+        self.healthy.store(false, Ordering::Release);
+        for (_, waiter) in self.responses.lock().unwrap().drain() {
+            let _ = waiter.send(Err(detail.to_owned()));
+        }
+        for (_, waiter) in self.notifications.lock().unwrap().waiters.drain() {
+            let _ = waiter.send(Err(detail.to_owned()));
+        }
+    }
+}
+
+impl SharedAppServerSession {
+    fn write_notification(&self, message: &Value) -> Result<()> {
+        let mut encoded = serde_json::to_vec(message)
+            .map_err(|error| protocol(&format!("could not encode request: {error}")))?;
+        encoded.push(b'\n');
+        let mut stdin = self.inner.stdin.lock().unwrap();
+        stdin
+            .write_all(&encoded)
+            .and_then(|()| stdin.flush())
+            .map_err(|source| MuxError::Filesystem {
+                path: Path::new("codex app-server stdin").to_owned(),
+                source,
+            })
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.inner.responses.lock().unwrap().insert(id, sender);
+        if let Err(error) =
+            self.write_notification(&json!({"id": id, "method": method, "params": params}))
+        {
+            self.inner.responses.lock().unwrap().remove(&id);
+            self.inner.healthy.store(false, Ordering::Release);
+            return Err(error);
+        }
+        let response =
+            wait_for_shared_reply(&receiver, timeout, &self.cancelled).inspect_err(|error| {
+                self.inner.responses.lock().unwrap().remove(&id);
+                if !matches!(error, MuxError::Cancelled) {
+                    self.inner.healthy.store(false, Ordering::Release);
+                }
+            })?;
+        response_result(response)
+    }
+}
+
+fn wait_for_shared_reply(
+    receiver: &Receiver<AppServerReply>,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Value> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(MuxError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(Ok(message)) => return Ok(message),
+            Ok(Err(detail)) => return Err(protocol(&detail)),
+            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(protocol("app-server request timed out"));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(protocol("app-server response channel closed"));
+            }
+        }
+    }
+}
+
+impl AppServerSession for SharedAppServerSession {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, Duration::from_secs(30))
+    }
+
+    fn wait_for(&mut self, method: &str, thread_id: &str) -> Result<Value> {
+        let key = (method.to_owned(), thread_id.to_owned());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        {
+            let mut notifications = self.inner.notifications.lock().unwrap();
+            if let Some(index) = notifications.pending.iter().position(|message| {
+                message["method"] == method
+                    && message.pointer("/params/threadId").and_then(Value::as_str)
+                        == Some(thread_id)
+            }) {
+                let message = notifications
+                    .pending
+                    .remove(index)
+                    .expect("pending index exists");
+                return message
+                    .get("params")
+                    .cloned()
+                    .ok_or_else(|| protocol("notification omitted params"));
+            }
+            if notifications.waiters.insert(key.clone(), sender).is_some() {
+                return Err(protocol("duplicate app-server notification waiter"));
+            }
+        }
+        let message = wait_for_shared_reply(&receiver, Duration::from_secs(30), &self.cancelled)
+            .inspect_err(|error| {
+                let mut notifications = self.inner.notifications.lock().unwrap();
+                notifications.waiters.remove(&key);
+                notifications.abandon_thread(thread_id);
+                if !matches!(error, MuxError::Cancelled) {
+                    self.inner.healthy.store(false, Ordering::Release);
+                }
+            })?;
+        message
+            .get("params")
+            .cloned()
+            .ok_or_else(|| protocol("notification omitted params"))
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.inner.healthy.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SharedAppServerInner {
+    fn drop(&mut self) {
+        let child = self.child.get_mut().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(reader) = self.reader.get_mut().unwrap().take() {
+            join_background(reader);
+        }
+        if let Some(reader) = self.stderr_reader.get_mut().unwrap().take() {
+            join_background(reader);
+        }
+    }
+}
+
+fn join_background(handle: JoinHandle<()>) {
+    if handle.thread().id() != thread::current().id() {
+        let _ = handle.join();
     }
 }
 
@@ -1186,8 +1530,9 @@ impl NamingWorker {
         F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
     {
+        let mut start_namer = Some(start_namer);
         Self::spawn_with_intervals(
-            start_namer,
+            move |cancelled| start_namer.take().ok_or(MuxError::Cancelled)?(cancelled),
             discover,
             poll_interval,
             NAMING_REFRESH_INTERVAL,
@@ -1207,7 +1552,13 @@ impl NamingWorker {
         F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
     {
-        Self::spawn_logged_phased(start_namer, move |_| discover(), poll_interval, diagnostics)
+        let mut start_namer = Some(start_namer);
+        Self::spawn_logged_phased(
+            move |cancelled| start_namer.take().ok_or(MuxError::Cancelled)?(cancelled),
+            move |_| discover(),
+            poll_interval,
+            diagnostics,
+        )
     }
 
     fn spawn_logged_phased<N, F, D>(
@@ -1218,7 +1569,7 @@ impl NamingWorker {
     ) -> Self
     where
         N: ConversationNamer,
-        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        F: FnMut(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut(DiscoveryPhase) -> Result<Vec<NamingTarget>> + Send + 'static,
     {
         Self::spawn_with_retry_intervals(
@@ -1241,7 +1592,7 @@ impl NamingWorker {
     ) -> Self
     where
         N: ConversationNamer,
-        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        F: FnMut(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut() -> Result<Vec<NamingTarget>> + Send + 'static,
     {
         Self::spawn_with_retry_intervals(
@@ -1256,7 +1607,7 @@ impl NamingWorker {
     }
 
     fn spawn_with_retry_intervals<N, F, D>(
-        start_namer: F,
+        mut start_namer: F,
         mut discover: D,
         poll_interval: Duration,
         refresh_interval: Duration,
@@ -1266,7 +1617,7 @@ impl NamingWorker {
     ) -> Self
     where
         N: ConversationNamer,
-        F: FnOnce(Arc<AtomicBool>) -> Result<N> + Send + 'static,
+        F: FnMut(Arc<AtomicBool>) -> Result<N> + Send + 'static,
         D: FnMut(DiscoveryPhase) -> Result<Vec<NamingTarget>> + Send + 'static,
     {
         let (commands, command_receiver) = mpsc::channel();
@@ -1276,14 +1627,45 @@ impl NamingWorker {
         let published = names.clone();
         let thread = thread::spawn(move || {
             log_diagnostic(&diagnostics, "worker_start");
-            let Ok(mut namer) = start_namer(worker_cancelled.clone()) else {
-                log_diagnostic(&diagnostics, "provider_start_failed");
-                return;
+            let mut namer = loop {
+                match start_namer(worker_cancelled.clone()) {
+                    Ok(namer) => break namer,
+                    Err(_) => {
+                        log_diagnostic(&diagnostics, "provider_start_failed");
+                        if wait_for_stop_ignoring_wakes(&command_receiver, retry_interval) {
+                            return;
+                        }
+                    }
+                }
             };
             log_diagnostic(&diagnostics, "provider_ready");
             let mut cache = HashMap::<String, (u64, String)>::new();
             let mut last_attempt =
                 HashMap::<AttemptIdentity, (std::time::Instant, Duration)>::new();
+            macro_rules! restart_provider {
+                ($worker:lifetime) => {{
+                    if wait_for_stop_ignoring_wakes(&command_receiver, retry_interval) {
+                        return;
+                    }
+                    namer = loop {
+                        match start_namer(worker_cancelled.clone()) {
+                            Ok(namer) => break namer,
+                            Err(MuxError::Cancelled) => return,
+                            Err(_) => {
+                                log_diagnostic(&diagnostics, "provider_restart_failed");
+                                if wait_for_stop_ignoring_wakes(
+                                    &command_receiver,
+                                    retry_interval,
+                                ) {
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    log_diagnostic(&diagnostics, "provider_restarted");
+                    continue $worker;
+                }};
+            }
             'worker: loop {
                 match drain_commands(&command_receiver) {
                     CommandSignal::Stop => break,
@@ -1345,9 +1727,9 @@ impl NamingWorker {
                         Ok(conversation) => conversation,
                         Err(_) if !namer.is_healthy() => {
                             log_diagnostic(&diagnostics, "read_provider_unhealthy");
-                            let _ = wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
-                            return;
+                            restart_provider!('worker);
                         }
+                        Err(MuxError::Cancelled) => return,
                         Err(_) => {
                             log_diagnostic(&diagnostics, "read_failed");
                             continue;
@@ -1385,11 +1767,7 @@ impl NamingWorker {
                                 Ok(name) => name,
                                 Err(_) if !namer.is_healthy() => {
                                     log_diagnostic(&diagnostics, "naming_provider_unhealthy");
-                                    let _ = wait_for_stop_ignoring_wakes(
-                                        &command_receiver,
-                                        retry_interval,
-                                    );
-                                    return;
+                                    restart_provider!('worker);
                                 }
                                 Err(_) => {
                                     log_diagnostic(&diagnostics, "naming_failed");
@@ -1404,9 +1782,7 @@ impl NamingWorker {
                             Ok(name) => name,
                             Err(_) if !namer.is_healthy() => {
                                 log_diagnostic(&diagnostics, "naming_provider_unhealthy");
-                                let _ =
-                                    wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
-                                return;
+                                restart_provider!('worker);
                             }
                             Err(_) => {
                                 log_diagnostic(&diagnostics, "naming_failed");
@@ -1420,8 +1796,7 @@ impl NamingWorker {
                         Ok(thread_id) => thread_id,
                         Err(_) if !namer.is_healthy() => {
                             log_diagnostic(&diagnostics, "resolve_provider_unhealthy");
-                            let _ = wait_for_stop_ignoring_wakes(&command_receiver, retry_interval);
-                            return;
+                            restart_provider!('worker);
                         }
                         Err(_) => {
                             log_diagnostic(&diagnostics, "resolve_failed");
@@ -3866,6 +4241,7 @@ fn protocol(message: &str) -> MuxError {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
 
     static PROCESS_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -4279,6 +4655,21 @@ mod transport_tests {
     }
 
     #[test]
+    fn background_cleanup_never_joins_the_current_reader_thread() {
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel::<JoinHandle<()>>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let own_handle = handle_rx.recv().unwrap();
+            join_background(own_handle);
+            done_tx.send(()).unwrap();
+        });
+        handle_tx.send(handle).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("self-owned reader handle must be detached without joining itself");
+    }
+
+    #[test]
     fn private_control_socket_peer_resolves_a_legacy_client_thread() {
         use std::os::unix::{
             fs::PermissionsExt,
@@ -4286,8 +4677,10 @@ mod transport_tests {
         };
 
         let _serial = PROCESS_ENVIRONMENT_TEST_LOCK.lock().unwrap();
-        let codex_home = std::env::temp_dir().join(format!(
-            "codex-mux-control-peer-{}-{}",
+        // Unix-domain socket paths are commonly limited to 108 bytes. Keep
+        // this fixture independent of a caller's potentially long TMPDIR.
+        let codex_home = PathBuf::from("/tmp").join(format!(
+            "cmux-peer-{}-{}",
             std::process::id(),
             unix_seconds(SystemTime::now())
         ));
@@ -4531,7 +4924,7 @@ mod transport_tests {
     }
 
     #[test]
-    fn unhealthy_worker_exits_after_one_cooldown() {
+    fn unhealthy_worker_remains_restartable_until_stopped() {
         struct UnhealthyNamer;
         impl ConversationNamer for UnhealthyNamer {
             fn read(&mut self, _: &NamingTarget) -> Result<NamingConversation> {
@@ -4555,11 +4948,8 @@ mod transport_tests {
             Duration::from_millis(5),
             Duration::from_millis(10),
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !worker.is_finished() && std::time::Instant::now() < deadline {
-            thread::yield_now();
-        }
-        assert!(worker.is_finished());
+        thread::sleep(Duration::from_millis(40));
+        assert!(!worker.is_finished());
         worker.stop();
     }
 
@@ -4596,7 +4986,7 @@ mod transport_tests {
         let target = target_created_at(0);
         let retry_interval = Duration::from_millis(40);
         let worker = NamingWorker::spawn_with_retry_intervals(
-            move |_| Ok(FailingNamer(observed)),
+            move |_| Ok(FailingNamer(observed.clone())),
             move |_| Ok(vec![target.clone()]),
             Duration::from_millis(1),
             Duration::from_millis(10),
@@ -4643,7 +5033,7 @@ mod transport_tests {
         let observed = attempts.clone();
         let target = target_created_at(0);
         let worker = NamingWorker::spawn_with_retry_intervals(
-            move |_| Ok(PendingNamer(observed)),
+            move |_| Ok(PendingNamer(observed.clone())),
             move |_| Ok(vec![target.clone()]),
             Duration::from_millis(1),
             Duration::from_millis(10),
@@ -4704,8 +5094,8 @@ mod transport_tests {
         let worker = NamingWorker::spawn_with_intervals(
             move |_| {
                 Ok(EvidenceNamer {
-                    reads: observed_reads,
-                    names: observed_names,
+                    reads: observed_reads.clone(),
+                    names: observed_names.clone(),
                 })
             },
             move || Ok(vec![target.clone()]),
@@ -4787,7 +5177,7 @@ mod transport_tests {
         let target = target_created_at(0);
         let refresh_interval = Duration::from_millis(40);
         let worker = NamingWorker::spawn_with_intervals(
-            move |_| Ok(SuccessfulNamer(observed)),
+            move |_| Ok(SuccessfulNamer(observed.clone())),
             move || Ok(vec![target.clone()]),
             Duration::from_millis(1),
             refresh_interval,
@@ -4830,7 +5220,7 @@ mod transport_tests {
         let target = target_created_at(0);
         let retry_interval = Duration::from_millis(40);
         let worker = NamingWorker::spawn_with_intervals(
-            move |_| Ok(StaleNamer(observed)),
+            move |_| Ok(StaleNamer(observed.clone())),
             move || Ok(vec![target.clone()]),
             Duration::from_millis(1),
             Duration::from_millis(10),
@@ -4873,7 +5263,7 @@ mod transport_tests {
         let observed_discovery = first_discovery.clone();
         let retry_interval = Duration::from_millis(40);
         let worker = NamingWorker::spawn_with_intervals(
-            move |_| Ok(SuccessfulNamer(observed)),
+            move |_| Ok(SuccessfulNamer(observed.clone())),
             move || {
                 let call = discovery_calls.fetch_add(1, Ordering::SeqCst);
                 if call % 2 == 0 {
@@ -4980,6 +5370,114 @@ mod transport_tests {
             message.pointer("/params/threadId").and_then(Value::as_str) != Some("other")
         });
         assert_eq!(pending, VecDeque::from([json!({"id": 7, "result": {}})]));
+    }
+
+    #[test]
+    fn abandoned_and_unclaimed_shared_completions_remain_bounded_without_poisoning_waiters() {
+        let mut notifications = NotificationState::default();
+        for index in 0..300 {
+            let thread_id = format!("abandoned-{index}");
+            notifications.abandon_thread(&thread_id);
+            assert!(
+                notifications
+                    .route(
+                        "turn/completed",
+                        &thread_id,
+                        json!({"method": "turn/completed", "params": {"threadId": thread_id}}),
+                    )
+                    .is_none()
+            );
+        }
+        assert!(notifications.pending.is_empty());
+        assert!(notifications.abandoned_threads.is_empty());
+
+        for index in 0..100 {
+            let thread_id = format!("early-{index}");
+            notifications.route(
+                "turn/completed",
+                &thread_id,
+                json!({"method": "turn/completed", "params": {"threadId": thread_id}}),
+            );
+        }
+        assert_eq!(notifications.pending.len(), 64);
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        notifications
+            .waiters
+            .insert(("turn/completed".to_owned(), "active".to_owned()), sender);
+        let (waiter, message) = notifications
+            .route(
+                "turn/completed",
+                "active",
+                json!({"method": "turn/completed", "params": {"threadId": "active"}}),
+            )
+            .expect("active waiter remains routable");
+        waiter.send(Ok(message)).unwrap();
+        assert!(receiver.recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn shared_stderr_drain_consumes_more_than_pipe_capacity() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let drain = thread::spawn(move || drain_app_server_stderr(reader));
+        writer.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+        drop(writer);
+        drain.join().unwrap();
+    }
+
+    #[test]
+    fn worker_restarts_an_unhealthy_provider_and_resumes_publication() {
+        struct RestartNamer {
+            healthy: bool,
+        }
+        impl ConversationNamer for RestartNamer {
+            fn resolve(&mut self, target: &NamingTarget) -> Result<String> {
+                Ok(target.thread_hint.clone())
+            }
+
+            fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+                if !self.healthy {
+                    return Err(protocol("injected unhealthy provider"));
+                }
+                Ok(NamingConversation {
+                    thread_id: target.thread_hint.clone(),
+                    transcript: "completed conversation".to_owned(),
+                    activity: String::new(),
+                })
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                Ok("Recovered provider".to_owned())
+            }
+
+            fn is_healthy(&self) -> bool {
+                self.healthy
+            }
+        }
+
+        let starts = Arc::new(AtomicU64::new(0));
+        let observed_starts = starts.clone();
+        let target = target_created_at(unix_seconds(SystemTime::now()));
+        let worker = NamingWorker::spawn_with_retry_intervals(
+            move |_| {
+                Ok(RestartNamer {
+                    healthy: observed_starts.fetch_add(1, Ordering::SeqCst) > 0,
+                })
+            },
+            move |_| Ok(vec![target.clone()]),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            None,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while worker.names().lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(worker.names().lock().unwrap().len(), 1);
+        worker.stop();
     }
 
     #[test]

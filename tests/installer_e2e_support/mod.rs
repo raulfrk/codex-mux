@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "../packaged_gate.rs"]
+mod packaged_gate;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -70,6 +73,9 @@ impl Drop for Scratch {
 
 pub fn packaged_binary() -> Option<PathBuf> {
     let Some(path) = std::env::var_os("CODEX_MUX_E2E_BINARY").map(PathBuf::from) else {
+        packaged_gate::missing_binary_is_allowed(
+            std::env::var("CODEX_MUX_REQUIRE_PACKAGED_E2E").as_deref() == Ok("1"),
+        );
         eprintln!(
             "CODEX_MUX_E2E_BINARY is unset; skipping packaged installer E2E (scripts/e2e.sh supplies it)"
         );
