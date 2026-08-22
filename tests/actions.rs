@@ -110,6 +110,9 @@ fn pane(id: &str, path: &str) -> Pane {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
 
         manual_name_source: None,
@@ -513,6 +516,45 @@ fn unpin_restores_retained_thread_and_requests_immediate_naming() {
             .iter()
             .any(|arg| arg.to_string_lossy().contains("@codex_mux_name_now"))
     );
+}
+
+#[test]
+fn explicit_auto_name_request_sets_only_guarded_privacy_safe_markers() {
+    let runner = RecordingRunner::with_outputs([ok(), operation_marker()]);
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+    let selected = pane("%120", "/work/project");
+
+    actions.request_auto_name(&selected).unwrap();
+
+    let commands = runner.commands();
+    assert_eq!(commands.len(), 2);
+    let mutation = commands[0]
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(mutation.contains("#{pane_pid},100"));
+    assert!(mutation.contains("#{session_id},$9"));
+    assert!(mutation.contains("@codex_mux_name_now 1"));
+    assert!(mutation.contains("@codex_mux_auto_name_status queued"));
+    assert!(mutation.contains("@codex_mux_auto_name_started"));
+    assert!(mutation.contains("@codex_mux_auto_name_token"));
+    assert!(!mutation.contains("/opt/codex/bin/codex"));
+    assert_eq!(
+        &commands[1][4],
+        &OsString::from("@codex_mux_auto_name_token")
+    );
+}
+
+#[test]
+fn explicit_auto_name_request_rejects_a_replaced_pane() {
+    let runner = RecordingRunner::with_outputs([ok(), stdout("different-token\n")]);
+    let executable = CodexExecutable::new("/opt/codex/bin/codex").unwrap();
+    let error = TmuxActions::new(&runner, &executable)
+        .request_auto_name(&pane("%121", "/work/project"))
+        .unwrap_err();
+    assert!(error.to_string().contains("pane changed"));
 }
 
 #[test]

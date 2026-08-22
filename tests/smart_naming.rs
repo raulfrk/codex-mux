@@ -180,6 +180,7 @@ fn verified_rollout_resolves_without_cwd_and_recovers_when_app_server_is_unavail
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
 
     let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
@@ -248,6 +249,7 @@ fn verified_rollout_survives_provider_exit_during_archive_cross_check() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
     let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
     assert_eq!(conversation.thread_id, full);
@@ -281,6 +283,7 @@ fn verified_rollout_prefix_ambiguity_fails_closed() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
 
     assert!(
@@ -321,6 +324,7 @@ fn response_only_rollout_uses_visible_assistant_without_contextual_user_fragment
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
     let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
     assert!(
@@ -362,6 +366,7 @@ fn rollout_and_app_server_prefix_collision_fails_closed() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
     assert!(
         ConversationNamer::read(&mut namer, &target)
@@ -397,6 +402,7 @@ fn unhealthy_provider_cannot_hide_a_cross_source_collision() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
     assert!(
         ConversationNamer::read(&mut namer, &target)
@@ -503,6 +509,7 @@ fn multi_cursor_thread_list_cycle_fails_closed() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
     let error = ConversationNamer::read(&mut AppServerNamer::new(session), &target).unwrap_err();
     assert!(error.to_string().contains("repeated its pagination cursor"));
@@ -528,6 +535,7 @@ fn rollout_store_rejects_symlinked_and_writable_trees() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
     let mut linked_namer =
         AppServerNamer::new(UnavailableSession).with_rollouts(RolloutStore::at(linked));
@@ -572,6 +580,7 @@ fn wide_rollout_tree_still_detects_prefix_ambiguity() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
     assert!(
         ConversationNamer::read(&mut namer, &target)
@@ -644,6 +653,7 @@ fn resolves_one_truncated_thread_across_pages_after_cwd_changes() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
 
     let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
@@ -689,6 +699,7 @@ fn resolves_external_truncated_thread_after_state_db_miss() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
 
     let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
@@ -721,6 +732,7 @@ fn external_fallback_rejects_an_ambiguous_uuid_prefix() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
 
     assert!(
@@ -756,6 +768,7 @@ fn external_fallback_rejects_a_state_and_archive_prefix_collision() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
 
     assert!(
@@ -786,6 +799,7 @@ fn ambiguous_truncated_thread_fails_closed() {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     };
 
     assert!(
@@ -807,6 +821,9 @@ fn pane_target_retains_truncated_title_and_exact_cwd() {
         generated_source_stable: true,
         generated_at_unix: Some(1_700_000_000),
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
 
         manual_name_source: None,
@@ -850,6 +867,9 @@ fn pane_target_rejects_prefixes_too_short_for_uuid_timestamp() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
 
         manual_name_source: None,
@@ -891,6 +911,9 @@ fn pane_target_rejects_a_manual_uuid_shaped_title() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: true,
 
         manual_name_source: None,
@@ -926,6 +949,9 @@ fn source_less_unpin_waits_for_a_changed_exact_thread_title() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: true,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
         manual_name_source: None,
         manual_name_pid: None,
@@ -957,6 +983,9 @@ fn source_less_unpin_does_not_trim_its_unchanged_manual_title_into_an_identity()
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
         manual_name_source: None,
         manual_name_pid: None,
@@ -1086,6 +1115,7 @@ fn target(pane: &str, thread: &str) -> NamingTarget {
         generated_name: None,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_token: None,
     }
 }
 
@@ -1216,10 +1246,11 @@ fn parallel_worker_forces_fresh_discovery_before_publication() {
 fn worker_is_non_blocking_deduplicates_and_joins_on_stop() {
     let reads = Arc::new(AtomicUsize::new(0));
     let names = Arc::new(AtomicUsize::new(0));
-    let current = Arc::new(Mutex::new(vec![
-        target("%1", "01999999-1111-7777-8888-123456789abc"),
-        target("%4", "01999999-1111-7777-8888-123456789abc"),
-    ]));
+    let mut first = target("%1", "01999999-1111-7777-8888-123456789abc");
+    first.auto_name_token = Some("request-one".to_owned());
+    let mut second = target("%4", "01999999-1111-7777-8888-123456789abc");
+    second.auto_name_token = Some("request-two".to_owned());
+    let current = Arc::new(Mutex::new(vec![first, second]));
     let discovered = current.clone();
     let provider_names = names.clone();
     let worker = NamingWorker::spawn(
@@ -1263,12 +1294,30 @@ fn worker_is_non_blocking_deduplicates_and_joins_on_stop() {
             .map(|generated| generated.name.as_str()),
         Some("Useful generated name")
     );
+    assert_eq!(
+        worker
+            .names()
+            .lock()
+            .unwrap()
+            .get(&PaneId::new("%1").unwrap())
+            .and_then(|generated| generated.auto_name_token.as_deref()),
+        Some("request-one")
+    );
     assert!(
         worker
             .names()
             .lock()
             .unwrap()
             .contains_key(&PaneId::new("%4").unwrap())
+    );
+    assert_eq!(
+        worker
+            .names()
+            .lock()
+            .unwrap()
+            .get(&PaneId::new("%4").unwrap())
+            .and_then(|generated| generated.auto_name_token.as_deref()),
+        Some("request-two")
     );
     worker.stop();
 }
@@ -1429,6 +1478,79 @@ fn immediate_resume_marker_bypasses_a_fresh_generated_title_cooldown() {
     wait_until("the resumed pane to bypass the refresh cooldown", || {
         reads.load(Ordering::SeqCst) == 1
     });
+    worker.stop();
+}
+
+#[test]
+fn explicit_force_token_bypasses_attempt_and_name_caches() {
+    let thread_id = "01999999-1111-7777-8888-123456789abc";
+    let reads = Arc::new(AtomicUsize::new(0));
+    let names = Arc::new(AtomicUsize::new(0));
+    let current = Arc::new(Mutex::new(vec![target("%1", thread_id)]));
+    let discovered = current.clone();
+    let observed_names = names.clone();
+    let observed_reads = reads.clone();
+    let worker = NamingWorker::spawn(
+        move |_| {
+            Ok(CountingNamer {
+                reads: observed_reads,
+                names: observed_names,
+                delay: Duration::ZERO,
+            })
+        },
+        move || Ok(discovered.lock().unwrap().clone()),
+        Duration::from_millis(10),
+    );
+    wait_until("the initial cached naming attempt", || {
+        names.load(Ordering::SeqCst) == 1
+    });
+
+    let mut forced = target("%1", thread_id);
+    forced.generated_name = Some("Useful generated name".to_owned());
+    forced.generated_at_unix = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    forced.immediate_naming = true;
+    forced.auto_name_token = Some("new-request".to_owned());
+    *current.lock().unwrap() = vec![forced];
+    worker.trigger();
+
+    wait_until("the explicit request to publish its causal token", || {
+        worker
+            .names()
+            .lock()
+            .unwrap()
+            .get(&PaneId::new("%1").unwrap())
+            .and_then(|generated| generated.auto_name_token.as_deref())
+            == Some("new-request")
+    });
+    assert_eq!(names.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        worker
+            .names()
+            .lock()
+            .unwrap()
+            .get(&PaneId::new("%1").unwrap())
+            .and_then(|generated| generated.auto_name_token.as_deref()),
+        Some("new-request")
+    );
+
+    let mut scheduled = target("%1", thread_id);
+    scheduled.generated_name = Some("Useful generated name".to_owned());
+    scheduled.generated_at_unix = Some(0);
+    *current.lock().unwrap() = vec![scheduled];
+    worker.trigger();
+    wait_until("the subsequent ordinary refresh", || {
+        reads.load(Ordering::SeqCst) == 3
+    });
+    assert_eq!(
+        names.load(Ordering::SeqCst),
+        2,
+        "a completed force token leaked into an ordinary refresh"
+    );
     worker.stop();
 }
 

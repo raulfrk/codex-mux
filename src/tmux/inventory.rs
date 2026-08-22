@@ -12,12 +12,13 @@ use std::os::unix::ffi::OsStringExt;
 use crate::{
     MuxError, Result,
     domain::{
-        CodexExecutable, Pane, PaneId, PaneProcess, ProcessInspector, SessionId, TmuxCommandRunner,
+        AutoNameStatus, CodexExecutable, Pane, PaneId, PaneProcess, ProcessInspector, SessionId,
+        TmuxCommandRunner,
     },
 };
 const FIELD_SEPARATOR: u8 = 0x1f;
 const ESCAPED_FIELD_SEPARATOR: &[u8] = b"\\037";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_manual_name_source}\x1f#{@codex_mux_manual_name_pid}\x1f#{@codex_mux_manual_name_session}\x1f#{@codex_mux_unpin_waiting}\x1f#{@codex_mux_unpin_waiting_title}\x1f#{@codex_mux_unpin_waiting_pid}\x1f#{@codex_mux_unpin_waiting_session}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_pid}\x1f#{@codex_mux_generated_source_session}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_id}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_pid}\x1f#{pane_tty}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_manual_name_source}\x1f#{@codex_mux_manual_name_pid}\x1f#{@codex_mux_manual_name_session}\x1f#{@codex_mux_unpin_waiting}\x1f#{@codex_mux_unpin_waiting_title}\x1f#{@codex_mux_unpin_waiting_pid}\x1f#{@codex_mux_unpin_waiting_session}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_pid}\x1f#{@codex_mux_generated_source_session}\x1f#{@codex_mux_auto_name_status}\x1f#{@codex_mux_auto_name_started}\x1f#{@codex_mux_auto_name_token}";
 
 /// Discovers Codex panes through injectable tmux and process boundaries.
 pub struct PaneInventory<R, I> {
@@ -136,6 +137,9 @@ where
                 generated_source_stable,
                 generated_at_unix,
                 immediate_naming: record.immediate_naming,
+                auto_name_status: record.auto_name_status,
+                auto_name_started_at_unix_nanos: record.auto_name_started_at_unix_nanos,
+                auto_name_token: nonempty_title(record.auto_name_token),
                 manual_name: record.manual_name,
                 manual_name_source: nonempty_title(record.manual_name_source),
                 manual_name_pid: record.manual_name_pid,
@@ -228,6 +232,9 @@ struct TmuxPaneRecord {
     generated_source_title: String,
     generated_source_pid: Option<u32>,
     generated_source_session: Option<String>,
+    auto_name_status: Option<AutoNameStatus>,
+    auto_name_started_at_unix_nanos: Option<u64>,
+    auto_name_token: String,
 }
 
 impl TmuxPaneRecord {
@@ -236,7 +243,7 @@ impl TmuxPaneRecord {
             return None;
         }
         let fields = split_fields(line);
-        if !matches!(fields.len(), 11..=24) {
+        if !matches!(fields.len(), 11..=27) {
             return None;
         }
 
@@ -309,6 +316,19 @@ impl TmuxPaneRecord {
             generated_source_session: fields
                 .get(23)
                 .map(|field| String::from_utf8_lossy(field).into_owned()),
+            auto_name_status: fields.get(24).and_then(|field| match *field {
+                b"recovering" => Some(AutoNameStatus::RecoveringIdentity),
+                b"queued" => Some(AutoNameStatus::Queued),
+                b"generating" => Some(AutoNameStatus::Generating),
+                b"success" => Some(AutoNameStatus::Succeeded),
+                _ => None,
+            }),
+            auto_name_started_at_unix_nanos: fields
+                .get(25)
+                .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok()),
+            auto_name_token: fields.get(26).map_or_else(String::new, |field| {
+                String::from_utf8_lossy(field).into_owned()
+            }),
         })
     }
 
@@ -413,6 +433,7 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{TmuxPaneRecord, matches_executable};
+    use crate::domain::AutoNameStatus;
     use std::{ffi::OsStr, path::Path};
 
     #[test]
@@ -438,6 +459,18 @@ mod tests {
         assert_eq!(record.current_path, Path::new("/work/project"));
         assert_eq!(record.command, OsStr::new("codex"));
         assert_eq!(record.pane_pid, 42);
+    }
+
+    #[test]
+    fn parser_accepts_privacy_safe_auto_name_progress() {
+        let record = TmuxPaneRecord::parse(
+            b"%1\x1f$1\x1f@1\x1fmain\x1fthread\x1f/work/project\x1fcodex\x1f42\x1f/dev/pts/1\x1f\x1f\x1f\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1fgenerating\x1f1700000000\x1frequest-token",
+        )
+        .expect("auto-name progress record should parse");
+
+        assert_eq!(record.auto_name_status, Some(AutoNameStatus::Generating));
+        assert_eq!(record.auto_name_started_at_unix_nanos, Some(1_700_000_000));
+        assert_eq!(record.auto_name_token, "request-token");
     }
 
     #[test]

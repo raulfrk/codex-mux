@@ -110,6 +110,12 @@ pub struct Pane {
     /// A pane-local request to refresh its smart title without waiting for the
     /// normal refresh interval.
     pub immediate_naming: bool,
+    /// Progress for an explicit forced automatic-name request.
+    pub auto_name_status: Option<AutoNameStatus>,
+    /// Unix timestamp in nanoseconds when the explicit automatic-name request began.
+    pub auto_name_started_at_unix_nanos: Option<u64>,
+    /// Opaque identity of the active explicit automatic-name request.
+    pub auto_name_token: Option<String>,
     /// A user-owned pane title that Smart Naming must never replace.
     pub manual_name: bool,
     /// Original Codex thread title retained while a pane is manually named.
@@ -134,6 +140,19 @@ pub struct Pane {
     pub pane_pid: u32,
     /// Current working directory exposed by tmux.
     pub current_path: PathBuf,
+}
+
+/// Privacy-safe progress exposed for an explicit automatic-name request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoNameStatus {
+    /// Waiting for the pane to expose a trustworthy conversation identity.
+    RecoveringIdentity,
+    /// Exact identity is available and the naming worker has been woken.
+    Queued,
+    /// The worker accepted the request and is resolving or naming the conversation.
+    Generating,
+    /// Fresh generated metadata was written for the guarded pane identity.
+    Succeeded,
 }
 
 impl Pane {
@@ -350,6 +369,9 @@ mod tests {
             generated_source_stable: false,
             generated_at_unix: None,
             immediate_naming: false,
+            auto_name_status: None,
+            auto_name_started_at_unix_nanos: None,
+            auto_name_token: None,
             manual_name: false,
 
             manual_name_source: None,

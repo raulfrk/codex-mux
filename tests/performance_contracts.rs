@@ -171,6 +171,9 @@ fn unzoomed_switch_uses_two_exact_tmux_requests() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
 
         manual_name_source: None,

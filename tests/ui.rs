@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use codex_mux::{
     config::{LaunchProfile, PermissionPreset},
-    domain::{Pane, PaneId, SessionId, ThemeId},
+    domain::{AutoNameStatus, Pane, PaneId, SessionId, ThemeId},
     ui::{Action, App, ColorPolicy, render},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,6 +19,9 @@ fn pane(id: &str, title: &str, path: &str) -> Pane {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
 
         manual_name_source: None,
@@ -191,6 +194,62 @@ fn rename_prompt_initial_c_clears_and_empty_enter_unpins_without_a_global_key() 
     app.handle_key(key(KeyCode::Char('c')));
     app.handle_key(key(KeyCode::Char('c')));
     assert!(rendered_app(&app, 100, 30).contains("Name  c"));
+}
+
+#[test]
+fn ctrl_r_requests_auto_name_only_when_smart_naming_is_enabled() {
+    let selected = pane("%7", "project session", "/work/project");
+    let mut disabled = App::new(vec![selected.clone()], ThemeId::default(), None);
+    disabled.handle_key(key(KeyCode::Char('R')));
+    assert_eq!(
+        disabled.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        None
+    );
+    assert!(rendered_app(&disabled, 100, 30).contains("Enable Smart Naming"));
+
+    let mut enabled = App::with_settings(
+        vec![selected],
+        ThemeId::default(),
+        None,
+        ColorPolicy::Allow,
+        vec![LaunchProfile::standard(), LaunchProfile::yolo()],
+        true,
+    );
+    enabled.handle_key(key(KeyCode::Char('R')));
+    assert_eq!(
+        enabled.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        Some(Action::AutoName(PaneId::new("%7").unwrap()))
+    );
+    assert!(rendered_app(&enabled, 100, 30).contains("Ctrl+R auto-name"));
+}
+
+#[test]
+fn auto_name_progress_survives_modal_close_and_reopen() {
+    let mut selected = pane("%7", "project session", "/work/project");
+    selected.immediate_naming = true;
+    selected.auto_name_status = Some(AutoNameStatus::Queued);
+    selected.auto_name_started_at_unix_nanos = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .try_into()
+            .unwrap(),
+    );
+    let mut app = App::with_settings(
+        vec![selected],
+        ThemeId::default(),
+        None,
+        ColorPolicy::Allow,
+        vec![LaunchProfile::standard(), LaunchProfile::yolo()],
+        true,
+    );
+    app.handle_key(key(KeyCode::Char('R')));
+    assert!(rendered_app(&app, 100, 30).contains("AUTO-NAMING · queued"));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(rendered_app(&app, 100, 30).contains("AUTO-NAMING · queued"));
+    app.handle_key(key(KeyCode::Char('R')));
+    assert!(rendered_app(&app, 100, 30).contains("AUTO-NAMING · queued"));
 }
 
 #[test]

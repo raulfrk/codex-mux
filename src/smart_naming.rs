@@ -564,6 +564,8 @@ pub struct NamingTarget {
     pub generated_at_unix: Option<u64>,
     /// A pane-local Resume request that should bypass a prior successful refresh cooldown.
     pub immediate_naming: bool,
+    /// Opaque identity of the explicit force-name request observed at discovery.
+    pub auto_name_token: Option<String>,
 }
 
 impl NamingTarget {
@@ -593,6 +595,7 @@ impl NamingTarget {
             generated_name: pane.generated_title.clone(),
             generated_at_unix: pane.generated_at_unix,
             immediate_naming: pane.immediate_naming,
+            auto_name_token: pane.auto_name_token.clone(),
         })
     }
 
@@ -613,6 +616,7 @@ impl NamingTarget {
             generated_name: pane.generated_title.clone(),
             generated_at_unix: pane.generated_at_unix,
             immediate_naming: pane.immediate_naming,
+            auto_name_token: pane.auto_name_token.clone(),
         })
     }
 }
@@ -1065,6 +1069,8 @@ pub struct GeneratedName {
     pub name: String,
     /// Unix timestamp persisted with the pane-local title.
     pub generated_at_unix: u64,
+    /// Explicit force-name request observed before this naming attempt began.
+    pub auto_name_token: Option<String>,
 }
 
 /// In-memory generated names published by the worker; conversation text is never stored here.
@@ -1307,6 +1313,10 @@ impl NamingWorker {
                         CommandSignal::None => {}
                     }
                     let now = unix_seconds(SystemTime::now());
+                    let initial_auto_name_tokens = targets
+                        .iter()
+                        .map(|target| (target.pane_id.clone(), target.auto_name_token.clone()))
+                        .collect::<HashMap<_, _>>();
                     let Some(due_target) = targets.iter().find(|target| naming_is_due(target, now))
                     else {
                         continue;
@@ -1354,8 +1364,11 @@ impl NamingWorker {
                     }
                     let thread_id = conversation.thread_id.clone();
                     let fingerprint = transcript_fingerprint(&conversation.transcript);
+                    let force_refresh = targets
+                        .iter()
+                        .any(|target| target.auto_name_token.is_some());
                     let name = if let Some((cached, name)) = cache.get(&thread_id) {
-                        if *cached == fingerprint {
+                        if !force_refresh && *cached == fingerprint {
                             name.clone()
                         } else {
                             let name = match namer.name(&conversation) {
@@ -1448,6 +1461,10 @@ impl NamingWorker {
                                     source_cwd: target.cwd.clone(),
                                     name: name.clone(),
                                     generated_at_unix: now,
+                                    auto_name_token: initial_auto_name_tokens
+                                        .get(&target.pane_id)
+                                        .cloned()
+                                        .flatten(),
                                 },
                             );
                             published_any = true;
@@ -1557,7 +1574,7 @@ enum CommandSignal {
     Wake,
 }
 
-type AttemptIdentity = (String, PathBuf, Vec<(PaneId, String, bool)>);
+type AttemptIdentity = (String, PathBuf, Vec<(PaneId, String, bool, Option<String>)>);
 
 fn attempt_identity(identity: &(String, PathBuf), targets: &[NamingTarget]) -> AttemptIdentity {
     let mut panes = targets
@@ -1567,6 +1584,7 @@ fn attempt_identity(identity: &(String, PathBuf), targets: &[NamingTarget]) -> A
                 target.pane_id.clone(),
                 target.pane_title.clone(),
                 target.immediate_naming,
+                target.auto_name_token.clone(),
             )
         })
         .collect::<Vec<_>>();
@@ -3482,6 +3500,9 @@ mod transport_tests {
             generated_source_stable: false,
             generated_at_unix: None,
             immediate_naming: false,
+            auto_name_status: None,
+            auto_name_started_at_unix_nanos: None,
+            auto_name_token: None,
             manual_name: false,
             manual_name_source: None,
             manual_name_pid: None,
@@ -4280,6 +4301,7 @@ mod transport_tests {
             generated_name: None,
             generated_at_unix: None,
             immediate_naming: false,
+            auto_name_token: None,
         }
     }
 

@@ -12,6 +12,7 @@ use crate::{
     domain::{CodexExecutable, CommandOutput, InvocationContext, Pane, PaneId, TmuxCommandRunner},
     launch::{LaunchKind, new_window_arguments, new_window_arguments_with_permissions},
     tmux::owned_names::{
+        AUTO_NAME_STARTED_OPTION, AUTO_NAME_STATUS_OPTION, AUTO_NAME_TOKEN_OPTION,
         IMMEDIATE_NAMING_OPTION, MANUAL_NAME_OPTION, MANUAL_NAME_PID_OPTION,
         MANUAL_NAME_SESSION_OPTION, MANUAL_NAME_SOURCE_OPTION, RENAME_COMPLETE_OPTION,
         UNPIN_COMPLETE_OPTION, UNPIN_READY_OPTION, UNPIN_WAITING_OPTION, UNPIN_WAITING_PID_OPTION,
@@ -304,6 +305,61 @@ where
             pane.id.as_str(),
             UNPIN_COMPLETE_OPTION,
         ]))?;
+        Ok(())
+    }
+
+    /// Guardedly relinquishes manual ownership and requests immediate automatic naming.
+    pub fn request_auto_name(&self, pane: &Pane) -> Result<()> {
+        let recovering_identity = pane.manual_name
+            && pane.manual_name_source.as_deref().is_none_or(|source| {
+                crate::smart_naming::thread_hint(source).is_none()
+                    || pane.manual_name_pid != Some(pane.pane_pid)
+                    || pane.manual_name_session.as_ref() != Some(&pane.session_id)
+            });
+        if pane.manual_name {
+            self.unpin_pane(pane)?;
+        }
+
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u128::from(u64::MAX))
+            .to_string();
+        let token = operation_token();
+        let status = if recovering_identity {
+            "recovering"
+        } else {
+            "queued"
+        };
+        let mutation = format!(
+            "set-option -p -t {pane} {immediate} 1; set-option -p -t {pane} {status_option} {status}; set-option -p -t {pane} {started_option} {started}; set-option -p -t {pane} {token_option} {token}",
+            pane = tmux_quote(pane.id.as_str()),
+            immediate = IMMEDIATE_NAMING_OPTION,
+            status_option = AUTO_NAME_STATUS_OPTION,
+            started_option = AUTO_NAME_STARTED_OPTION,
+            token_option = AUTO_NAME_TOKEN_OPTION,
+            token = tmux_quote(&token),
+        );
+        let condition = format!(
+            "#{{&&:#{{==:#{{pane_pid}},{}}},#{{==:#{{session_id}},{}}}}}",
+            pane.pane_pid,
+            tmux_format_literal(pane.session_id.as_str())
+        );
+        self.run_checked(&os_strings([
+            "if-shell",
+            "-F",
+            "-t",
+            pane.id.as_str(),
+            &condition,
+            &mutation,
+        ]))?;
+        self.require_marker(
+            pane,
+            AUTO_NAME_TOKEN_OPTION,
+            &token,
+            "pane changed before automatic naming could be requested",
+        )?;
         Ok(())
     }
 

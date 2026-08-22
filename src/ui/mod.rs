@@ -2,9 +2,12 @@
 
 pub mod terminal;
 
-use std::cmp;
+use std::{
+    cmp,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -17,11 +20,12 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config::{LaunchProfile, PermissionPreset, validate_profiles},
-    domain::{Pane, PaneId, TerminalSize, ThemeId},
+    domain::{AutoNameStatus, Pane, PaneId, TerminalSize, ThemeId},
     theme::{Theme, theme},
 };
 
 const MAX_MANUAL_TITLE_CHARS: usize = 80;
+const AUTO_NAME_DEADLINE_SECS: u64 = 90;
 
 /// Responsive rendering profile selected from the terminal dimensions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +75,8 @@ pub enum Action {
     Rename(PaneId, String),
     /// Remove manual ownership and resume Smart Naming for the selected pane.
     Unpin(PaneId),
+    /// Relinquish manual ownership and request an immediate automatic name.
+    AutoName(PaneId),
     /// Persist a theme chosen in the live-preview picker.
     PersistTheme(ThemeId),
     /// Leave the popup without changing tmux state.
@@ -137,6 +143,8 @@ struct ManualRename {
     untouched: bool,
     can_unpin: bool,
     unpin_unavailable_reason: Option<&'static str>,
+    auto_name_status: Option<AutoNameStatus>,
+    auto_name_started_at_unix_nanos: Option<u64>,
 }
 
 impl ManualRename {
@@ -148,6 +156,8 @@ impl ManualRename {
             untouched: true,
             can_unpin: pane.manual_name,
             unpin_unavailable_reason: None,
+            auto_name_status: pane.auto_name_status,
+            auto_name_started_at_unix_nanos: pane.auto_name_started_at_unix_nanos,
         }
     }
 }
@@ -361,6 +371,13 @@ impl App {
         }
     }
 
+    /// Keeps the rename modal open when an automatic-name request cannot start.
+    pub fn auto_name_failed(&mut self, error: impl Into<String>) {
+        if let Mode::ManualRename(editor) = &mut self.mode {
+            editor.error = Some(error.into());
+        }
+    }
+
     /// Returns the panes in their display order.
     #[must_use]
     pub fn panes(&self) -> &[Pane] {
@@ -390,6 +407,15 @@ impl App {
     pub fn replace_panes(&mut self, panes: Vec<Pane>) {
         let old_index = self.selected_index().unwrap_or(0);
         let old_selection = self.selected.clone();
+        if let Mode::ManualRename(editor) = &mut self.mode
+            && let Some(pane) = panes.iter().find(|pane| pane.id == editor.pane_id)
+        {
+            editor.auto_name_status = pane.auto_name_status;
+            editor.auto_name_started_at_unix_nanos = pane.auto_name_started_at_unix_nanos;
+            if pane.auto_name_status == Some(AutoNameStatus::Succeeded) {
+                editor.title = pane.display_title();
+            }
+        }
         self.panes = panes;
         self.selected = old_selection
             .filter(|id| self.panes.iter().any(|pane| &pane.id == id))
@@ -411,7 +437,7 @@ impl App {
         match self.mode.clone() {
             Mode::Browse => self.handle_browse_key(key.code),
             Mode::ConfirmClose(id) => self.handle_confirmation_key(key, id),
-            Mode::ManualRename(editor) => self.handle_manual_rename_key(key.code, editor),
+            Mode::ManualRename(editor) => self.handle_manual_rename_key(key, editor),
             Mode::ThemePicker { original } => self.handle_theme_key(key.code, original),
             Mode::ProfilePicker {
                 selected,
@@ -513,14 +539,22 @@ impl App {
 
     fn handle_manual_rename_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut editor: ManualRename,
     ) -> Option<Action> {
         editor.error = None;
-        match code {
+        match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Browse;
                 return None;
+            }
+            KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.smart_naming {
+                    editor.error = Some("Enable Smart Naming in configuration first".to_owned());
+                } else {
+                    self.mode = Mode::ManualRename(editor.clone());
+                    return Some(Action::AutoName(editor.pane_id));
+                }
             }
             KeyCode::Backspace => {
                 editor.title.pop();
@@ -885,7 +919,13 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
             .saturating_sub(highlight_width + path_indent_width),
     );
     let items = app.panes.iter().map(|pane| {
-        let title = end_elide(&sanitized(&pane.display_title()), title_width);
+        let visible_title =
+            auto_name_badge(pane.auto_name_status, pane.auto_name_started_at_unix_nanos)
+                .map_or_else(
+                    || pane.display_title(),
+                    |badge| format!("{}  {badge}", pane.display_title()),
+                );
+        let title = end_elide(&sanitized(&visible_title), title_width);
         let path = start_elide(&sanitized(&pane.current_path.to_string_lossy()), path_width);
         ListItem::new(vec![
             Line::from(title),
@@ -1095,10 +1135,16 @@ fn render_manual_rename(frame: &mut Frame<'_>, area: Rect, editor: &ManualRename
     if let Some(error) = &editor.error {
         lines.push(Line::styled(sanitized(error), palette.warning));
     } else {
+        if let Some(status) = auto_name_badge(
+            editor.auto_name_status,
+            editor.auto_name_started_at_unix_nanos,
+        ) {
+            lines.push(Line::styled(status, palette.accent));
+        }
         let help = if editor.can_unpin {
-            "c clear · empty Enter unpin · Esc cancel"
+            "Ctrl+R auto-name · c clear · empty Enter unpin · Esc close"
         } else {
-            "c clear · Enter save · Esc cancel"
+            "Ctrl+R auto-name · c clear · Enter save · Esc close"
         };
         lines.push(Line::styled(help, palette.muted));
         if let Some(reason) = editor.unpin_unavailable_reason {
@@ -1116,6 +1162,33 @@ fn render_manual_rename(frame: &mut Frame<'_>, area: Rect, editor: &ManualRename
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+fn auto_name_badge(status: Option<AutoNameStatus>, started: Option<u64>) -> Option<String> {
+    let status = status?;
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let elapsed_nanos = started.map(|started| now_nanos.saturating_sub(u128::from(started)));
+    let timed_out = elapsed_nanos
+        .is_some_and(|elapsed| elapsed >= Duration::from_secs(AUTO_NAME_DEADLINE_SECS).as_nanos());
+    if status == AutoNameStatus::Succeeded && timed_out {
+        return None;
+    }
+    if timed_out && status != AutoNameStatus::Succeeded {
+        return Some("AUTO-NAME FAILED · timed out".to_owned());
+    }
+    let spinner =
+        ["◐", "◓", "◑", "◒"][((now_nanos / Duration::from_millis(250).as_nanos()) as usize) % 4];
+    Some(match status {
+        AutoNameStatus::RecoveringIdentity => {
+            format!("{spinner} AUTO-NAMING · recovering identity")
+        }
+        AutoNameStatus::Queued => format!("{spinner} AUTO-NAMING · queued"),
+        AutoNameStatus::Generating => format!("{spinner} AUTO-NAMING · generating"),
+        AutoNameStatus::Succeeded => "✓ AUTO-NAMED".to_owned(),
+    })
 }
 
 fn validate_manual_title(title: &str) -> std::result::Result<String, &'static str> {
@@ -1278,6 +1351,9 @@ mod tests {
             generated_source_stable: false,
             generated_at_unix: None,
             immediate_naming: false,
+            auto_name_status: None,
+            auto_name_started_at_unix_nanos: None,
+            auto_name_token: None,
             manual_name: false,
 
             manual_name_source: None,

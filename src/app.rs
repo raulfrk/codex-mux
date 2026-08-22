@@ -842,6 +842,24 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
                     minimum_refresh_generation = minimum_refresh_generation.saturating_add(1);
                     refresh_worker.request(minimum_refresh_generation);
                 }
+                Action::AutoName(id) => {
+                    let pane = app
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.id == id)
+                        .cloned()
+                        .ok_or_else(|| MuxError::Command("selected pane disappeared".to_owned()))?;
+                    match ensure_naming_daemon(&process)
+                        .and_then(|()| actions.request_auto_name(&pane))
+                    {
+                        Ok(()) => {
+                            minimum_refresh_generation =
+                                minimum_refresh_generation.saturating_add(1);
+                            refresh_worker.request(minimum_refresh_generation);
+                        }
+                        Err(error) => app.auto_name_failed(error.to_string()),
+                    }
+                }
                 Action::PersistTheme(theme) => theme_store.save(theme)?,
                 Action::Quit => return Ok(()),
             }
@@ -1131,6 +1149,7 @@ fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
             .clone();
         if names != applied_names || last_name_reconcile.elapsed() >= Duration::from_secs(2) {
             let panes = verification_inventory.discover().unwrap_or_default();
+            owned_names.mark_auto_name_generating(&panes);
             let (verified_names, invalid_volatile) =
                 verify_volatile_generated_names(&names, &panes, verification_rollouts.as_ref());
             let stable_names = verified_names
@@ -2070,6 +2089,7 @@ mod tests {
                 source_cwd: PathBuf::from("/work"),
                 name: "Old conversation".to_owned(),
                 generated_at_unix: 1,
+                auto_name_token: None,
             },
         )]);
         let authoritative = HashMap::from([(

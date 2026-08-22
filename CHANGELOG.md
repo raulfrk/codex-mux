@@ -4,6 +4,10 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+### Added
+
+- Add `Ctrl+R` in the Rename flow to request an immediate automatic name with guarded ownership release and recoverable progress, success, and timeout indicators.
+
 ### Fixed
 
 - Retry a bounded, state-bracketed Smart Left composer snapshot when live Max/Ultra redraws move the cursor row during probing, while continuing to fail through on persistent instability.

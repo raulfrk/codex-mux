@@ -121,6 +121,9 @@ fn main() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
         manual_name_source: None,
         manual_name_pid: None,
@@ -202,6 +205,7 @@ fn smart_naming_targets_a_background_pane_format_context() {
             source_cwd: scratch.path().to_owned(),
             name: "Background naming works".to_owned(),
             generated_at_unix: 1_700_000_000,
+            auto_name_token: None,
         },
     )]);
     let owned = OwnedTmuxNames::new(SocketRunner(server.socket().to_owned()));
@@ -316,6 +320,7 @@ fn authoritative_recovery_names_a_pane_while_codex_redraws_its_title() {
             source_cwd: scratch.path().to_owned(),
             name: "Recovered volatile session".to_owned(),
             generated_at_unix: 1_700_000_000,
+            auto_name_token: None,
         },
     )]);
     server.checked(&["select-pane", "-t", &pane, "-T", "⠹ later spinner"]);
@@ -374,6 +379,9 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
         generated_source_stable: true,
         generated_at_unix: Some(1_700_000_000),
         immediate_naming: true,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
 
         manual_name_source: None,
@@ -405,6 +413,7 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
             source_cwd: scratch.path().to_owned(),
             name: "Generated name".to_owned(),
             generated_at_unix: 1_700_000_000,
+            auto_name_token: None,
         },
     )]);
     let runner = SocketRunner(server.socket().to_owned());
@@ -499,6 +508,183 @@ fn manual_pane_rename_relinquishes_smart_naming_ownership_in_real_tmux() {
 }
 
 #[test]
+fn forced_auto_name_progresses_to_success_in_real_tmux() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        return;
+    }
+    let scratch = Scratch::new("forced-auto-name");
+    let config = scratch.join("tmux.conf");
+    fs::write(&config, "set -g status off\n").unwrap();
+    let server = TmuxServer::start(&config, "target", scratch.path());
+    let pane_id = server
+        .checked(&["display-message", "-p", "-t", "target", "#{pane_id}"])
+        .trim()
+        .to_owned();
+    let pane_pid = server
+        .checked(&["display-message", "-p", "-t", &pane_id, "#{pane_pid}"])
+        .trim()
+        .parse()
+        .unwrap();
+    let session_id = SessionId::new(
+        server
+            .checked(&["display-message", "-p", "-t", &pane_id, "#{session_id}"])
+            .trim(),
+    )
+    .unwrap();
+    let thread_id = "12345678-1234-1234-1234-123456789abc";
+    server.checked(&["select-pane", "-t", &pane_id, "-T", thread_id]);
+    let mut pane = Pane {
+        id: PaneId::new(&pane_id).unwrap(),
+        session_id: session_id.clone(),
+        title: Some(thread_id.to_owned()),
+        generated_title: None,
+        generated_thread_id: None,
+        generated_source_stable: false,
+        generated_at_unix: None,
+        immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
+        manual_name: false,
+        manual_name_source: None,
+        manual_name_pid: None,
+        manual_name_pid_raw: String::new(),
+        manual_name_session: None,
+        manual_name_session_raw: String::new(),
+        unpin_waiting: false,
+        unpin_waiting_title: None,
+        unpin_waiting_pid: None,
+        unpin_waiting_session: None,
+        pane_pid,
+        current_path: scratch.path().to_owned(),
+    };
+    let runner = SocketRunner(server.socket().to_owned());
+    let executable = CodexExecutable::new("/bin/true").unwrap();
+    let actions = TmuxActions::new(&runner, &executable);
+    actions.request_auto_name(&pane).unwrap();
+    pane.auto_name_started_at_unix_nanos = Some(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_auto_name_started",
+            ])
+            .trim()
+            .parse::<u64>()
+            .expect("forced request start timestamp"),
+    );
+    pane.auto_name_token = Some(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_auto_name_token",
+            ])
+            .trim()
+            .to_owned(),
+    );
+    assert_eq!(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_auto_name_status",
+            ])
+            .trim(),
+        "queued"
+    );
+
+    pane.immediate_naming = true;
+    pane.auto_name_status = Some(codex_mux::domain::AutoNameStatus::Queued);
+    OwnedTmuxNames::new(runner.clone()).mark_auto_name_generating(std::slice::from_ref(&pane));
+    assert_eq!(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_auto_name_status",
+            ])
+            .trim(),
+        "generating"
+    );
+
+    let request_token = pane.auto_name_token.clone().expect("forced request token");
+    let generated = |auto_name_token: Option<String>| GeneratedName {
+        thread_id: thread_id.to_owned(),
+        source_session: session_id.clone(),
+        source_pane_pid: pane_pid,
+        stable_source_title: true,
+        source_title: thread_id.to_owned(),
+        source_cwd: scratch.path().to_owned(),
+        name: "Project workspace".to_owned(),
+        generated_at_unix: 1_700_000_000,
+        auto_name_token,
+    };
+
+    OwnedTmuxNames::new(runner.clone()).reconcile(&HashMap::from([(
+        pane.id.clone(),
+        generated(Some("superseded-token".to_owned())),
+    )]));
+    assert_eq!(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_auto_name_status",
+            ])
+            .trim(),
+        "generating"
+    );
+    assert_eq!(
+        server
+            .checked(&["show-options", "-pv", "-t", &pane_id, "@codex_mux_name_now",])
+            .trim(),
+        "1"
+    );
+
+    OwnedTmuxNames::new(runner).reconcile(&HashMap::from([(
+        pane.id.clone(),
+        generated(Some(request_token)),
+    )]));
+    assert_eq!(
+        server
+            .checked(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_auto_name_status",
+            ])
+            .trim(),
+        "success"
+    );
+    assert!(
+        !server
+            .run(&[
+                "show-options",
+                "-pv",
+                "-t",
+                &pane_id,
+                "@codex_mux_auto_name_token",
+            ])
+            .status
+            .success(),
+        "a completed force request must clear its causal token"
+    );
+}
+
+#[test]
 fn manual_pane_rename_accepts_an_outside_codex_title_refresh() {
     let _serial = serial_tmux_test();
     if !tools_available() {
@@ -537,6 +723,9 @@ fn manual_pane_rename_accepts_an_outside_codex_title_refresh() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
         manual_name_source: None,
         manual_name_pid: None,
@@ -621,6 +810,9 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
 
         manual_name_source: None,
@@ -690,6 +882,9 @@ fn manual_pane_rename_keeps_tmux_format_syntax_literal_in_real_tmux() {
         generated_source_stable: false,
         generated_at_unix: None,
         immediate_naming: false,
+        auto_name_status: None,
+        auto_name_started_at_unix_nanos: None,
+        auto_name_token: None,
         manual_name: false,
         manual_name_source: None,
         manual_name_pid: None,
