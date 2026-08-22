@@ -6,7 +6,10 @@ use regex::Regex;
 
 use crate::{
     MuxError, Result,
-    domain::{CodexExecutable, CommandOutput, InvocationContext, PaneProcess, TmuxCommandRunner},
+    domain::{
+        CodexExecutable, CommandOutput, InvocationContext, PaneProcess, ProcessMatchIdentity,
+        TmuxCommandRunner,
+    },
     linux_process::LinuxProcessInspector,
     smart_naming::NamingDiagnostics,
 };
@@ -15,6 +18,8 @@ const FIELD_SEPARATOR: char = '\u{1f}';
 const ESCAPED_FIELD_SEPARATOR: &str = "\\037";
 const SHELL_SETTLE_INTERVAL: Duration = Duration::from_millis(30);
 const CODEX_REDRAW_SETTLE_INTERVAL: Duration = Duration::from_millis(30);
+const CODEX_SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const CODEX_SNAPSHOT_ATTEMPTS: usize = 3;
 
 /// Observable result of one Smart Left gesture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,9 +32,21 @@ pub enum SmartLeftOutcome {
 
 /// Exact foreground-process identity required before prefixless interception.
 pub trait DirectCodexInspector {
-    /// Returns true only when the pane foreground includes the configured Codex
-    /// executable itself, never merely an allowlisted wrapper.
+    /// Returns true only when the pane includes a configured Codex process.
     fn is_direct_codex(&self, pane: &PaneProcess) -> Result<bool>;
+
+    /// Returns the stable identity of the configured process matched in the pane.
+    ///
+    /// The default preserves the pre-0.10 implementation contract. The Linux
+    /// runtime overrides it with the exact matched descendant PID/start time.
+    fn direct_codex_identity(&self, pane: &PaneProcess) -> Result<Option<ProcessMatchIdentity>> {
+        self.is_direct_codex(pane).map(|matched| {
+            matched.then_some(ProcessMatchIdentity {
+                pid: pane.pid,
+                start_time: 0,
+            })
+        })
+    }
 
     /// Returns true only for an interactive Bash or Zsh process that is the
     /// pane's exact foreground process.
@@ -38,7 +55,12 @@ pub trait DirectCodexInspector {
 
 impl DirectCodexInspector for LinuxProcessInspector {
     fn is_direct_codex(&self, pane: &PaneProcess) -> Result<bool> {
-        self.pane_process_matches(pane)
+        self.pane_process_match_identity(pane)
+            .map(|identity| identity.is_some())
+    }
+
+    fn direct_codex_identity(&self, pane: &PaneProcess) -> Result<Option<ProcessMatchIdentity>> {
+        self.pane_process_match_identity(pane)
     }
 
     fn is_direct_shell(&self, pid: u32, command: &str) -> Result<bool> {
@@ -57,6 +79,7 @@ enum ComposerBoundary {
     Exact,
     RowRejected,
     CursorRejected,
+    SnapshotUnstable,
 }
 
 /// Injectable delay boundary for deterministic probe tests.
@@ -229,23 +252,26 @@ where
                         Regex::new(expression)
                             .is_ok_and(|regex| regex.is_match(&state.pane_command))
                     });
-                let target = if pane_command_allowed
-                    && self
-                        .inspector
-                        .is_direct_codex(&PaneProcess {
+                let codex_identity = pane_command_allowed
+                    .then(|| {
+                        self.inspector.direct_codex_identity(&PaneProcess {
                             pid: state.pane_pid,
                             tty: state.pane_tty.clone(),
                         })
-                        .unwrap_or(false)
-                {
-                    Some(SmartLeftTarget::Codex)
+                    })
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .flatten();
+                let target = if codex_identity.is_some() {
+                    Some((SmartLeftTarget::Codex, codex_identity))
                 } else if state.shell_prompt
                     && self
                         .inspector
                         .is_direct_shell(state.pane_pid, &state.pane_command)
                         .unwrap_or(false)
                 {
-                    Some(SmartLeftTarget::Shell)
+                    Some((SmartLeftTarget::Shell, None))
                 } else {
                     None
                 };
@@ -256,7 +282,7 @@ where
                         "pane_command_rejected"
                     });
                 }
-                target.map(|target| (state, target))
+                target.map(|(target, identity)| (state, target, identity))
             }
             Ok(state) => {
                 self.event(if state.pane_in_mode {
@@ -272,25 +298,30 @@ where
             }
         };
 
-        let Some((initial, target)) = initial else {
+        let Some((mut initial, target, initial_process_identity)) = initial else {
             self.send_left(context)?;
             return Ok(SmartLeftOutcome::Forwarded);
         };
 
         let boundary_is_exact = match target {
-            SmartLeftTarget::Codex => {
-                match self.composer_boundary(context, initial.cursor_x, initial.cursor_y) {
-                    ComposerBoundary::Exact => true,
-                    ComposerBoundary::RowRejected => {
-                        self.event("composer_row_rejected");
-                        false
-                    }
-                    ComposerBoundary::CursorRejected => {
-                        self.event("composer_cursor_rejected");
-                        false
-                    }
+            SmartLeftTarget::Codex => match self.composer_boundary(context, &initial) {
+                (ComposerBoundary::Exact, stable) => {
+                    initial = stable;
+                    true
                 }
-            }
+                (ComposerBoundary::RowRejected, _) => {
+                    self.event("composer_row_rejected");
+                    false
+                }
+                (ComposerBoundary::CursorRejected, _) => {
+                    self.event("composer_cursor_rejected");
+                    false
+                }
+                (ComposerBoundary::SnapshotUnstable, _) => {
+                    self.event("composer_snapshot_unstable");
+                    false
+                }
+            },
             // Shell prompts may occupy any number of columns. An unchanged
             // immediate post-key observation proves the editing boundary.
             SmartLeftTarget::Shell => true,
@@ -300,9 +331,9 @@ where
             return Ok(SmartLeftOutcome::Forwarded);
         }
 
-        // tmux can finish writing to a shell PTY before Readline/ZLE consumes and
-        // redraws the key. Codex renders synchronously enough for the immediate
-        // check, but shells need this bounded settle to avoid opening mid-line.
+        // tmux can finish writing to a PTY before the application consumes and
+        // redraws the key. Shells always need a bounded settle; Codex gets one
+        // only after an observed state change so its stable fast path stays fast.
         if target == SmartLeftTarget::Shell {
             self.sleeper.sleep(SHELL_SETTLE_INTERVAL);
         }
@@ -325,10 +356,13 @@ where
         }
 
         let still_exact = match target {
-            SmartLeftTarget::Codex => self.inspector.is_direct_codex(&PaneProcess {
-                pid: current.pane_pid,
-                tty: current.pane_tty.clone(),
-            }),
+            SmartLeftTarget::Codex => self
+                .inspector
+                .direct_codex_identity(&PaneProcess {
+                    pid: current.pane_pid,
+                    tty: current.pane_tty.clone(),
+                })
+                .map(|identity| identity == initial_process_identity),
             SmartLeftTarget::Shell => self
                 .inspector
                 .is_direct_shell(current.pane_pid, &current.pane_command),
@@ -338,7 +372,10 @@ where
             self.event("process_changed_after_left");
             return Ok(SmartLeftOutcome::Forwarded);
         }
-        self.open_popup(context)?;
+        if self.open_popup(context).is_err() {
+            self.event("client_context_changed");
+            return Ok(SmartLeftOutcome::Forwarded);
+        }
         self.event("popup_opened");
         Ok(SmartLeftOutcome::Opened)
     }
@@ -357,7 +394,7 @@ where
 
     fn state_format(&self) -> String {
         format!(
-            "#{{pane_pid}}{FIELD_SEPARATOR}#{{pane_tty}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}{FIELD_SEPARATOR}#{{pane_current_command}}{FIELD_SEPARATOR}#{{@codex_mux_shell_prompt}}"
+            "#{{pane_pid}}{FIELD_SEPARATOR}#{{pane_tty}}{FIELD_SEPARATOR}#{{cursor_x}}{FIELD_SEPARATOR}#{{cursor_y}}{FIELD_SEPARATOR}#{{cursor_flag}}{FIELD_SEPARATOR}#{{pane_in_mode}}{FIELD_SEPARATOR}#{{pane_current_command}}{FIELD_SEPARATOR}#{{@codex_mux_shell_prompt}}{FIELD_SEPARATOR}#{{pane_width}}{FIELD_SEPARATOR}#{{pane_height}}{FIELD_SEPARATOR}#{{session_id}}{FIELD_SEPARATOR}#{{window_id}}"
         )
     }
 
@@ -372,6 +409,35 @@ where
     }
 
     fn composer_boundary(
+        &self,
+        context: &InvocationContext,
+        initial: &PaneState,
+    ) -> (ComposerBoundary, PaneState) {
+        // Cursor metadata and captured cells are separate tmux observations.
+        // Reasoning-mode redraws can move the composer between them, so accept
+        // a row only when the same pane/cursor evidence brackets its capture.
+        let mut before = initial.clone();
+        for attempt in 0..CODEX_SNAPSHOT_ATTEMPTS {
+            let boundary =
+                self.capture_composer_boundary(context, before.cursor_x, before.cursor_y);
+            let Ok(after) = self.read_state(context) else {
+                return (ComposerBoundary::SnapshotUnstable, before);
+            };
+            if state_is_unchanged(&before, &after) {
+                return (boundary, after);
+            }
+            if !same_pane_identity(&before, &after) || !after.cursor_visible || after.pane_in_mode {
+                return (ComposerBoundary::SnapshotUnstable, after);
+            }
+            before = after;
+            if attempt + 1 < CODEX_SNAPSHOT_ATTEMPTS {
+                self.sleeper.sleep(CODEX_SNAPSHOT_RETRY_INTERVAL);
+            }
+        }
+        (ComposerBoundary::SnapshotUnstable, before)
+    }
+
+    fn capture_composer_boundary(
         &self,
         context: &InvocationContext,
         cursor_x: u16,
@@ -419,7 +485,7 @@ where
             OsString::from("list-clients"),
             OsString::from("-F"),
             OsString::from(format!(
-                "#{{client_tty}}{FIELD_SEPARATOR}#{{client_width}}{FIELD_SEPARATOR}#{{client_height}}"
+                "#{{client_tty}}{FIELD_SEPARATOR}#{{client_width}}{FIELD_SEPARATOR}#{{client_height}}{FIELD_SEPARATOR}#{{session_id}}{FIELD_SEPARATOR}#{{window_id}}{FIELD_SEPARATOR}#{{pane_id}}"
             )),
         ])?;
         let (width, height) = dimensions
@@ -428,7 +494,12 @@ where
             .filter(|line| !line.is_empty())
             .find_map(|line| {
                 let fields = split_fields(line).ok()?;
-                (fields.len() == 3 && fields[0] == context.client_id.as_str()).then(|| {
+                (fields.len() == 6
+                    && fields[0] == context.client_id.as_str()
+                    && fields[3] == context.session_id.as_str()
+                    && fields[4] == context.window_id.as_str()
+                    && fields[5] == context.pane_id.as_str())
+                .then(|| {
                     Ok((
                         parse_u16(fields[1], "client width")?,
                         parse_u16(fields[2], "client height")?,
@@ -494,6 +565,11 @@ where
             OsString::from("-E"),
             OsString::from("-c"),
             OsString::from(context.client_id.as_str()),
+            // Target both objects explicitly. tmux resolves them independently,
+            // so the popup child performs the authoritative association preflight
+            // before initializing the mux.
+            OsString::from("-t"),
+            OsString::from(context.pane_id.as_str()),
             OsString::from("-d"),
             context.current_path.as_os_str().to_owned(),
             OsString::from("-w"),
@@ -524,10 +600,23 @@ fn state_is_unchanged(initial: &PaneState, observed: &PaneState) -> bool {
         && observed.pane_tty == initial.pane_tty
         && observed.cursor_x == initial.cursor_x
         && observed.cursor_y == initial.cursor_y
+        && observed.pane_width == initial.pane_width
+        && observed.pane_height == initial.pane_height
+        && observed.session_id == initial.session_id
+        && observed.window_id == initial.window_id
         && observed.cursor_visible
         && !observed.pane_in_mode
         && observed.pane_command == initial.pane_command
         && observed.shell_prompt == initial.shell_prompt
+}
+
+fn same_pane_identity(initial: &PaneState, observed: &PaneState) -> bool {
+    observed.pane_pid == initial.pane_pid
+        && observed.pane_tty == initial.pane_tty
+        && observed.pane_command == initial.pane_command
+        && observed.shell_prompt == initial.shell_prompt
+        && observed.session_id == initial.session_id
+        && observed.window_id == initial.window_id
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -540,17 +629,22 @@ struct PaneState {
     pane_in_mode: bool,
     pane_command: String,
     shell_prompt: bool,
+    pane_width: u16,
+    pane_height: u16,
+    session_id: String,
+    window_id: String,
 }
 
 impl PaneState {
     fn parse(output: &[u8]) -> Result<Self> {
         let fields = split_fields(output)?;
-        if fields.len() != 7 && fields.len() != 8 {
+        if fields.len() != 7 && fields.len() != 8 && fields.len() != 12 {
             return Err(MuxError::Command(
                 "tmux returned malformed Smart Left pane state".to_owned(),
             ));
         }
-        let offset = usize::from(fields.len() == 8);
+        let offset = usize::from(fields.len() != 7);
+        let extended = fields.len() == 12;
         Ok(Self {
             pane_pid: parse_u32(fields[0], "pane PID")?,
             pane_tty: if offset == 1 {
@@ -572,6 +666,26 @@ impl PaneState {
                         message: format!("tmux returned {value:?}"),
                     });
                 }
+            },
+            pane_width: if extended {
+                parse_u16(fields[8], "pane width")?
+            } else {
+                0
+            },
+            pane_height: if extended {
+                parse_u16(fields[9], "pane height")?
+            } else {
+                0
+            },
+            session_id: if extended {
+                fields[10].to_owned()
+            } else {
+                String::new()
+            },
+            window_id: if extended {
+                fields[11].to_owned()
+            } else {
+                String::new()
             },
         })
     }
@@ -635,7 +749,7 @@ mod tests {
         Result,
         domain::{
             ClientId, CodexExecutable, CommandOutput, InvocationContext, PaneId, PaneProcess,
-            SessionId, TmuxCommandRunner,
+            ProcessMatchIdentity, SessionId, TmuxCommandRunner,
         },
     };
 
@@ -713,6 +827,36 @@ mod tests {
         )
     }
 
+    fn state_with_geometry(x: u16, y: u16, width: u16, height: u16) -> CommandOutput {
+        output(
+            format!(
+                "42\x1f/dev/pts/7\x1f{x}\x1f{y}\x1f1\x1f0\x1fcodex\x1f0\x1f{width}\x1f{height}\x1f$2\x1f@3\n"
+            )
+            .into_bytes(),
+        )
+    }
+
+    struct SequenceInspector {
+        identities: RefCell<VecDeque<Option<ProcessMatchIdentity>>>,
+    }
+
+    impl DirectCodexInspector for SequenceInspector {
+        fn is_direct_codex(&self, _pane: &PaneProcess) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn direct_codex_identity(
+            &self,
+            _pane: &PaneProcess,
+        ) -> Result<Option<ProcessMatchIdentity>> {
+            Ok(self.identities.borrow_mut().pop_front().unwrap())
+        }
+
+        fn is_direct_shell(&self, _pid: u32, _command: &str) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
     fn shell_state(x: u16, y: u16, prompt: bool) -> CommandOutput {
         output(
             format!(
@@ -774,6 +918,7 @@ mod tests {
         let runner = Runner::with([
             state(5, 10, true, false),
             output(b"not a composer\n"),
+            state(5, 10, true, false),
             output([]),
         ]);
         let sleeper = Sleeper::default();
@@ -809,9 +954,10 @@ mod tests {
         let outputs = vec![
             state(2, 10, true, false),
             output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(2, 10, true, false),
             output([]),
             state(2, 10, true, false),
-            output(b"/dev/pts/8\x1f120\x1f40\n/dev/pts/7\x1f62\x1f35\n".to_vec()),
+            output(b"/dev/pts/8\x1f120\x1f40\x1f$9\x1f@9\x1f%9\n/dev/pts/7\x1f62\x1f35\x1f$2\x1f@3\x1f%4\n".to_vec()),
             output([]),
         ];
         let runner = Runner::with(outputs);
@@ -834,7 +980,7 @@ mod tests {
         assert_eq!(sleeper.calls.get(), 0);
         assert_eq!(sleeper.elapsed.get(), Duration::ZERO);
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 7);
         assert_eq!(
             calls.iter().filter(|call| call[0] == "send-keys").count(),
             1
@@ -851,15 +997,279 @@ mod tests {
     }
 
     #[test]
+    fn composer_snapshot_retries_when_a_redraw_moves_the_cursor_row() {
+        let mut first_screen = [""; 12];
+        first_screen[10] = "not the composer";
+        let mut settled_screen = [""; 12];
+        settled_screen[11] = "› draft";
+        let runner = Runner::with([
+            state(2, 10, true, false),
+            output(format!("{}\n", first_screen.join("\n")).into_bytes()),
+            state(2, 11, true, false),
+            output(format!("{}\n", settled_screen.join("\n")).into_bytes()),
+            state(2, 11, true, false),
+            output([]),
+            state(2, 11, true, false),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n".to_vec()),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        let outcome = probe(
+            &runner,
+            &Inspector {
+                codex: true,
+                shell: false,
+            },
+            &sleeper,
+            &codex,
+        )
+        .run(&context())
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SmartLeftOutcome::Opened,
+            "{:?}",
+            runner.calls.borrow()
+        );
+        assert_eq!(sleeper.calls.get(), 1);
+        assert_eq!(sleeper.elapsed.get(), Duration::from_millis(10));
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call[0] == "capture-pane")
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls.iter().filter(|call| call[0] == "send-keys").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn composer_snapshot_retries_when_geometry_changes_at_the_same_cursor() {
+        let mut screen = [""; 11];
+        screen[10] = "› draft";
+        let runner = Runner::with([
+            state_with_geometry(2, 10, 80, 24),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state_with_geometry(2, 10, 60, 18),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state_with_geometry(2, 10, 60, 18),
+            output([]),
+            state_with_geometry(2, 10, 60, 18),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n"),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        let outcome = probe(
+            &runner,
+            &Inspector {
+                codex: true,
+                shell: false,
+            },
+            &sleeper,
+            &codex,
+        )
+        .run(&context())
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SmartLeftOutcome::Opened,
+            "{:?}",
+            runner.calls.borrow()
+        );
+        assert_eq!(sleeper.calls.get(), 1);
+    }
+
+    #[test]
+    fn moved_client_fails_through_after_the_left_gesture() {
+        let mut screen = [""; 11];
+        screen[10] = "› draft";
+        let runner = Runner::with([
+            state(2, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(2, 10, true, false),
+            output([]),
+            state(2, 10, true, false),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@8\x1f%9\n"),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Forwarded
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|call| call[0] == "send-keys").count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call[0] == "display-popup"));
+    }
+
+    #[test]
+    fn popup_launch_failure_after_validation_fails_through() {
+        let mut screen = [""; 11];
+        screen[10] = "› draft";
+        let runner = Runner::with([
+            state(2, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(2, 10, true, false),
+            output([]),
+            state(2, 10, true, false),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n"),
+            CommandOutput {
+                stdout: Vec::new(),
+                stderr: b"popup unavailable".to_vec(),
+                status: Some(1),
+            },
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Forwarded
+        );
+        let calls = runner.calls.borrow();
+        let popup = calls
+            .iter()
+            .find(|call| call[0] == "display-popup")
+            .unwrap();
+        assert!(popup.windows(2).any(|pair| pair == ["-c", "/dev/pts/7"]));
+        assert!(popup.windows(2).any(|pair| pair == ["-t", "%4"]));
+    }
+
+    #[test]
+    fn replaced_matched_descendant_cannot_authorize_the_popup() {
+        let mut screen = [""; 11];
+        screen[10] = "› draft";
+        let runner = Runner::with([
+            state(2, 10, true, false),
+            output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(2, 10, true, false),
+            output([]),
+            state(2, 10, true, false),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+        let inspector = SequenceInspector {
+            identities: RefCell::new(VecDeque::from([
+                Some(ProcessMatchIdentity {
+                    pid: 100,
+                    start_time: 1,
+                }),
+                Some(ProcessMatchIdentity {
+                    pid: 101,
+                    start_time: 2,
+                }),
+            ])),
+        };
+        let probe = SmartLeftProbe::new(
+            &runner,
+            &inspector,
+            &sleeper,
+            std::path::Path::new("/opt/codex-mux"),
+            &codex,
+        );
+
+        assert_eq!(probe.run(&context()).unwrap(), SmartLeftOutcome::Forwarded);
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call[0] == "send-keys")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn continuously_moving_composer_snapshot_fails_through_after_the_bound() {
+        let screen = output(b"not the captured composer row\n".to_vec());
+        let runner = Runner::with([
+            state(2, 10, true, false),
+            screen.clone(),
+            state(2, 11, true, false),
+            screen.clone(),
+            state(2, 12, true, false),
+            screen,
+            state(2, 13, true, false),
+            output([]),
+        ]);
+        let sleeper = Sleeper::default();
+        let codex = CodexExecutable::new("/opt/codex").unwrap();
+
+        assert_eq!(
+            probe(
+                &runner,
+                &Inspector {
+                    codex: true,
+                    shell: false,
+                },
+                &sleeper,
+                &codex,
+            )
+            .run(&context())
+            .unwrap(),
+            SmartLeftOutcome::Forwarded
+        );
+        assert_eq!(sleeper.calls.get(), 2);
+        assert_eq!(sleeper.elapsed.get(), Duration::from_millis(20));
+        let calls = runner.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call[0] == "capture-pane")
+                .count(),
+            super::CODEX_SNAPSHOT_ATTEMPTS
+        );
+        assert_eq!(
+            calls.iter().filter(|call| call[0] == "send-keys").count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call[0] == "display-popup"));
+    }
+
+    #[test]
     fn indented_composer_boundary_used_by_reasoning_modes_opens_popup() {
         let mut screen = [""; 11];
         screen[10] = "    › draft";
         let runner = Runner::with([
             state(6, 10, true, false),
             output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(6, 10, true, false),
             output([]),
             state(6, 10, true, false),
-            output(b"/dev/pts/7\x1f120\x1f40\n"),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n"),
             output([]),
         ]);
         let sleeper = Sleeper::default();
@@ -887,9 +1297,10 @@ mod tests {
         let runner = Runner::with([
             state(4, 10, true, false),
             output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(4, 10, true, false),
             output([]),
             state(4, 10, true, false),
-            output(b"/dev/pts/7\x1f120\x1f40\n"),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n"),
             output([]),
         ]);
         let sleeper = Sleeper::default();
@@ -918,9 +1329,10 @@ mod tests {
         let runner = Runner::with([
             state(5, 10, true, false),
             output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(5, 10, true, false),
             output([]),
             state(5, 10, true, false),
-            output(b"/dev/pts/7\x1f120\x1f40\n"),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n"),
             output([]),
         ]);
         let sleeper = Sleeper::default();
@@ -950,6 +1362,7 @@ mod tests {
             let runner = Runner::with([
                 state(cursor_x, 10, true, false),
                 output(format!("{}\n", screen.join("\n")).into_bytes()),
+                state(cursor_x, 10, true, false),
                 output([]),
             ]);
             let sleeper = Sleeper::default();
@@ -977,7 +1390,7 @@ mod tests {
             shell_state(8, 4, true),
             output([]),
             shell_state(8, 4, true),
-            output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n".to_vec()),
             output([]),
         ];
         let runner = Runner::with(outputs);
@@ -1036,6 +1449,7 @@ mod tests {
         let outputs = vec![
             state(2, 3, true, false),
             output(b"picker\nrow\nselected\nnot a composer\n".to_vec()),
+            state(2, 3, true, false),
             output([]),
         ];
         let runner = Runner::with(outputs);
@@ -1072,6 +1486,7 @@ mod tests {
         let runner = Runner::with([
             state(2, 10, true, false),
             output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(2, 10, true, false),
             output([]),
             state(3, 10, true, false),
             state(3, 10, true, false),
@@ -1110,10 +1525,11 @@ mod tests {
         let runner = Runner::with([
             state(2, 10, true, false),
             output(format!("{}\n", screen.join("\n")).into_bytes()),
+            state(2, 10, true, false),
             output([]),
             state(54, 3, true, false),
             state(2, 10, true, false),
-            output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n".to_vec()),
             output([]),
         ]);
         let sleeper = Sleeper::default();
@@ -1178,9 +1594,10 @@ mod tests {
                 vec![
                     state(2, 10, true, false),
                     output(format!("{}\n", screen.join("\n")).into_bytes()),
+                    state(2, 10, true, false),
                     output([]),
                     state(2, 10, true, false),
-                    output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+                    output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n".to_vec()),
                     output([]),
                 ]
             } else {
@@ -1214,9 +1631,10 @@ mod tests {
         let runner = Runner::with([
             output(b"42\x1f2\x1f10\x1f1\x1f0\x1fsupervisor-v17\x1f0\n".to_vec()),
             output(format!("{}\n", screen.join("\n")).into_bytes()),
+            output(b"42\x1f2\x1f10\x1f1\x1f0\x1fsupervisor-v17\x1f0\n".to_vec()),
             output([]),
             output(b"42\x1f2\x1f10\x1f1\x1f0\x1fsupervisor-v17\x1f0\n".to_vec()),
-            output(b"/dev/pts/7\x1f120\x1f40\n".to_vec()),
+            output(b"/dev/pts/7\x1f120\x1f40\x1f$2\x1f@3\x1f%4\n".to_vec()),
             output([]),
         ]);
         let sleeper = Sleeper::default();

@@ -4,6 +4,10 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+### Fixed
+
+- Retry a bounded, state-bracketed Smart Left composer snapshot when live Max/Ultra redraws move the cursor row during probing, while continuing to fail through on persistent instability.
+
 ## [0.9.5] - 2026-08-21
 
 ### Fixed

@@ -621,6 +621,13 @@ fn run_smart_left(cli: &Cli, process_arguments: &ProcessArguments) -> Result<()>
 
 fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()> {
     let context = invocation_context(&cli)?;
+    let runner = SystemTmuxRunner::default();
+    if !invocation_context_is_current(&runner, &context) {
+        if let Ok(diagnostics) = NamingDiagnostics::smart_left() {
+            diagnostics.event("client_context_changed");
+        }
+        return Ok(());
+    }
     let theme_store = XdgThemeStore::discover()?;
     let preference = theme_store.load_preference();
     let process = resolve_process(process_arguments, Some(&preference))?;
@@ -655,7 +662,6 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
     );
     let mut initial_selection_pending = true;
     let mut minimum_refresh_generation = 0_u64;
-    let runner = SystemTmuxRunner::default();
     let actions = TmuxActions::new(&runner, &codex);
     if preference.smart_naming {
         if let Err(error) = ensure_naming_daemon(&process) {
@@ -841,6 +847,36 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
             }
         }
     })
+}
+
+fn invocation_context_is_current(
+    runner: &impl crate::domain::TmuxCommandRunner,
+    context: &InvocationContext,
+) -> bool {
+    let output = runner.run(&[
+        OsString::from("list-clients"),
+        OsString::from("-F"),
+        OsString::from("#{client_tty}\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}"),
+    ]);
+    let Ok(output) = output else { return false };
+    if output.status != Some(0) {
+        return false;
+    }
+    output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .any(|line| {
+            let Ok(line) = std::str::from_utf8(line) else {
+                return false;
+            };
+            let fields = line.split('\x1f').collect::<Vec<_>>();
+            fields.len() == 4
+                && fields[0] == context.client_id.as_str()
+                && fields[1] == context.session_id.as_str()
+                && fields[2] == context.window_id.as_str()
+                && fields[3] == context.pane_id.as_str()
+        })
 }
 
 fn configured_codex_executables(
@@ -1971,13 +2007,54 @@ mod tests {
 
     use super::{
         PaneRefreshWorker, configured_codex_executables, filter_names_by_authoritative_threads,
-        invocation_context, parse_naming_server_identity,
+        invocation_context, invocation_context_is_current, parse_naming_server_identity,
     };
     use crate::cli::Cli;
     use crate::{
         config::{LaunchProfile, PermissionPreset},
-        domain::{CodexExecutable, PaneId, SessionId},
+        domain::{
+            ClientId, CodexExecutable, CommandOutput, InvocationContext, PaneId, SessionId,
+            TmuxCommandRunner, WindowId,
+        },
     };
+
+    struct ContextRunner(CommandOutput);
+
+    impl TmuxCommandRunner for ContextRunner {
+        fn run(&self, _arguments: &[std::ffi::OsString]) -> crate::Result<CommandOutput> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn popup_child_context_preflight_fails_closed_on_client_movement() {
+        let context = InvocationContext {
+            client_id: ClientId::new("/dev/pts/7").unwrap(),
+            pane_id: PaneId::new("%4").unwrap(),
+            session_id: SessionId::new("$2").unwrap(),
+            window_id: WindowId::new("@3").unwrap(),
+            current_path: PathBuf::from("/work"),
+        };
+        let output = |stdout: &[u8]| {
+            ContextRunner(CommandOutput {
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+                status: Some(0),
+            })
+        };
+        assert!(invocation_context_is_current(
+            &output(b"/dev/pts/7\x1f$2\x1f@3\x1f%4\n"),
+            &context
+        ));
+        assert!(!invocation_context_is_current(
+            &output(b"/dev/pts/7\x1f$8\x1f@9\x1f%10\n"),
+            &context
+        ));
+        assert!(!invocation_context_is_current(
+            &output(b"malformed\n"),
+            &context
+        ));
+    }
 
     #[test]
     fn volatile_name_is_rejected_when_the_same_pane_now_resolves_another_thread() {

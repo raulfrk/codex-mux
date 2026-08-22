@@ -180,6 +180,15 @@ pub struct PaneProcess {
     pub tty: PathBuf,
 }
 
+/// Stable identity of the exact process that satisfied a pane match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessMatchIdentity {
+    /// Matched process ID.
+    pub pid: u32,
+    /// Kernel process start time, preventing PID-reuse equivalence.
+    pub start_time: u64,
+}
+
 /// Terminal dimensions used to select a responsive layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalSize {

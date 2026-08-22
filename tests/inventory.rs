@@ -312,6 +312,46 @@ fn proc_group_wrapper_requires_absolute_configured_path_evidence() {
 }
 
 #[test]
+fn smart_left_rejects_an_unmatched_foreground_leader_with_codex_basename() {
+    let root = TemporaryDirectory::new("proc-smart-left-leader-fallback");
+    let configured = root.path().join("configured/codex");
+    let unrelated = root.path().join("unrelated/codex");
+    fs::create_dir_all(configured.parent().unwrap()).unwrap();
+    fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+    fs::write(&configured, b"configured").unwrap();
+    fs::write(&unrelated, b"unrelated").unwrap();
+    write_process(root.path(), 10, 10, 34816, 20, "/bin/sh", &["/bin/sh"]);
+    write_process(
+        root.path(),
+        20,
+        20,
+        34816,
+        20,
+        unrelated.to_str().unwrap(),
+        &[unrelated.to_str().unwrap()],
+    );
+    let inspector = LinuxProcessInspector::with_proc_root(
+        CodexExecutable::new(&configured).unwrap(),
+        root.path(),
+    );
+
+    assert_eq!(
+        inspector.foreground_executable(10).unwrap(),
+        Some(unrelated)
+    );
+    assert!(
+        !DirectCodexInspector::is_direct_codex(
+            &inspector,
+            &PaneProcess {
+                pid: 10,
+                tty: PathBuf::new(),
+            },
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn launcher_and_differently_located_underlying_binary_share_the_matcher() {
     let root = TemporaryDirectory::new("proc-launcher-underlying");
     let launcher = root.path().join("launch/codex-launcher");

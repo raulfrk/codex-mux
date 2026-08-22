@@ -81,7 +81,7 @@ use regex::Regex;
 use crate::{
     MuxError, Result,
     config::MatchScope,
-    domain::{CodexExecutable, PaneProcess, ProcessInspector},
+    domain::{CodexExecutable, PaneProcess, ProcessInspector, ProcessMatchIdentity},
 };
 
 /// Resolves foreground process groups from a configurable procfs root.
@@ -190,10 +190,10 @@ impl LinuxProcessInspector {
     pub fn foreground_process_matches(&self, pane_pid: u32) -> Result<bool> {
         self.inspect(pane_pid)
             .map(|matched| {
-                matched.is_some_and(|path| {
+                matched.is_some_and(|matched| {
                     self.recognized
                         .iter()
-                        .any(|executable| same_file(&path, executable.as_path()))
+                        .any(|executable| same_file(&matched.path, executable.as_path()))
                 })
             })
             .map_err(|source| MuxError::Filesystem {
@@ -212,7 +212,22 @@ impl LinuxProcessInspector {
             })
     }
 
-    fn inspect_scoped(&self, pane: &PaneProcess) -> std::io::Result<Option<PathBuf>> {
+    /// Returns the stable identity of the process satisfying the pane matcher.
+    pub fn pane_process_match_identity(
+        &self,
+        pane: &PaneProcess,
+    ) -> Result<Option<ProcessMatchIdentity>> {
+        self.inspect_scoped(pane)
+            .map(|matched| {
+                matched.and_then(|matched| matched.proven_match.then_some(matched.identity))
+            })
+            .map_err(|source| MuxError::Filesystem {
+                path: self.proc_root.clone(),
+                source,
+            })
+    }
+
+    fn inspect_scoped(&self, pane: &PaneProcess) -> std::io::Result<Option<MatchedProcess>> {
         if self.match_scope == MatchScope::Foreground {
             return self.inspect(pane.pid);
         }
@@ -247,7 +262,11 @@ impl LinuxProcessInspector {
                 };
                 let Some(path) = matched else { continue };
                 if self.scoped_candidate_is_current(&initial, candidate)? {
-                    return Ok(Some(path));
+                    return Ok(Some(MatchedProcess {
+                        path,
+                        identity: candidate.identity(),
+                        proven_match: true,
+                    }));
                 }
             }
         }
@@ -363,7 +382,7 @@ impl LinuxProcessInspector {
             && current.arguments == pane.arguments)
     }
 
-    fn inspect(&self, pane_pid: u32) -> std::io::Result<Option<PathBuf>> {
+    fn inspect(&self, pane_pid: u32) -> std::io::Result<Option<MatchedProcess>> {
         let pane = match self.read_process(pane_pid)? {
             Some(process) => process,
             None => return Ok(None),
@@ -373,7 +392,11 @@ impl LinuxProcessInspector {
                 return Ok(None);
             };
             return Ok(
-                same_process_evidence(&pane, &current).then(|| executable.as_path().to_owned())
+                same_process_evidence(&pane, &current).then(|| MatchedProcess {
+                    path: executable.as_path().to_owned(),
+                    identity: pane.identity(),
+                    proven_match: true,
+                }),
             );
         }
         if pane.tty_nr != 0
@@ -384,12 +407,16 @@ impl LinuxProcessInspector {
             let Some(current) = self.read_process(pane_pid)? else {
                 return Ok(None);
             };
-            return Ok(same_process_evidence(&pane, &current).then(|| {
-                self.recognized_match(&pane).map_or_else(
-                    || self.recognized[0].as_path().to_owned(),
-                    |executable| executable.as_path().to_owned(),
-                )
-            }));
+            return Ok(
+                same_process_evidence(&pane, &current).then(|| MatchedProcess {
+                    path: self.recognized_match(&pane).map_or_else(
+                        || self.recognized[0].as_path().to_owned(),
+                        |executable| executable.as_path().to_owned(),
+                    ),
+                    identity: pane.identity(),
+                    proven_match: true,
+                }),
+            );
         }
         if pane.tty_nr == 0 || pane.tpgid <= 0 {
             return Ok(None);
@@ -431,7 +458,11 @@ impl LinuxProcessInspector {
                 };
                 return Ok((same_process_evidence(candidate, &current_candidate)
                     && same_foreground_snapshot(&pane, &current_pane))
-                .then(|| executable.as_path().to_owned()));
+                .then(|| MatchedProcess {
+                    path: executable.as_path().to_owned(),
+                    identity: candidate.identity(),
+                    proven_match: true,
+                }));
             }
         }
         for candidate in &candidates {
@@ -444,7 +475,11 @@ impl LinuxProcessInspector {
                 };
                 return Ok((same_process_evidence(candidate, &current_candidate)
                     && same_foreground_snapshot(&pane, &current_pane))
-                .then(|| self.recognized[0].as_path().to_owned()));
+                .then(|| MatchedProcess {
+                    path: self.recognized[0].as_path().to_owned(),
+                    identity: candidate.identity(),
+                    proven_match: true,
+                }));
             }
         }
 
@@ -453,7 +488,13 @@ impl LinuxProcessInspector {
         Ok(candidates
             .iter()
             .find(|process| i64::from(process.pid) == pane.tpgid)
-            .and_then(|process| process.executable.clone()))
+            .and_then(|process| {
+                process.executable.clone().map(|path| MatchedProcess {
+                    path,
+                    identity: process.identity(),
+                    proven_match: false,
+                })
+            }))
     }
 
     fn inspect_batch(&self, pane_pids: &[u32]) -> Vec<std::io::Result<Option<PathBuf>>> {
@@ -727,6 +768,7 @@ impl LinuxProcessInspector {
 impl ProcessInspector for LinuxProcessInspector {
     fn foreground_executable(&self, pane_pid: u32) -> Result<Option<PathBuf>> {
         self.inspect(pane_pid)
+            .map(|matched| matched.map(|matched| matched.path))
             .map_err(|source| MuxError::Filesystem {
                 path: self.proc_root.clone(),
                 source,
@@ -747,6 +789,7 @@ impl ProcessInspector for LinuxProcessInspector {
 
     fn pane_executable(&self, pane: &PaneProcess) -> Result<Option<PathBuf>> {
         self.inspect_scoped(pane)
+            .map(|matched| matched.map(|matched| matched.path))
             .map_err(|source| MuxError::Filesystem {
                 path: self.proc_root.clone(),
                 source,
@@ -774,6 +817,21 @@ struct ProcessEvidence {
     start_time: u64,
     executable: Option<PathBuf>,
     arguments: Vec<OsString>,
+}
+
+impl ProcessEvidence {
+    const fn identity(&self) -> ProcessMatchIdentity {
+        ProcessMatchIdentity {
+            pid: self.pid,
+            start_time: self.start_time,
+        }
+    }
+}
+
+struct MatchedProcess {
+    path: PathBuf,
+    identity: ProcessMatchIdentity,
+    proven_match: bool,
 }
 
 fn same_foreground_snapshot(initial: &ProcessEvidence, current: &ProcessEvidence) -> bool {

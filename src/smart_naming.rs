@@ -91,6 +91,8 @@ const DIAGNOSTIC_CODES: &[&str] = &[
     "state_read_failed",
     "composer_row_rejected",
     "composer_cursor_rejected",
+    "composer_snapshot_unstable",
+    "client_context_changed",
     "state_recheck_failed",
     "state_changed_after_left",
     "process_changed_after_left",

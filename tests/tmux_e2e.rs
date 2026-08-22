@@ -1690,6 +1690,62 @@ fn interactive_cli_selects_full_screen_for_only_the_named_client() {
 }
 
 #[test]
+fn popup_child_exits_when_the_invoking_client_moved_before_preflight() {
+    let _serial = serial_tmux_test();
+    if !tools_available() {
+        eprintln!("tmux or util-linux script is unavailable; skipping tmux E2E test");
+        return;
+    }
+
+    let fixture = RuntimeFixture::new("stale-popup-client");
+    let observer_pane = fixture.new_shell("observer", fixture.scratch.path());
+    let invoking_client = PtyProcess::attach(&fixture.server, "origin", 110, 36);
+    let invoking_tty = wait_for_client(&fixture.server, "origin");
+    let expected_arguments = fixture.interactive_arguments(&invoking_tty);
+
+    fixture
+        .server
+        .checked(&["switch-client", "-c", &invoking_tty, "-t", "observer"]);
+    assert_eq!(client_pane(&fixture.server, &invoking_tty), observer_pane);
+
+    let result = fixture.scratch.join("stale-popup-result");
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut words = vec![
+        "timeout".to_owned(),
+        "5".to_owned(),
+        quote(env!("CARGO_BIN_EXE_codex-mux")),
+    ];
+    words.extend(expected_arguments.iter().map(|argument| quote(argument)));
+    let command = format!(
+        "{}; printf '%s' \"$?\" > {}",
+        words.join(" "),
+        quote(path(&result))
+    );
+    let popup = fixture
+        .server
+        .command()
+        .args([
+            "display-popup",
+            "-E",
+            "-c",
+            &invoking_tty,
+            "-t",
+            &fixture.origin_pane,
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert_success(&popup, "run stale-context popup child");
+    support::wait_for_file_text(&result, "0");
+    assert_eq!(client_pane(&fixture.server, &invoking_tty), observer_pane);
+    assert!(
+        !fixture.log.exists() || fs::read_to_string(&fixture.log).unwrap().is_empty(),
+        "stale popup initialized Codex actions"
+    );
+    drop(invoking_client);
+}
+
+#[test]
 fn interactive_cli_launches_exact_new_and_resume_arguments_in_selected_cwd() {
     let _serial = serial_tmux_test();
     if !tools_available() {
