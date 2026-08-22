@@ -825,26 +825,29 @@ fn render_block(
     } else {
         String::new()
     };
-    let matches = executables
-        .match_executables
-        .iter()
-        .map(|path| format!("{MATCH_FIELD}{}\n", path.display()))
-        .collect::<String>();
-    let pane_commands = executables
-        .pane_commands
-        .iter()
-        .map(|command| format!("{PANE_COMMAND_FIELD}{command}\n"))
-        .collect::<String>();
-    let match_regexes = executables
-        .match_command_regexes
-        .iter()
-        .map(|expression| format!("{MATCH_COMMAND_REGEX_FIELD}{expression}\n"))
-        .collect::<String>();
-    let pane_regexes = executables
-        .pane_command_regexes
-        .iter()
-        .map(|expression| format!("{PANE_COMMAND_REGEX_FIELD}{expression}\n"))
-        .collect::<String>();
+    let mut matches = String::new();
+    for path in &executables.match_executables {
+        writeln!(&mut matches, "{MATCH_FIELD}{}", path.display())
+            .expect("writing to a String cannot fail");
+    }
+    let mut pane_commands = String::new();
+    for command in &executables.pane_commands {
+        writeln!(&mut pane_commands, "{PANE_COMMAND_FIELD}{command}")
+            .expect("writing to a String cannot fail");
+    }
+    let mut match_regexes = String::new();
+    for expression in &executables.match_command_regexes {
+        writeln!(
+            &mut match_regexes,
+            "{MATCH_COMMAND_REGEX_FIELD}{expression}"
+        )
+        .expect("writing to a String cannot fail");
+    }
+    let mut pane_regexes = String::new();
+    for expression in &executables.pane_command_regexes {
+        writeln!(&mut pane_regexes, "{PANE_COMMAND_REGEX_FIELD}{expression}")
+            .expect("writing to a String cannot fail");
+    }
     format!(
         "{BEGIN_MARKER}\n# Managed by codex-mux; changes inside this block are replaced.\n{LEADING_NEWLINE_FIELD}{owned_leading_newline}\n{KEY_FIELD}{key}\n{BINARY_FIELD}{}\n{CODEX_FIELD}{}\n{LAUNCH_FIELD}{}\n{MATCH_SCOPE_FIELD}{}\n{matches}{pane_commands}{match_regexes}{pane_regexes}{SMART_LEFT_FIELD}{smart_left}\nbind-key {key} run-shell -C {popup}\n{smart_binding}{END_MARKER}\n",
         executables.mux.display(),

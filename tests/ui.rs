@@ -87,11 +87,11 @@ fn wide_and_both_compact_thresholds_render_deterministically() {
     assert_eq!(wide.matches("/work/release").count(), 1);
 
     let width_compact = rendered(89, 28);
-    assert!(width_compact.contains("Enter switch"));
+    assert!(width_compact.contains("Enter open"));
     assert!(!width_compact.contains("Commands"));
 
     let height_compact = rendered(120, 27);
-    assert!(height_compact.contains("Enter switch"));
+    assert!(height_compact.contains("Enter open"));
     assert!(!height_compact.contains("Commands"));
     assert_eq!(height_compact, rendered(120, 27));
 }
@@ -586,7 +586,85 @@ fn tiny_layout_is_deterministic_and_keeps_primary_controls() {
     let second = rendered(32, 8);
     assert_eq!(first, second);
     assert!(first.contains("shipping feature"));
-    assert!(first.contains("n r R x t c q"));
+    for control in [
+        "move",
+        "Enter",
+        "n new",
+        "r resume",
+        "R rename",
+        "x close",
+        "t theme",
+        "c config",
+        "q/Esc quit",
+    ] {
+        assert!(first.contains(control), "missing {control:?} in {first:?}");
+    }
+}
+
+#[test]
+fn constrained_footers_keep_every_browse_control_visible() {
+    for (width, height) in [(89, 28), (62, 20), (40, 12), (32, 8), (20, 8)] {
+        let screen = rendered(width, height);
+        for control in [
+            "move",
+            "Enter",
+            "n new",
+            "r resume",
+            "R rename",
+            "x close",
+            "t theme",
+            "c config",
+            "q/Esc quit",
+        ] {
+            assert!(
+                screen.contains(control),
+                "{width}x{height} hides {control:?}: {screen:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn smallest_footer_survives_realistic_long_titles() {
+    let mut generated = pane("%19", "Codex", "/work/generated");
+    generated.generated_title = Some("界".repeat(48));
+    let cases = [
+        pane(
+            "%19",
+            "01922f9a-7b8c-7000-8000-0123456789ab",
+            "/work/direct",
+        ),
+        generated,
+        pane(
+            "%19",
+            "An externally launched session with a title much wider than the terminal",
+            "/work/external",
+        ),
+    ];
+
+    for candidate in cases {
+        let screen = rendered_panes(vec![candidate], 20, 8);
+        assert!(
+            screen.lines().nth(1).is_some_and(|line| line.contains('…')),
+            "20x8 did not elide the selected title to one row: {screen:?}"
+        );
+        for control in [
+            "move",
+            "Enter open",
+            "n new",
+            "r resume",
+            "R rename",
+            "x close",
+            "t theme",
+            "c config",
+            "q/Esc quit",
+        ] {
+            assert!(
+                screen.contains(control),
+                "20x8 long-title layout hides {control:?}: {screen:?}"
+            );
+        }
+    }
 }
 
 #[test]

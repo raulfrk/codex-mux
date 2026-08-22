@@ -419,13 +419,13 @@ impl App {
     pub fn replace_panes(&mut self, panes: Vec<Pane>) {
         let old_index = self.selected_index().unwrap_or(0);
         let old_selection = self.selected.clone();
-        if let Mode::ManualRename(editor) = &mut self.mode
-            && let Some(pane) = panes.iter().find(|pane| pane.id == editor.pane_id)
-        {
-            editor.auto_name_status = pane.auto_name_status;
-            editor.auto_name_started_at_unix_nanos = pane.auto_name_started_at_unix_nanos;
-            if pane.auto_name_status == Some(AutoNameStatus::Succeeded) {
-                editor.title = pane.display_title();
+        if let Mode::ManualRename(editor) = &mut self.mode {
+            if let Some(pane) = panes.iter().find(|pane| pane.id == editor.pane_id) {
+                editor.auto_name_status = pane.auto_name_status;
+                editor.auto_name_started_at_unix_nanos = pane.auto_name_started_at_unix_nanos;
+                if pane.auto_name_status == Some(AutoNameStatus::Succeeded) {
+                    editor.title = pane.display_title();
+                }
             }
         }
         self.panes = panes;
@@ -799,8 +799,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         height: area.height,
     }) {
         LayoutKind::Wide => render_wide(frame, area, app, palette),
-        LayoutKind::Compact => render_compact(frame, area, app, palette, false),
-        LayoutKind::Phone => render_compact(frame, area, app, palette, true),
+        LayoutKind::Compact | LayoutKind::Phone => render_compact(frame, area, app, palette),
         LayoutKind::Tiny => render_tiny(frame, area, app, palette),
     }
     if matches!(app.mode, Mode::ThemePicker { .. }) {
@@ -869,13 +868,21 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
     frame.render_widget(help, columns[1]);
 }
 
-fn render_compact(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, phone: bool) {
+fn render_compact(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
+    let command_lines = browse_command_lines(area.width);
+    let footer_height = if app.warning.is_some() {
+        2
+    } else if matches!(app.mode, Mode::ConfirmClose(_)) {
+        1
+    } else {
+        command_lines.len() as u16
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(if app.warning.is_some() { 2 } else { 1 }),
+            Constraint::Length(footer_height),
         ])
         .split(area);
     frame.render_widget(Paragraph::new("codex-mux").style(palette.accent), chunks[0]);
@@ -886,16 +893,54 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme, 
         Paragraph::new(sanitized(warning))
             .style(palette.warning)
             .wrap(Wrap { trim: true })
-    } else if phone {
-        Paragraph::new("↕/jk move · Enter open · n new · r resume · R rename · x close · c config")
-            .style(palette.muted)
     } else {
         Paragraph::new(
-            "jk/↕ move  Enter switch  n new  r resume  R rename  x close  t theme  c config  q quit",
+            command_lines
+                .into_iter()
+                .map(|line| Line::styled(line, palette.muted))
+                .collect::<Vec<_>>(),
         )
-        .style(palette.muted)
     };
     frame.render_widget(footer, chunks[2]);
+}
+
+fn browse_command_lines(width: u16) -> Vec<String> {
+    const COMMANDS: &[&str] = &[
+        "↑/↓/jk move",
+        "Enter open",
+        "n new",
+        "r resume",
+        "R rename",
+        "x close",
+        "t theme",
+        "c config",
+        "q/Esc quit",
+    ];
+    const SEPARATOR: &str = " · ";
+
+    let width = usize::from(width.max(1));
+    let separator_width = UnicodeWidthStr::width(SEPARATOR);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for command in COMMANDS {
+        let command_width = UnicodeWidthStr::width(*command);
+        if !current.is_empty() && current_width + separator_width + command_width > width {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push_str(SEPARATOR);
+            current_width += separator_width;
+        }
+        current.push_str(command);
+        current_width += command_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn render_tiny(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
@@ -904,6 +949,7 @@ fn render_tiny(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
         .and_then(|index| app.panes.get(index))
         .map(|pane| sanitized(&pane.display_title()))
         .unwrap_or_else(|| "No Codex panes".to_owned());
+    let title = end_elide(&title, usize::from(area.width));
     let lines = if matches!(app.mode, Mode::ConfirmClose(_)) {
         vec![
             Line::styled("Close pane?", palette.warning),
@@ -911,11 +957,16 @@ fn render_tiny(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Theme) {
             Line::styled("x=yes Esc=no", palette.muted),
         ]
     } else {
-        vec![
+        let mut lines = vec![
             Line::styled("codex-mux", palette.accent),
             Line::styled(title, palette.selected),
-            Line::styled("↕ open n r R x t c q", palette.muted),
-        ]
+        ];
+        lines.extend(
+            browse_command_lines(area.width)
+                .into_iter()
+                .map(|line| Line::styled(line, palette.muted)),
+        );
+        lines
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }

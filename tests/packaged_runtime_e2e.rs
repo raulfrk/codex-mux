@@ -65,9 +65,11 @@ fn packaged_binary_renders_server_wide_rows_rebuilds_and_handles_navigation_size
 
     for (index, (width, height, expected, absent)) in [
         (120, 40, "Commands", "Enter open"),
-        (89, 35, "Enter switch", "Commands"),
-        (62, 35, "Enter open", "Commands"),
-        (32, 10, "n r R x t c q", "Commands"),
+        (89, 28, "q/Esc quit", "Commands"),
+        (62, 20, "q/Esc quit", "Commands"),
+        (40, 12, "q/Esc quit", "Commands"),
+        (32, 8, "q/Esc quit", "Commands"),
+        (20, 8, "q/Esc quit", "Commands"),
     ]
     .into_iter()
     .enumerate()
@@ -87,6 +89,24 @@ fn packaged_binary_renders_server_wide_rows_rebuilds_and_handles_navigation_size
             screen.contains("Beta"),
             "{size:?} omitted selected session title: {screen:?}"
         );
+        if width < 120 {
+            for control in [
+                "move",
+                "Enter open",
+                "n new",
+                "r resume",
+                "R rename",
+                "x close",
+                "t theme",
+                "c config",
+                "q/Esc quit",
+            ] {
+                assert!(
+                    screen.contains(control),
+                    "{size:?} omitted constrained footer control {control:?}: {screen:?}"
+                );
+            }
+        }
         sized.send(b"q");
         assert!(sized.wait_exit().success());
         assert_eq!(

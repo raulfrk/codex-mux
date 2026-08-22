@@ -2,6 +2,13 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [0.10.1] - 2026-08-22
+
+### Fixed
+
+- Keep every browse command visible on compact, phone, and tiny terminals by packing labeled key hints into width-aware footer rows.
+- Restore compatibility with the declared Rust 1.85 minimum toolchain so release artifacts compile successfully.
+
 ## [0.10.0] - 2026-08-22
 
 ### Added
