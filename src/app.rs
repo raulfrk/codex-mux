@@ -7,8 +7,8 @@ use std::{
     fs,
     fs::OpenOptions,
     hash::{Hash, Hasher},
-    io,
-    os::unix::fs::MetadataExt,
+    io::{self, Read, Seek, SeekFrom, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, mpsc},
     thread,
@@ -54,6 +54,8 @@ use crate::{
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_VOLATILE_RECONCILES_PER_CYCLE: usize = 4;
+const NAMING_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const NAMING_FORCED_STOP_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 struct ProcessArguments {
@@ -185,6 +187,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let preference = process_preference(&process_arguments)?;
             ensure_naming_daemon(&resolve_process(&process_arguments, preference.as_ref())?)
         }
+        Some(Command::SmartNamingStop) => stop_naming_daemon(),
         None => run_interactive(cli, &process_arguments),
     }
 }
@@ -704,13 +707,13 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
                         dirty = true;
                     }
                     Ok(Err(error)) => {
-                        app.smart_naming_runtime_failed(error.to_string());
+                        app.smart_naming_shutdown_failed(error.to_string());
                         shutdown_pending = false;
                         dirty = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        app.smart_naming_runtime_failed("smart-naming shutdown channel closed");
+                        app.smart_naming_shutdown_failed("smart-naming shutdown channel closed");
                         shutdown_pending = false;
                         dirty = true;
                     }
@@ -784,7 +787,7 @@ fn run_interactive(cli: Cli, process_arguments: &ProcessArguments) -> Result<()>
                                 shutdown_pending = true;
                                 let sender = shutdown_sender.clone();
                                 thread::spawn(move || {
-                                    let _ = sender.send(wait_for_naming_daemon_stop());
+                                    let _ = sender.send(stop_naming_daemon());
                                 });
                             }
                         }
@@ -1096,9 +1099,10 @@ fn volatile_name_matches(
 }
 
 fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
-    let Some(_lock) = try_naming_daemon_lock()? else {
+    let Some(mut lock) = try_naming_daemon_lock()? else {
         return Ok(());
     };
+    write_naming_daemon_identity(&mut lock)?;
     let store = XdgThemeStore::discover()?;
     let owned_names = OwnedTmuxNames::new(SystemTmuxRunner::default());
     let now = SystemTime::now()
@@ -1108,7 +1112,7 @@ fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
     owned_names.migrate_legacy_window_names(now);
     let preference = store.load_preference();
     if !preference.smart_naming {
-        owned_names.clear_all();
+        owned_names.clear_all()?;
         return Ok(());
     }
     let mut process = resolve_process(process_arguments, Some(&preference))?;
@@ -1221,7 +1225,7 @@ fn run_smart_naming_worker(process_arguments: &ProcessArguments) -> Result<()> {
         worker.stop();
     }
     if !store.load_preference().smart_naming {
-        owned_names.clear_all();
+        owned_names.clear_all()?;
     }
     Ok(())
 }
@@ -1269,22 +1273,274 @@ fn ensure_naming_daemon(process: &ResolvedProcessConfig) -> Result<()> {
 }
 
 fn wait_for_naming_daemon_stop() -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + NAMING_SHUTDOWN_GRACE;
     loop {
-        if let Some(lock) = try_naming_daemon_lock()? {
-            drop(lock);
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(MuxError::Command(
-                "smart-naming worker did not stop within 3 seconds".to_owned(),
-            ));
+        match probe_naming_daemon_lock()? {
+            NamingDaemonLock::Acquired(lock) => {
+                drop(lock);
+                OwnedTmuxNames::new(SystemTmuxRunner::default()).clear_all()?;
+                return Ok(());
+            }
+            NamingDaemonLock::Busy(mut locked_inode) => {
+                if std::time::Instant::now() >= deadline {
+                    force_stop_naming_daemon(&mut locked_inode)?;
+                    let forced_deadline = std::time::Instant::now() + NAMING_FORCED_STOP_WAIT;
+                    while std::time::Instant::now() < forced_deadline {
+                        if let NamingDaemonLock::Acquired(lock) = probe_naming_daemon_lock()? {
+                            drop(lock);
+                            OwnedTmuxNames::new(SystemTmuxRunner::default()).clear_all()?;
+                            return Ok(());
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    return Err(MuxError::Command(
+                        "smart-naming worker retained its lock after an authenticated forced stop"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
+fn stop_naming_daemon() -> Result<()> {
+    if XdgThemeStore::discover()?.load_preference().smart_naming {
+        return Err(MuxError::Command(
+            "refusing to stop smart naming while it remains enabled".to_owned(),
+        ));
+    }
+    wait_for_naming_daemon_stop()
+}
+
+fn write_naming_daemon_identity(lock: &mut fs::File) -> Result<()> {
+    let pid = std::process::id();
+    let start_time = linux_process_start_time(pid)?;
+    lock.set_len(0).map_err(|source| MuxError::Filesystem {
+        path: naming_daemon_lock_path().unwrap_or_else(|_| PathBuf::from("naming daemon lock")),
+        source,
+    })?;
+    lock.seek(SeekFrom::Start(0))
+        .and_then(|_| writeln!(lock, "v1 {pid} {start_time}"))
+        .and_then(|_| lock.sync_data())
+        .map_err(|source| MuxError::Filesystem {
+            path: naming_daemon_lock_path().unwrap_or_else(|_| PathBuf::from("naming daemon lock")),
+            source,
+        })
+}
+
+fn force_stop_naming_daemon(file: &mut fs::File) -> Result<()> {
+    match rustix::fs::flock(
+        &mut *file,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Ok(()) => {
+            return Err(MuxError::Command(
+                "smart-naming worker released its authenticated lock before forced stop".to_owned(),
+            ));
+        }
+        Err(rustix::io::Errno::WOULDBLOCK) => {}
+        Err(source) => {
+            return Err(MuxError::Command(format!(
+                "could not revalidate smart-naming lock ownership: {source}"
+            )));
+        }
+    }
+    let lock_path = naming_daemon_lock_path()
+        .unwrap_or_else(|_| PathBuf::from("authenticated naming daemon lock"));
+    let mut identity = String::new();
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.take(128).read_to_string(&mut identity))
+        .map_err(|source| MuxError::Filesystem {
+            path: lock_path,
+            source,
+        })?;
+    let mut fields = identity.split_whitespace();
+    let (Some("v1"), Some(pid), Some(start_time), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(MuxError::Command(
+            "smart-naming worker identity record is missing or invalid".to_owned(),
+        ));
+    };
+    let pid = pid
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            MuxError::Command("smart-naming worker identity PID is invalid".to_owned())
+        })?;
+    if linux_flock_owner(file)? != pid {
+        return Err(MuxError::Command(
+            "smart-naming worker identity does not own the authenticated lock".to_owned(),
+        ));
+    }
+    let start_time = start_time.parse::<u64>().map_err(|_| {
+        MuxError::Command("smart-naming worker identity start time is invalid".to_owned())
+    })?;
+    let raw_pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| MuxError::Command("smart-naming worker PID is out of range".to_owned()))?;
+    let pidfd = rustix::process::pidfd_open(raw_pid, rustix::process::PidfdFlags::empty())
+        .map_err(|source| {
+            MuxError::Command(format!("could not bind smart-naming worker PID: {source}"))
+        })?;
+    if linux_process_start_time(pid)? != start_time {
+        return Err(MuxError::Command(
+            "smart-naming worker identity changed before forced stop".to_owned(),
+        ));
+    }
+    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::Stop).map_err(
+        |source| {
+            MuxError::Command(format!(
+                "could not suspend the authenticated smart-naming worker: {source}"
+            ))
+        },
+    )?;
+    for descendant in linux_descendant_pidfds(pid) {
+        let _ = rustix::process::pidfd_send_signal(descendant, rustix::process::Signal::Kill);
+    }
+    rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::Kill).map_err(|source| {
+        MuxError::Command(format!(
+            "could not force-stop the authenticated smart-naming worker: {source}"
+        ))
+    })
+}
+
+fn linux_process_start_time(pid: u32) -> Result<u64> {
+    linux_process_identity(pid).map(|(_, start_time)| start_time)
+}
+
+fn linux_flock_owner(file: &fs::File) -> Result<u32> {
+    let metadata = file.metadata().map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("authenticated naming daemon lock"),
+        source,
+    })?;
+    let expected_major = rustix::fs::major(metadata.dev());
+    let expected_minor = rustix::fs::minor(metadata.dev());
+    let expected_inode = metadata.ino();
+    let locks = fs::read_to_string("/proc/locks").map_err(|source| MuxError::Filesystem {
+        path: PathBuf::from("/proc/locks"),
+        source,
+    })?;
+    let mut owner = None;
+    for line in locks.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 6 || fields[1] != "FLOCK" || fields[3] != "WRITE" {
+            continue;
+        }
+        let Some((major, rest)) = fields[5].split_once(':') else {
+            continue;
+        };
+        let Some((minor, inode)) = rest.split_once(':') else {
+            continue;
+        };
+        if u32::from_str_radix(major, 16).ok() != Some(expected_major)
+            || u32::from_str_radix(minor, 16).ok() != Some(expected_minor)
+            || inode.parse::<u64>().ok() != Some(expected_inode)
+        {
+            continue;
+        }
+        let candidate = fields[4].parse::<u32>().map_err(|_| {
+            MuxError::Command("smart-naming kernel lock owner is invalid".to_owned())
+        })?;
+        if owner.replace(candidate).is_some() {
+            return Err(MuxError::Command(
+                "smart-naming kernel lock ownership is ambiguous".to_owned(),
+            ));
+        }
+    }
+    owner.ok_or_else(|| {
+        MuxError::Command("smart-naming kernel lock owner could not be authenticated".to_owned())
+    })
+}
+
+fn linux_process_identity(pid: u32) -> Result<(u32, u64)> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = fs::read_to_string(&path).map_err(|source| MuxError::Filesystem {
+        path: path.clone(),
+        source,
+    })?;
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, remainder)| remainder.split_whitespace().collect::<Vec<_>>())
+        .filter(|fields| fields.len() > 19)
+        .ok_or_else(|| {
+            MuxError::Command("smart-naming worker process identity is malformed".to_owned())
+        })?;
+    let parent = fields[1].parse::<u32>().map_err(|_| {
+        MuxError::Command("smart-naming worker parent process is invalid".to_owned())
+    })?;
+    let start_time = fields[19].parse::<u64>().map_err(|_| {
+        MuxError::Command("smart-naming worker process start time is invalid".to_owned())
+    })?;
+    Ok((parent, start_time))
+}
+
+fn linux_descendant_pidfds(root: u32) -> Vec<rustix::fd::OwnedFd> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let processes = entries
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_string_lossy()
+                .parse::<u32>()
+                .ok()
+        })
+        .filter_map(|pid| {
+            linux_process_identity(pid)
+                .ok()
+                .map(|identity| (pid, identity))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut depths = HashMap::from([(root, 0_usize)]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (&pid, &(parent, _)) in &processes {
+            if depths.contains_key(&pid) {
+                continue;
+            }
+            if let Some(depth) = depths.get(&parent).copied() {
+                depths.insert(pid, depth + 1);
+                changed = true;
+            }
+        }
+    }
+    let mut descendants = depths
+        .into_iter()
+        .filter(|(pid, _)| *pid != root)
+        .collect::<Vec<_>>();
+    descendants.sort_unstable_by_key(|(_, depth)| std::cmp::Reverse(*depth));
+    descendants
+        .into_iter()
+        .filter_map(|(pid, _)| {
+            let recorded_start = processes.get(&pid)?.1;
+            let raw = rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)?;
+            let pidfd =
+                rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()).ok()?;
+            (linux_process_start_time(pid).ok() == Some(recorded_start)).then_some(pidfd)
+        })
+        .collect()
+}
+
 fn try_naming_daemon_lock() -> Result<Option<fs::File>> {
+    match probe_naming_daemon_lock()? {
+        NamingDaemonLock::Acquired(file) => Ok(Some(file)),
+        NamingDaemonLock::Busy(_) => Ok(None),
+    }
+}
+
+enum NamingDaemonLock {
+    Acquired(fs::File),
+    Busy(fs::File),
+}
+
+fn probe_naming_daemon_lock() -> Result<NamingDaemonLock> {
     let path = naming_daemon_lock_path()?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -1292,14 +1548,28 @@ fn try_naming_daemon_lock() -> Result<Option<fs::File>> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
     }
     let file = options.open(&path).map_err(|source| MuxError::Filesystem {
         path: path.clone(),
         source,
     })?;
+    let metadata = file.metadata().map_err(|source| MuxError::Filesystem {
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(MuxError::Command(
+            "smart-naming lock must be a private, user-owned regular file".to_owned(),
+        ));
+    }
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+        Ok(()) => Ok(NamingDaemonLock::Acquired(file)),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(NamingDaemonLock::Busy(file)),
         Err(source) => Err(MuxError::Filesystem {
             path,
             source: source.into(),
@@ -1314,7 +1584,33 @@ fn naming_daemon_lock_path() -> Result<PathBuf> {
     let root = env::var_os("XDG_RUNTIME_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
+        .unwrap_or_else(|| {
+            env::temp_dir().join(format!(
+                "codex-mux-runtime-{}",
+                rustix::process::geteuid().as_raw()
+            ))
+        });
+    if !root.exists() {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .map_err(|source| MuxError::Filesystem {
+                path: root.clone(),
+                source,
+            })?;
+    }
+    let metadata = fs::symlink_metadata(&root).map_err(|source| MuxError::Filesystem {
+        path: root.clone(),
+        source,
+    })?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(MuxError::Command(
+            "smart-naming runtime directory must be private and user-owned".to_owned(),
+        ));
+    }
     Ok(root.join(format!("codex-mux-namer-{:016x}.lock", hasher.finish())))
 }
 
@@ -2022,11 +2318,21 @@ fn os_strings<const N: usize>(values: [&str; N]) -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf, sync::mpsc, time::Duration};
+    use std::{
+        collections::HashMap,
+        fs::{self, OpenOptions},
+        io::{Seek, SeekFrom, Write},
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
 
     use super::{
         PaneRefreshWorker, configured_codex_executables, filter_names_by_authoritative_threads,
-        invocation_context, invocation_context_is_current, parse_naming_server_identity,
+        force_stop_naming_daemon, invocation_context, invocation_context_is_current,
+        linux_process_start_time, parse_naming_server_identity,
     };
     use crate::cli::Cli;
     use crate::{
@@ -2212,5 +2518,218 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.generation, 1);
         assert!(recovered.panes.is_ok());
+    }
+
+    fn locked_sleeper(lock: &Path, wrong_identity: bool) -> std::process::Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "app::tests::naming_lock_holder_helper",
+            ])
+            .env("CODEX_MUX_TEST_NAMING_LOCK", lock)
+            .env(
+                "CODEX_MUX_TEST_WRONG_NAMING_IDENTITY",
+                if wrong_identity { "1" } else { "0" },
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for_identity(lock: &Path, wrong_identity: bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(Instant::now() < deadline, "lock identity was not published");
+            if fs::read_to_string(lock).is_ok_and(|identity| {
+                let fields = identity.split_whitespace().collect::<Vec<_>>();
+                fields.len() == 3 && (wrong_identity || fields[0] == "v1")
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn naming_lock_holder_helper() {
+        let Some(path) = std::env::var_os("CODEX_MUX_TEST_NAMING_LOCK") else {
+            return;
+        };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let pid = std::process::id();
+        let mut start = linux_process_start_time(pid).unwrap();
+        if std::env::var_os("CODEX_MUX_TEST_WRONG_NAMING_IDENTITY").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            start += 1;
+        }
+        file.set_len(0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        writeln!(file, "v1 {pid} {start}").unwrap();
+        file.sync_data().unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn forced_daemon_stop_uses_a_pidfd_bound_to_the_recorded_start_time() {
+        let scratch = std::env::temp_dir().join(format!(
+            "codex-mux-force-stop-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&scratch).unwrap();
+        let lock = scratch.join("daemon.lock");
+        let mut child = locked_sleeper(&lock, false);
+        wait_for_identity(&lock, false);
+
+        let mut locked_inode = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        force_stop_naming_daemon(&mut locked_inode).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "authenticated process survived SIGKILL"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn forced_daemon_stop_rejects_a_reused_or_mismatched_pid_identity() {
+        let scratch = std::env::temp_dir().join(format!(
+            "codex-mux-force-stop-mismatch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&scratch).unwrap();
+        let lock = scratch.join("daemon.lock");
+        let mut child = locked_sleeper(&lock, true);
+        wait_for_identity(&lock, true);
+
+        let mut locked_inode = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let error = force_stop_naming_daemon(&mut locked_inode)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity changed"));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "unrelated process was killed"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn forced_daemon_stop_ignores_a_replacement_lock_path() {
+        let scratch = std::env::temp_dir().join(format!(
+            "codex-mux-force-stop-replaced-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&scratch).unwrap();
+        let lock = scratch.join("daemon.lock");
+        let mut daemon = locked_sleeper(&lock, false);
+        wait_for_identity(&lock, false);
+        let mut locked_inode = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+
+        fs::remove_file(&lock).unwrap();
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        let unrelated_pid = unrelated.id();
+        let unrelated_start = linux_process_start_time(unrelated_pid).unwrap();
+        fs::write(&lock, format!("v1 {unrelated_pid} {unrelated_start}\n")).unwrap();
+
+        force_stop_naming_daemon(&mut locked_inode).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while daemon.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "original daemon survived SIGKILL"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "replacement-path process was signaled"
+        );
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn forced_daemon_stop_rejects_a_valid_identity_that_does_not_own_the_flock() {
+        let scratch = std::env::temp_dir().join(format!(
+            "codex-mux-force-stop-forged-owner-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&scratch).unwrap();
+        let lock = scratch.join("daemon.lock");
+        let mut daemon = locked_sleeper(&lock, false);
+        wait_for_identity(&lock, false);
+        let mut locked_inode = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        let unrelated_pid = unrelated.id();
+        let unrelated_start = linux_process_start_time(unrelated_pid).unwrap();
+        fs::write(&lock, format!("v1 {unrelated_pid} {unrelated_start}\n")).unwrap();
+
+        let error = force_stop_naming_daemon(&mut locked_inode)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not own"));
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "lock owner was killed"
+        );
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "forged identity process was killed"
+        );
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        fs::remove_dir_all(scratch).unwrap();
     }
 }

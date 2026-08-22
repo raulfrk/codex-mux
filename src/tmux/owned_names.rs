@@ -51,6 +51,7 @@ pub const UNPIN_COMPLETE_OPTION: &str = "@codex_mux_unpin_complete";
 pub const RENAME_COMPLETE_OPTION: &str = "@codex_mux_rename_complete";
 const STATE_FORMAT: &str = "#{pane_id}\x1f#{pane_title}\x1f#{pane_current_path}\x1f#{pane_pid}\x1f#{session_id}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_cwd}\x1f#{@codex_mux_generated_source_pid}\x1f#{@codex_mux_generated_source_session}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_manual_name}\x1f#{@codex_mux_auto_name_status}\x1f#{@codex_mux_auto_name_started}\x1f#{@codex_mux_auto_name_token}";
 const LEGACY_STATE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{pane_title}\x1f#{window_name}\x1f#{automatic-rename}\x1f#{window_panes}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_cwd}\x1f#{@codex_mux_generated_at}\x1f#{pane_current_path}";
+const CLEAR_STATE_FORMAT: &str = "#{pane_id}\x1f#{@codex_mux_generated_thread}\x1f#{@codex_mux_generated_name}\x1f#{@codex_mux_generated_source_title}\x1f#{@codex_mux_generated_source_cwd}\x1f#{@codex_mux_generated_source_pid}\x1f#{@codex_mux_generated_source_session}\x1f#{@codex_mux_generated_at}\x1f#{@codex_mux_name_now}\x1f#{@codex_mux_auto_name_status}\x1f#{@codex_mux_auto_name_started}\x1f#{@codex_mux_auto_name_token}";
 
 /// Applies generated titles as pane-local metadata without mutating tmux window names.
 pub struct OwnedTmuxNames<R> {
@@ -337,13 +338,21 @@ impl<R: TmuxCommandRunner> OwnedTmuxNames<R> {
     }
 
     /// Removes every pane-local Codex Mux title when the feature is disabled.
-    pub fn clear_all(&self) {
-        let Ok(output) = self.run(["list-panes", "-a", "-F", "#{pane_id}"]) else {
-            return;
-        };
+    pub fn clear_all(&self) -> Result<()> {
+        let output = self.run(["list-panes", "-a", "-F", "#{pane_id}"])?;
         for pane_id in String::from_utf8_lossy(&output.stdout).lines() {
-            let _ = self.unset_marker(pane_id);
+            self.unset_marker(pane_id)?;
         }
+        let output = self.run(["list-panes", "-a", "-F", CLEAR_STATE_FORMAT])?;
+        if String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            let fields = split_state_fields(line);
+            fields.len() != 12 || fields[1..].iter().any(|value| !value.is_empty())
+        }) {
+            return Err(MuxError::Command(
+                "tmux retained smart-naming metadata after cleanup".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Removes volatile metadata whose exact current rollout identity failed revalidation.
@@ -883,10 +892,10 @@ mod tests {
     #[test]
     fn disabling_clears_only_pane_local_codex_mux_metadata() {
         let runner = FakeRunner::with_states(&["%7\n"]);
-        OwnedTmuxNames::new(runner.clone()).clear_all();
+        OwnedTmuxNames::new(runner.clone()).clear_all().unwrap();
 
         let calls = calls(&runner);
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         for option in [
             THREAD_OPTION,
             OWNER_OPTION,
@@ -897,6 +906,19 @@ mod tests {
             assert!(calls[1].iter().any(|argument| argument == option));
         }
         assert!(!calls[1].iter().any(|argument| argument == "-w"));
+    }
+
+    #[test]
+    fn disabling_reports_retained_tmux_metadata() {
+        let retained = "%7\x1fthread\x1fname\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n";
+        let runner = FakeRunner::with_states(&["%7\n", "", retained]);
+
+        let error = OwnedTmuxNames::new(runner)
+            .clear_all()
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("retained smart-naming metadata"));
     }
 
     #[test]

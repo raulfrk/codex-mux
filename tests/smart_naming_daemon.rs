@@ -25,12 +25,19 @@ fn executable(path: &Path, contents: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn private_runtime(root: &Path) {
+    let path = root.join("runtime");
+    fs::create_dir_all(&path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn worker(root: &Path, codex: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_codex-mux"))
         .args(["--codex", codex.to_str().unwrap(), "smart-naming-worker"])
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env("CODEX_MUX_TEST_PROVIDER_PID", root.join("provider.pid"))
         .env(
             "TMUX",
             format!("{}/tmux.sock,{},0", root.display(), std::process::id()),
@@ -114,7 +121,7 @@ fn daemon_lock(root: &Path) -> PathBuf {
 #[test]
 fn worker_is_singleton_and_survives_its_launcher_until_persisted_disable() {
     let root = scratch();
-    fs::create_dir_all(root.join("runtime")).unwrap();
+    private_runtime(&root);
     fs::write(root.join("tmux.sock"), b"fixture").unwrap();
     let config = root.join("config/codex-mux/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -149,12 +156,68 @@ fn worker_is_singleton_and_survives_its_launcher_until_persisted_disable() {
 }
 
 #[test]
+fn persisted_disable_force_stops_a_blocked_owned_daemon_and_its_provider_only() {
+    let root = scratch();
+    private_runtime(&root);
+    fs::write(root.join("tmux.sock"), b"fixture").unwrap();
+    let config = root.join("config/codex-mux/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "smart_naming = true\n").unwrap();
+    let provider_pid = root.join("provider.pid");
+    let codex = root.join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$CODEX_MUX_TEST_PROVIDER_PID\"\nIFS= read -r request || exit 1\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r initialized || exit 1\nwhile IFS= read -r request; do :; done\n",
+    );
+    executable(&root.join("tmux"), "#!/bin/sh\nexit 0\n");
+
+    let mut daemon = worker(&root, &codex);
+    let provider = wait_for_file(&provider_pid, Duration::from_secs(3))
+        .expect("provider did not start")
+        .parse::<u32>()
+        .unwrap();
+    let lock = daemon_lock(&root);
+    let identity = wait_for_file(&lock, Duration::from_secs(1)).expect("daemon identity missing");
+    assert!(identity.starts_with(&format!("v1 {} ", daemon.id())));
+    let daemon_pid = rustix::process::Pid::from_raw(i32::try_from(daemon.id()).unwrap()).unwrap();
+    rustix::process::kill_process(daemon_pid, rustix::process::Signal::Stop).unwrap();
+    let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+    fs::write(&config, "smart_naming = false\n").unwrap();
+
+    let started = Instant::now();
+    let stopped = Command::new(env!("CARGO_BIN_EXE_codex-mux"))
+        .args(["--codex", codex.to_str().unwrap(), "smart-naming-stop"])
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env(
+            "TMUX",
+            format!("{}/tmux.sock,{},0", root.display(), std::process::id()),
+        )
+        .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "forced stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(1)));
+    assert!(wait_for_pid_gone(provider, Duration::from_secs(1)));
+    assert!(unrelated.try_wait().unwrap().is_none());
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn tmux_owned_launcher_cleans_provider_on_disable_and_server_death() {
     if Command::new("tmux").arg("-V").output().is_err() {
         return;
     }
     let root = scratch();
-    fs::create_dir_all(root.join("runtime")).unwrap();
+    private_runtime(&root);
     let config = root.join("config/codex-mux/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(&config, "smart_naming = true\n").unwrap();
@@ -249,7 +312,7 @@ fn disable_interrupts_late_provider_retry_backoff() {
         return;
     }
     let root = scratch();
-    fs::create_dir_all(root.join("runtime")).unwrap();
+    private_runtime(&root);
     let config = root.join("config/codex-mux/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(&config, "smart_naming = true\n").unwrap();

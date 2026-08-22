@@ -690,3 +690,36 @@ fn naming_persistence_failure_rolls_back_and_success_clears_its_warning() {
         .collect::<String>();
     assert!(!text.contains("disk full"));
 }
+
+#[test]
+fn failed_smart_naming_shutdown_stays_off_and_can_retry_cleanup() {
+    let mut app = App::with_settings(
+        vec![],
+        ThemeId::AdaptiveCyan,
+        None,
+        ColorPolicy::Allow,
+        vec![],
+        true,
+    );
+    app.handle_key(key(KeyCode::Char('c')));
+    app.smart_naming_stopping();
+    app.smart_naming_shutdown_failed("tmux cleanup failed");
+
+    assert!(!app.smart_naming_enabled());
+    assert_eq!(
+        app.handle_key(key(KeyCode::Char('n'))),
+        Some(Action::PersistSmartNaming(false))
+    );
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("OFF · CLEANUP FAILED"));
+}

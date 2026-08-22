@@ -11,6 +11,7 @@ All notable changes are documented here. This project follows Semantic Versionin
 ### Fixed
 
 - Retry a bounded, state-bracketed Smart Left composer snapshot when live Max/Ultra redraws move the cursor row during probing, while continuing to fail through on persistent instability.
+- Stop Smart Naming promptly after disable, using a short cooperative grace period followed by PID/start-time-authenticated pidfd termination of only the owned daemon and its snapshotted descendants when the worker is blocked.
 
 ## [0.9.5] - 2026-08-21
 

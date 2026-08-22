@@ -88,6 +88,9 @@ pub enum Command {
     /// Internal launcher for the tmux-owned smart-naming daemon.
     #[command(hide = true)]
     SmartNamingStart,
+    /// Internal authenticated shutdown for the tmux-server-scoped naming daemon.
+    #[command(hide = true)]
+    SmartNamingStop,
 }
 
 /// Optional exact release selected by the self-update command.

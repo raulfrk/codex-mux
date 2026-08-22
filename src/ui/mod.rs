@@ -207,6 +207,7 @@ pub struct App {
     smart_naming: bool,
     naming_save_warning: bool,
     smart_naming_pending: bool,
+    smart_naming_shutdown_warning: bool,
     inventory_warning: bool,
 }
 
@@ -273,6 +274,7 @@ impl App {
             smart_naming,
             naming_save_warning: false,
             smart_naming_pending: false,
+            smart_naming_shutdown_warning: false,
             inventory_warning: false,
         }
     }
@@ -295,6 +297,7 @@ impl App {
     pub fn smart_naming_saved(&mut self, enabled: bool) {
         self.smart_naming = enabled;
         self.smart_naming_pending = false;
+        self.smart_naming_shutdown_warning = false;
         if self.naming_save_warning {
             self.warning = None;
             self.naming_save_warning = false;
@@ -306,6 +309,15 @@ impl App {
         self.warning = Some(error.into());
         self.inventory_warning = false;
         self.smart_naming_pending = false;
+    }
+
+    /// Keeps the persisted disabled state visible and allows cleanup to be retried.
+    pub fn smart_naming_shutdown_failed(&mut self, error: impl Into<String>) {
+        self.smart_naming = false;
+        self.smart_naming_pending = false;
+        self.smart_naming_shutdown_warning = true;
+        self.warning = Some(error.into());
+        self.inventory_warning = false;
     }
 
     /// Keeps the prior visible state while a daemon shutdown is acknowledged.
@@ -510,8 +522,11 @@ impl App {
 
     fn handle_configuration_key(&mut self, code: KeyCode) -> Option<Action> {
         match code {
-            KeyCode::Char('n') | KeyCode::Char('N') => (!self.smart_naming_pending)
-                .then_some(Action::PersistSmartNaming(!self.smart_naming)),
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                (!self.smart_naming_pending).then_some(Action::PersistSmartNaming(
+                    !self.smart_naming && !self.smart_naming_shutdown_warning,
+                ))
+            }
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = Mode::Browse;
                 None
@@ -1250,6 +1265,8 @@ fn render_configuration(frame: &mut Frame<'_>, area: Rect, app: &App, palette: T
     frame.render_widget(Clear, popup);
     let state = if app.smart_naming_pending {
         "STOPPING"
+    } else if app.smart_naming_shutdown_warning {
+        "OFF · CLEANUP FAILED"
     } else if app.smart_naming {
         "ON"
     } else {
@@ -1261,7 +1278,14 @@ fn render_configuration(frame: &mut Frame<'_>, area: Rect, app: &App, palette: T
             Line::from("GPT-5.6 Luna gets chat"),
             Line::from("Uses allowance · not stored"),
             Line::from("Manual/error keeps title"),
-            Line::styled("N toggle · Esc close", palette.muted),
+            Line::styled(
+                if app.smart_naming_shutdown_warning {
+                    "N retry · Esc close"
+                } else {
+                    "N toggle · Esc close"
+                },
+                palette.muted,
+            ),
         ]
     } else if constrained {
         vec![
@@ -1269,7 +1293,14 @@ fn render_configuration(frame: &mut Frame<'_>, area: Rect, app: &App, palette: T
             Line::from("Shares bounded completed chat with GPT-5.6 Luna."),
             Line::from("Uses Codex allowance; codex-mux stores no chat."),
             Line::from("No restart. Errors/manual names keep current title."),
-            Line::styled("N toggle · C/Esc close", palette.muted),
+            Line::styled(
+                if app.smart_naming_shutdown_warning {
+                    "N retry · C/Esc close"
+                } else {
+                    "N toggle · C/Esc close"
+                },
+                palette.muted,
+            ),
         ]
     } else {
         vec![
@@ -1285,7 +1316,14 @@ fn render_configuration(frame: &mut Frame<'_>, area: Rect, app: &App, palette: T
             Line::from("Works for running sessions without restart. Failures keep current names."),
             Line::from("Manually renamed windows are never overwritten."),
             Line::default(),
-            Line::styled("N toggle · C/Esc close", palette.muted),
+            Line::styled(
+                if app.smart_naming_shutdown_warning {
+                    "N retry cleanup · C/Esc close"
+                } else {
+                    "N toggle · C/Esc close"
+                },
+                palette.muted,
+            ),
         ]
     };
     frame.render_widget(
