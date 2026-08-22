@@ -34,8 +34,15 @@ use crate::{MuxError, Result};
 
 /// Codex model used exclusively for background session naming.
 pub const NAMING_MODEL: &str = "gpt-5.6-luna";
+/// Low effort keeps the short classification task responsive without changing models.
+pub const NAMING_REASONING_EFFORT: &str = "low";
+/// Exact production naming instructions, exposed so evals cannot drift from runtime behavior.
+pub const NAMING_BASE_INSTRUCTIONS: &str = "Return only a concise tmux session title for the sustained project, component, or durable conversation theme. Use the recent chronological excerpt to correct stale early context, but do not name a transient command, bug, release step, or latest task unless it has become the sustained theme. Structural activity contains privacy-sanitized, frequency-ranked repository/component labels; use repeated labels as supporting evidence, especially inside monorepos, but never copy a label unless the conversation supports it. Prefer a recognizable product, component, domain, or broad workstream. No quotes, markup, punctuation suffix, or explanation.";
 /// Maximum UTF-8 payload sent to the naming model.
 pub const MAX_CONVERSATION_BYTES: usize = 12 * 1024;
+const MAX_ACTIVITY_BYTES: usize = 1024;
+const MAX_ACTIVITY_LABELS: usize = 8;
+const MAX_ACTIVITY_PATHS: usize = 128;
 /// Maximum accepted generated title length in Unicode scalar values.
 pub const MAX_NAME_CHARS: usize = 48;
 const THREAD_LIST_PAGE_SIZE: u32 = 100;
@@ -541,6 +548,8 @@ pub struct NamingConversation {
     pub thread_id: String,
     /// Bounded plain user/assistant transcript; never persisted by this crate.
     pub transcript: String,
+    /// Bounded structural project/component evidence containing no raw commands or outputs.
+    pub activity: String,
 }
 
 /// Stable pane/thread identity consumed by the background worker.
@@ -1362,8 +1371,9 @@ impl NamingWorker {
                         CommandSignal::Wake => continue 'worker,
                         CommandSignal::None => {}
                     }
+                    let naming_conversation = prepare_naming_conversation(&conversation);
+                    let fingerprint = transcript_fingerprint(&naming_conversation.transcript);
                     let thread_id = conversation.thread_id.clone();
-                    let fingerprint = transcript_fingerprint(&conversation.transcript);
                     let force_refresh = targets
                         .iter()
                         .any(|target| target.auto_name_token.is_some());
@@ -1371,7 +1381,7 @@ impl NamingWorker {
                         if !force_refresh && *cached == fingerprint {
                             name.clone()
                         } else {
-                            let name = match namer.name(&conversation) {
+                            let name = match namer.name(&naming_conversation) {
                                 Ok(name) => name,
                                 Err(_) if !namer.is_healthy() => {
                                     log_diagnostic(&diagnostics, "naming_provider_unhealthy");
@@ -1390,7 +1400,7 @@ impl NamingWorker {
                             name
                         }
                     } else {
-                        let name = match namer.name(&conversation) {
+                        let name = match namer.name(&naming_conversation) {
                             Ok(name) => name,
                             Err(_) if !namer.is_healthy() => {
                                 log_diagnostic(&diagnostics, "naming_provider_unhealthy");
@@ -1640,6 +1650,309 @@ fn transcript_fingerprint(transcript: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     transcript.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Builds the exact bounded evidence payload sent to the naming model.
+///
+/// This is public so deterministic and live evals exercise the production builder rather than a
+/// duplicated test prompt.
+#[must_use]
+pub fn prepare_naming_conversation(conversation: &NamingConversation) -> NamingConversation {
+    let activity = validated_activity_payload(&conversation.activity);
+    let prefix = if activity.is_empty() {
+        "Structural activity: unavailable\nRecent completed conversation (oldest to newest):\n"
+            .to_owned()
+    } else {
+        format!(
+            "Structural activity (sanitized, most frequent first):\n{}Recent completed conversation (oldest to newest):\n",
+            activity
+        )
+    };
+    let available = MAX_CONVERSATION_BYTES.saturating_sub(prefix.len());
+    let transcript = recent_suffix(&conversation.transcript, available);
+    NamingConversation {
+        thread_id: conversation.thread_id.clone(),
+        transcript: format!("{prefix}{transcript}"),
+        activity: String::new(),
+    }
+}
+
+fn validated_activity_payload(activity: &str) -> String {
+    let mut validated = String::new();
+    for line in activity.lines().take(MAX_ACTIVITY_LABELS) {
+        let Some(body) = line.strip_prefix("- ") else {
+            continue;
+        };
+        let Some((label, count)) = body.rsplit_once(" (") else {
+            continue;
+        };
+        let Some(count) = count.strip_suffix(" observations)") else {
+            continue;
+        };
+        if label.is_empty()
+            || label.len() > 256
+            || !label.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
+            })
+            || count.parse::<usize>().is_err()
+        {
+            continue;
+        }
+        let line = format!("- {label} ({count} observations)\n");
+        if validated.len() + line.len() > MAX_ACTIVITY_BYTES {
+            break;
+        }
+        validated.push_str(&line);
+    }
+    validated
+}
+
+#[derive(Default)]
+struct ActivityDigest {
+    counts: HashMap<String, usize>,
+    labels_by_directory: HashMap<PathBuf, Option<String>>,
+    observed_paths: usize,
+    resolved_directories: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ActivityPathKind {
+    Directory,
+    File,
+}
+
+impl ActivityDigest {
+    fn record(&mut self, path: &Path, cwd: Option<&Path>, kind: ActivityPathKind) {
+        if self.observed_paths >= MAX_ACTIVITY_PATHS {
+            return;
+        }
+        let candidate = if path.is_absolute() {
+            path.to_owned()
+        } else if let Some(cwd) = cwd {
+            cwd.join(path)
+        } else {
+            return;
+        };
+        if !candidate.is_absolute() {
+            return;
+        }
+        self.observed_paths += 1;
+        let directory = normalized_activity_directory(&candidate, kind);
+        let label = if let Some(label) = self.labels_by_directory.get(&directory) {
+            label.clone()
+        } else {
+            let label = activity_label(&directory);
+            self.labels_by_directory
+                .insert(directory.clone(), label.clone());
+            self.resolved_directories += 1;
+            label
+        };
+        if let Some(label) = label {
+            *self.counts.entry(label).or_default() += 1;
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut labels = self.counts.iter().collect::<Vec<_>>();
+        labels.sort_by(|(left_label, left_count), (right_label, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_label.cmp(right_label))
+        });
+        let mut rendered = String::new();
+        for (label, count) in labels.into_iter().take(MAX_ACTIVITY_LABELS) {
+            let line = format!("- {label} ({count} observations)\n");
+            if rendered.len() + line.len() > MAX_ACTIVITY_BYTES {
+                break;
+            }
+            rendered.push_str(&line);
+        }
+        rendered
+    }
+}
+
+fn normalized_activity_directory(path: &Path, kind: ActivityPathKind) -> PathBuf {
+    match kind {
+        ActivityPathKind::Directory => path,
+        ActivityPathKind::File => path.parent().unwrap_or(path),
+    }
+    .to_owned()
+}
+
+fn activity_label(path: &Path) -> Option<String> {
+    canonicalize_nearest_existing(path)
+        .as_deref()
+        .and_then(repository_activity_label)
+}
+
+fn canonicalize_nearest_existing(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = cursor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        suffix.push(cursor.file_name()?.to_owned());
+        if suffix.len() > 64 {
+            return None;
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
+fn repository_activity_label(path: &Path) -> Option<String> {
+    let mut cursor = Some(path);
+    while let Some(candidate) = cursor {
+        let git = candidate.join(".git");
+        let git_type = git
+            .symlink_metadata()
+            .ok()
+            .map(|metadata| metadata.file_type());
+        if git_type
+            .as_ref()
+            .is_some_and(|kind| kind.is_dir() || kind.is_file())
+        {
+            if let Some(repository) = repository_name(candidate, &git) {
+                let component = nearest_manifest_component(path, candidate);
+                return component
+                    .filter(|component| !component.as_os_str().is_empty())
+                    .and_then(|component| safe_relative_component(&component))
+                    .map_or_else(
+                        || Some(repository.clone()),
+                        |component| Some(format!("{repository}/{component}")),
+                    );
+            }
+        }
+        cursor = candidate.parent();
+    }
+    None
+}
+
+fn repository_name(root: &Path, git: &Path) -> Option<String> {
+    if git.is_file() {
+        let contents = read_git_marker(git)?;
+        let git_dir = contents.trim().strip_prefix("gitdir: ")?;
+        let git_dir = Path::new(git_dir);
+        let git_dir = if git_dir.is_absolute() {
+            git_dir.to_owned()
+        } else {
+            root.join(git_dir)
+        };
+        let git_dir = git_dir.canonicalize().ok()?;
+        let dot_git = git_dir
+            .ancestors()
+            .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(".git"))?;
+        if dot_git.is_dir() {
+            if let Some(name) = dot_git.parent().and_then(Path::file_name) {
+                return safe_project_component(name);
+            }
+        }
+        return None;
+    }
+    root.file_name().and_then(safe_project_component)
+}
+
+#[cfg(unix)]
+fn read_git_marker(path: &Path) -> Option<String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let file = fs::File::from(fd);
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CURSOR_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CURSOR_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_CURSOR_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(not(unix))]
+fn read_git_marker(_: &Path) -> Option<String> {
+    None
+}
+
+fn nearest_manifest_component(path: &Path, repository: &Path) -> Option<PathBuf> {
+    const MANIFESTS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pnpm-workspace.yaml",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "Package.swift",
+    ];
+    let mut cursor = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    loop {
+        if MANIFESTS
+            .iter()
+            .any(|manifest| cursor.join(manifest).is_file())
+        {
+            return cursor.strip_prefix(repository).ok().map(Path::to_owned);
+        }
+        if cursor == repository {
+            return None;
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
+fn safe_relative_component(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return None;
+        };
+        parts.push(safe_project_component(component)?);
+        if parts.len() > 6 || parts.iter().map(String::len).sum::<usize>() > 192 {
+            return None;
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn safe_project_component(value: &std::ffi::OsStr) -> Option<String> {
+    let value = value.to_str()?.trim();
+    (!value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.len() <= 64
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        }))
+    .then(|| value.to_owned())
+}
+
+fn recent_suffix(transcript: &str, maximum: usize) -> &str {
+    if transcript.len() <= maximum {
+        return transcript;
+    }
+    let mut start = transcript.len() - maximum;
+    while !transcript.is_char_boundary(start) {
+        start += 1;
+    }
+    let suffix = &transcript[start..];
+    suffix
+        .find('\n')
+        .map_or(suffix, |newline| &suffix[newline + 1..])
 }
 
 pub(crate) fn looks_like_thread_id(value: &str) -> bool {
@@ -2874,6 +3187,7 @@ fn read_rollout_transcript(
         let _ = reader.read_until(b'\n', &mut partial);
     }
     let mut transcript = RecentTranscript::default();
+    let mut activity = ActivityDigest::default();
     let mut seen_item_ids = HashSet::new();
     let mut legacy_assistant_for_pair: Option<String> = None;
     let mut line = Vec::new();
@@ -2891,6 +3205,14 @@ fn read_rollout_transcript(
         }
         let paired_legacy_assistant = legacy_assistant_for_pair.take();
         if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+            if matches!(
+                value["type"].as_str(),
+                Some("session_meta" | "turn_context")
+            ) {
+                if let Some(cwd) = bounded_activity_path(&value["payload"]["cwd"]) {
+                    activity.record(cwd, None, ActivityPathKind::Directory);
+                }
+            }
             if value["type"] == "event_msg"
                 && value.pointer("/payload/type").and_then(Value::as_str) == Some("item_completed")
             {
@@ -2944,7 +3266,17 @@ fn read_rollout_transcript(
     Ok(NamingConversation {
         thread_id: thread_id.to_owned(),
         transcript: transcript.render(),
+        activity: activity.render(),
     })
+}
+
+fn bounded_activity_path(value: &Value) -> Option<&Path> {
+    let path = value.as_str()?;
+    (!path.is_empty()
+        && path.len() <= MAX_CURSOR_BYTES
+        && !path.chars().any(char::is_control)
+        && !path.chars().any(is_unsafe_format_character))
+    .then(|| Path::new(path))
 }
 
 fn rollout_single_text(content: &Value) -> Option<&str> {
@@ -3189,6 +3521,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
     /// Reads structured completed turns through the bounded paginated API.
     pub fn read_completed(&mut self, thread_id: &str) -> Result<NamingConversation> {
         let mut transcript = RecentTranscript::default();
+        let mut activity = ActivityDigest::default();
         let mut completed_turns = HashSet::new();
         let mut request_budget = MAX_HISTORY_REQUESTS;
         let mut cursor: Option<String> = None;
@@ -3248,11 +3581,13 @@ impl<S: AppServerSession> AppServerNamer<S> {
             thread_id,
             &completed_turns,
             &mut transcript,
+            &mut activity,
             &mut request_budget,
         )?;
         Ok(NamingConversation {
             thread_id: thread_id.to_owned(),
             transcript: transcript.render_reversed(),
+            activity: activity.render(),
         })
     }
 
@@ -3261,10 +3596,13 @@ impl<S: AppServerSession> AppServerNamer<S> {
         thread_id: &str,
         completed_turns: &HashSet<String>,
         transcript: &mut RecentTranscript,
+        activity: &mut ActivityDigest,
         request_budget: &mut usize,
     ) -> Result<()> {
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
+        let mut turn_cwds = HashMap::<String, PathBuf>::new();
+        let mut pending_paths = Vec::<(String, PathBuf, ActivityPathKind)>::new();
         for _ in 0..MAX_THREAD_TURNS_PAGES {
             take_history_request(request_budget)?;
             let response = self.session.request(
@@ -3283,6 +3621,23 @@ impl<S: AppServerSession> AppServerNamer<S> {
                 return Err(protocol(
                     "thread/items/list exceeded its requested page size",
                 ));
+            }
+            for entry in items {
+                let Some(turn_id) = entry["turnId"].as_str() else {
+                    continue;
+                };
+                if !completed_turns.contains(turn_id) {
+                    continue;
+                }
+                let item = &entry["item"];
+                if item["type"] == "commandExecution" {
+                    if let Some(cwd) = bounded_activity_path(&item["cwd"]) {
+                        if cwd.is_absolute() {
+                            activity.record(cwd, None, ActivityPathKind::Directory);
+                            turn_cwds.insert(turn_id.to_owned(), cwd.to_owned());
+                        }
+                    }
+                }
             }
             for entry in items {
                 let Some(turn_id) = entry["turnId"].as_str() else {
@@ -3313,6 +3668,46 @@ impl<S: AppServerSession> AppServerNamer<S> {
                             transcript.push_newest_first("Assistant", text);
                         }
                     }
+                    Some("commandExecution") => {
+                        let cwd = turn_cwds.get(turn_id).map(PathBuf::as_path);
+                        if let Some(actions) = item["commandActions"].as_array() {
+                            for action in actions {
+                                if let Some(path) = bounded_activity_path(&action["path"]) {
+                                    let kind = match action["type"].as_str() {
+                                        Some("listFiles" | "search") => ActivityPathKind::Directory,
+                                        _ => ActivityPathKind::File,
+                                    };
+                                    if path.is_absolute() || cwd.is_some() {
+                                        activity.record(path, cwd, kind);
+                                    } else if pending_paths.len() < MAX_ACTIVITY_PATHS {
+                                        pending_paths.push((
+                                            turn_id.to_owned(),
+                                            path.to_owned(),
+                                            kind,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("fileChange") => {
+                        let cwd = turn_cwds.get(turn_id).map(PathBuf::as_path);
+                        if let Some(changes) = item["changes"].as_array() {
+                            for change in changes {
+                                if let Some(path) = bounded_activity_path(&change["path"]) {
+                                    if path.is_absolute() || cwd.is_some() {
+                                        activity.record(path, cwd, ActivityPathKind::File);
+                                    } else if pending_paths.len() < MAX_ACTIVITY_PATHS {
+                                        pending_paths.push((
+                                            turn_id.to_owned(),
+                                            path.to_owned(),
+                                            ActivityPathKind::File,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3323,6 +3718,9 @@ impl<S: AppServerSession> AppServerNamer<S> {
                 }
             }
             if transcript.bytes >= MAX_CONVERSATION_BYTES || next.is_none() {
+                for (turn_id, path, kind) in pending_paths {
+                    activity.record(&path, turn_cwds.get(&turn_id).map(PathBuf::as_path), kind);
+                }
                 return Ok(());
             }
             cursor = next;
@@ -3371,7 +3769,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
                 "ephemeral": true,
                 "sandbox": "read-only",
                 "approvalPolicy": "never",
-                "baseInstructions": "Return only a concise descriptive tmux session title. No quotes, markup, punctuation suffix, or explanation."
+                "baseInstructions": NAMING_BASE_INSTRUCTIONS
             }),
         )?;
         let naming_thread = started
@@ -3383,6 +3781,7 @@ impl<S: AppServerSession> AppServerNamer<S> {
             json!({
                 "threadId": naming_thread,
                 "model": NAMING_MODEL,
+                "effort": NAMING_REASONING_EFFORT,
                 "input": [{"type": "text", "text": conversation.transcript}],
                 "outputSchema": {
                     "type": "object",
@@ -3542,6 +3941,167 @@ mod transport_tests {
         let rendered = newest_first.render_reversed();
         assert!(!rendered.contains("older answer"));
         assert!(rendered.find("newest question") < rendered.find("newest answer"));
+    }
+
+    #[test]
+    fn naming_evidence_uses_proven_activity_and_recent_complete_messages() {
+        let root = env::temp_dir().join(format!(
+            "codex-mux-project-evidence-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("durable-product");
+        let nested = project.join("crates/session-naming/src");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            project.join("crates/session-naming/Cargo.toml"),
+            "[package]\n",
+        )
+        .unwrap();
+        let mut activity = ActivityDigest::default();
+        activity.record(&nested.join("prompt.rs"), None, ActivityPathKind::File);
+        let conversation = NamingConversation {
+            thread_id: "12345678-1234-1234-1234-123456789abc".to_owned(),
+            transcript: format!(
+                "User: stale bootstrap task {}\nAssistant: established durable product architecture\nUser: recent project direction\n",
+                "x".repeat(MAX_CONVERSATION_BYTES)
+            ),
+            activity: activity.render(),
+        };
+
+        let evidence = prepare_naming_conversation(&conversation);
+
+        assert!(evidence.transcript.len() <= MAX_CONVERSATION_BYTES);
+        assert!(
+            evidence
+                .transcript
+                .starts_with("Structural activity (sanitized, most frequent first):\n- durable-product/crates/session-naming")
+        );
+        assert!(!evidence.transcript.contains("stale bootstrap task"));
+        assert!(
+            evidence
+                .transcript
+                .contains("established durable product architecture")
+        );
+        assert!(evidence.transcript.contains("recent project direction"));
+
+        let worktree = root.join("release-lane");
+        let git_dir = project.join(".git/worktrees/release-lane");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::create_dir_all(worktree.join("nested")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        fs::write(worktree.join("Cargo.toml"), "[workspace]\n").unwrap();
+        assert_eq!(
+            activity_label(&worktree.join("nested")).as_deref(),
+            Some("durable-product")
+        );
+
+        #[cfg(unix)]
+        {
+            let linked = root.join("linked-checkout");
+            std::os::unix::fs::symlink(&project, &linked).unwrap();
+            assert_eq!(
+                activity_label(&linked.join("crates/session-naming/src/prompt.rs")).as_deref(),
+                Some("durable-product/crates/session-naming")
+            );
+
+            let escaped = project.join("escaped-repository");
+            std::os::unix::fs::symlink("/proc", &escaped).unwrap();
+            assert_eq!(activity_label(&escaped), None);
+
+            let other = root.join("actual-other-product");
+            fs::create_dir_all(other.join(".git")).unwrap();
+            fs::create_dir_all(other.join("services/api")).unwrap();
+            fs::write(
+                other.join("services/api/go.mod"),
+                "module example.invalid/api\n",
+            )
+            .unwrap();
+            let cross_repository = project.join("linked-other-product");
+            std::os::unix::fs::symlink(&other, &cross_repository).unwrap();
+            assert_eq!(
+                activity_label(&cross_repository.join("services/api")).as_deref(),
+                Some("actual-other-product/services/api")
+            );
+        }
+
+        let dotted = project.join("packages/sdk.v2");
+        fs::create_dir_all(&dotted).unwrap();
+        fs::write(dotted.join("package.json"), "{}").unwrap();
+        assert_eq!(
+            normalized_activity_directory(&dotted, ActivityPathKind::Directory),
+            dotted
+        );
+        assert_eq!(
+            activity_label(&dotted).as_deref(),
+            Some("durable-product/packages/sdk.v2")
+        );
+
+        let outside = root.join("home/temporary-task");
+        fs::create_dir_all(&outside).unwrap();
+        assert_ne!(activity_label(&outside).as_deref(), Some("temporary-task"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn structural_activity_has_hard_work_and_output_bounds() {
+        let root = env::temp_dir().join(format!(
+            "codex-mux-activity-bounds-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let component = root.join("bounded-product/packages/naming/src");
+        fs::create_dir_all(root.join("bounded-product/.git")).unwrap();
+        fs::create_dir_all(&component).unwrap();
+        fs::write(
+            root.join("bounded-product/packages/naming/package.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let mut activity = ActivityDigest::default();
+        for index in 0..10_000 {
+            activity.record(
+                &component.join(format!("file-{index}.rs")),
+                None,
+                ActivityPathKind::File,
+            );
+        }
+        assert_eq!(activity.observed_paths, MAX_ACTIVITY_PATHS);
+        assert_eq!(activity.resolved_directories, 1);
+        assert!(activity.render().len() <= MAX_ACTIVITY_BYTES);
+        assert!(
+            activity
+                .render()
+                .contains("bounded-product/packages/naming")
+        );
+
+        let unsafe_path = root.join("bounded-product/token=secret/packages/naming");
+        let mut unsafe_activity = ActivityDigest::default();
+        unsafe_activity.record(&unsafe_path, None, ActivityPathKind::Directory);
+        assert!(!unsafe_activity.render().contains("secret"));
+
+        let oversized_marker = root.join("oversized-git-marker");
+        fs::write(&oversized_marker, vec![b'x'; MAX_CURSOR_BYTES + 1]).unwrap();
+        assert_eq!(read_git_marker(&oversized_marker), None);
+        #[cfg(unix)]
+        {
+            let linked_marker = root.join("linked-git-marker");
+            std::os::unix::fs::symlink(&oversized_marker, &linked_marker).unwrap();
+            assert_eq!(read_git_marker(&linked_marker), None);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4067,6 +4627,7 @@ mod transport_tests {
                     } else {
                         "completed chat".to_owned()
                     },
+                    activity: String::new(),
                 })
             }
 
@@ -4110,6 +4671,60 @@ mod transport_tests {
     }
 
     #[test]
+    fn changed_activity_invalidates_the_name_cache_while_unchanged_evidence_deduplicates() {
+        struct EvidenceNamer {
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+            names: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ConversationNamer for EvidenceNamer {
+            fn read(&mut self, target: &NamingTarget) -> Result<NamingConversation> {
+                let read = self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(NamingConversation {
+                    thread_id: target.thread_hint.clone(),
+                    transcript: "same completed conversation".to_owned(),
+                    activity: if read == 0 {
+                        "- product/component-a (3 observations)\n".to_owned()
+                    } else {
+                        "- product/component-b (3 observations)\n".to_owned()
+                    },
+                })
+            }
+
+            fn name(&mut self, _: &NamingConversation) -> Result<String> {
+                let call = self.names.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(format!("Generated title {call}"))
+            }
+        }
+
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let names = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_reads = reads.clone();
+        let observed_names = names.clone();
+        let target = target_created_at(0);
+        let worker = NamingWorker::spawn_with_intervals(
+            move |_| {
+                Ok(EvidenceNamer {
+                    reads: observed_reads,
+                    names: observed_names,
+                })
+            },
+            move || Ok(vec![target.clone()]),
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while (names.load(Ordering::SeqCst) < 2 || reads.load(Ordering::SeqCst) < 3)
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        worker.stop();
+        assert!(reads.load(Ordering::SeqCst) >= 3);
+        assert_eq!(names.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn trigger_discovers_a_resumed_thread_without_waiting_for_the_normal_poll() {
         struct ReadyNamer;
         impl ConversationNamer for ReadyNamer {
@@ -4117,6 +4732,7 @@ mod transport_tests {
                 Ok(NamingConversation {
                     thread_id: target.thread_hint.clone(),
                     transcript: "completed resumed chat".to_owned(),
+                    activity: String::new(),
                 })
             }
 
@@ -4157,6 +4773,7 @@ mod transport_tests {
                 Ok(NamingConversation {
                     thread_id: target.thread_hint.clone(),
                     transcript: "completed chat".to_owned(),
+                    activity: String::new(),
                 })
             }
 
@@ -4199,6 +4816,7 @@ mod transport_tests {
                 Ok(NamingConversation {
                     thread_id: target.thread_hint.clone(),
                     transcript: "completed chat".to_owned(),
+                    activity: String::new(),
                 })
             }
 
@@ -4237,6 +4855,7 @@ mod transport_tests {
                 Ok(NamingConversation {
                     thread_id: target.thread_hint.clone(),
                     transcript: "completed chat".to_owned(),
+                    activity: String::new(),
                 })
             }
 

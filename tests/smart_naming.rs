@@ -13,8 +13,8 @@ use codex_mux::{
     MuxError, Result,
     smart_naming::{
         AppServerNamer, AppServerProcess, AppServerSession, ConversationNamer,
-        MAX_CONVERSATION_BYTES, NAMING_MODEL, NamingConversation, NamingTarget, NamingWorker,
-        RolloutStore, start_if_enabled,
+        MAX_CONVERSATION_BYTES, NAMING_MODEL, NAMING_REASONING_EFFORT, NamingConversation,
+        NamingTarget, NamingWorker, RolloutStore, start_if_enabled,
     },
 };
 use serde_json::{Value, json};
@@ -214,6 +214,53 @@ fn verified_rollout_resolves_without_cwd_and_recovers_when_app_server_is_unavail
             .count(),
         1
     );
+}
+
+#[test]
+fn rollout_fallback_derives_only_sanitized_structural_cwd_evidence() {
+    let scratch = Scratch::new("rollout-activity");
+    let sessions = scratch.0.join("sessions/2026/08/22");
+    let component = scratch.0.join("product/services/gateway");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(scratch.0.join("product/.git")).unwrap();
+    fs::create_dir_all(&component).unwrap();
+    fs::write(component.join("go.mod"), "module example.invalid/gateway\n").unwrap();
+    let full = "01a01001-2dbb-74e2-86ab-996b31234567";
+    let rollout = sessions.join(format!("rollout-2026-08-22T00-00-00-{full}.jsonl"));
+    let records = [
+        json!({"type": "session_meta", "payload": {"id": full, "cwd": component}}),
+        json!({"type": "turn_context", "payload": {"cwd": component, "private": "must-not-leak"}}),
+        json!({"type": "event_msg", "payload": {"type": "user_message", "message": "Continue gateway reliability"}}),
+    ];
+    fs::write(
+        &rollout,
+        records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let mut namer = AppServerNamer::new(UnavailableSession)
+        .with_rollouts(RolloutStore::at(scratch.0.join("sessions")));
+    let target = NamingTarget {
+        pane_id: PaneId::new("%7").unwrap(),
+        session_id: SessionId::new("$1").unwrap(),
+        pane_pid: 77,
+        pane_title: full.to_owned(),
+        thread_hint: full.to_owned(),
+        cwd: scratch.0.clone(),
+        generated_name: None,
+        generated_at_unix: None,
+        immediate_naming: false,
+        auto_name_token: None,
+    };
+    let conversation = ConversationNamer::read(&mut namer, &target).unwrap();
+    assert!(conversation.activity.contains("product/services/gateway"));
+    assert!(!conversation.activity.contains("must-not-leak"));
+    assert!(!conversation.activity.contains(scratch.0.to_str().unwrap()));
 }
 
 #[test]
@@ -623,6 +670,135 @@ fn reads_only_completed_user_and_assistant_text_with_a_hard_bound() {
 }
 
 #[test]
+fn structured_activity_covers_common_repository_and_monorepo_styles_without_extra_requests() {
+    let scratch = Scratch::new("activity-repository-styles");
+    let cases = [
+        ("standalone-rust", "crates/terminal-ui", "Cargo.toml"),
+        ("npm-workspace", "packages/session-picker", "package.json"),
+        ("python-monorepo", "services/naming", "pyproject.toml"),
+        ("go-workspace", "cmd/mux-daemon", "go.mod"),
+        ("java-multiproject", "modules/process-match", "pom.xml"),
+    ];
+
+    for (repository_name, component, manifest) in cases {
+        let repository = scratch.0.join(repository_name);
+        let component_root = repository.join(component);
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        fs::create_dir_all(component_root.join("src")).unwrap();
+        fs::write(component_root.join(manifest), "eval fixture").unwrap();
+        let source = component_root.join("src/lib.rs");
+        fs::write(&source, "// fixture").unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let session = FakeSession {
+            replies: VecDeque::from([
+                json!({"data": [{"id": "turn-1", "status": "completed"}], "nextCursor": null}),
+                json!({"data": [
+                    {"turnId": "turn-1", "item": {
+                        "type": "commandExecution",
+                        "cwd": component_root,
+                        "command": "do-not-retain --token secret-value",
+                        "aggregatedOutput": "secret-output",
+                        "commandActions": [{"type": "read", "path": "src/lib.rs", "command": "ignored", "name": "lib.rs"}]
+                    }},
+                    {"turnId": "turn-1", "item": {
+                        "type": "fileChange",
+                        "changes": [{"path": source, "kind": "update", "diff": "credential=secret"}]
+                    }},
+                    {"turnId": "turn-1", "item": {"type": "userMessage", "content": [{"type": "text", "text": "Improve durable session naming"}]}}
+                ], "nextCursor": null}),
+            ]),
+            calls: calls.clone(),
+        };
+
+        let conversation = AppServerNamer::new(session)
+            .read_completed("source-thread")
+            .unwrap();
+        let expected = format!("{repository_name}/{component}");
+        assert!(
+            conversation.activity.contains(&expected),
+            "{conversation:?}"
+        );
+        assert!(!conversation.activity.contains("secret"));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "activity added an API round"
+        );
+    }
+}
+
+#[test]
+fn relative_structured_paths_never_resolve_against_the_mux_daemon_cwd() {
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [{"id": "turn-1", "status": "completed"}], "nextCursor": null}),
+            json!({"data": [
+                {"turnId": "turn-1", "item": {
+                    "type": "commandExecution",
+                    "cwd": ".",
+                    "command": "ignored",
+                    "commandActions": [{"type": "read", "path": "src/smart_naming.rs", "command": "ignored", "name": "smart_naming.rs"}]
+                }},
+                {"turnId": "turn-1", "item": {
+                    "type": "fileChange",
+                    "changes": [{"path": "src/lib.rs", "kind": "update", "diff": "ignored"}]
+                }},
+                {"turnId": "turn-1", "item": {"type": "userMessage", "content": [{"type": "text", "text": "Keep naming private"}]}}
+            ], "nextCursor": null}),
+        ]),
+        calls: Arc::default(),
+    };
+
+    let conversation = AppServerNamer::new(session)
+        .read_completed("source-thread")
+        .unwrap();
+    assert!(conversation.activity.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_parent_traversal_uses_filesystem_symlink_semantics() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = Scratch::new("activity-symlink-parent");
+    let containing = scratch.0.join("containing-product");
+    let target = scratch.0.join("actual-product/services");
+    fs::create_dir_all(containing.join(".git")).unwrap();
+    fs::create_dir_all(target.join("api")).unwrap();
+    fs::create_dir_all(target.join("shared")).unwrap();
+    fs::create_dir_all(scratch.0.join("actual-product/.git")).unwrap();
+    fs::write(target.join("shared/package.json"), "{}").unwrap();
+    symlink(target.join("api"), containing.join("linked-api")).unwrap();
+
+    let session = FakeSession {
+        replies: VecDeque::from([
+            json!({"data": [{"id": "turn-1", "status": "completed"}], "nextCursor": null}),
+            json!({"data": [
+                {"turnId": "turn-1", "item": {
+                    "type": "commandExecution",
+                    "cwd": containing,
+                    "command": "ignored",
+                    "commandActions": [{"type": "listFiles", "path": "linked-api/../shared", "command": "ignored"}]
+                }},
+                {"turnId": "turn-1", "item": {"type": "userMessage", "content": [{"type": "text", "text": "Work on shared API support"}]}}
+            ], "nextCursor": null}),
+        ]),
+        calls: Arc::default(),
+    };
+
+    let conversation = AppServerNamer::new(session)
+        .read_completed("source-thread")
+        .unwrap();
+    assert!(
+        conversation
+            .activity
+            .contains("actual-product/services/shared")
+    );
+    assert!(!conversation.activity.contains("containing-product/shared"));
+}
+
+#[test]
 fn resolves_one_truncated_thread_across_pages_after_cwd_changes() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let full = "01a01001-2dbb-74e2-86ab-996b31234567";
@@ -1020,6 +1196,7 @@ fn starts_an_ephemeral_exact_luna_thread_and_validates_output() {
     let conversation = NamingConversation {
         thread_id: "source".to_owned(),
         transcript: "User: speed up everything".to_owned(),
+        activity: String::new(),
     };
     assert_eq!(
         namer.generate_name(&conversation).unwrap(),
@@ -1032,9 +1209,14 @@ fn starts_an_ephemeral_exact_luna_thread_and_validates_output() {
     assert_eq!(calls[0].1["ephemeral"], true);
     assert_eq!(calls[0].1["sandbox"], "read-only");
     assert_eq!(calls[0].1["approvalPolicy"], "never");
+    let instructions = calls[0].1["baseInstructions"].as_str().unwrap();
+    assert!(instructions.contains("sustained project, component, or durable conversation theme"));
+    assert!(instructions.contains("do not name a transient"));
+    assert!(instructions.contains("privacy-sanitized, frequency-ranked"));
     assert_eq!(calls[1].0, "turn/start");
     assert_eq!(calls[1].1["threadId"], "naming-thread");
     assert_eq!(calls[1].1["model"], NAMING_MODEL);
+    assert_eq!(calls[1].1["effort"], NAMING_REASONING_EFFORT);
     assert_eq!(calls[1].1["input"][0]["text"], "User: speed up everything");
     assert_eq!(calls[1].1["outputSchema"]["additionalProperties"], false);
     assert_eq!(
@@ -1063,6 +1245,7 @@ impl ConversationNamer for ParallelNamer {
         Ok(NamingConversation {
             thread_id: target.thread_hint.clone(),
             transcript: "recent completed exchange".to_owned(),
+            activity: String::new(),
         })
     }
 
@@ -1095,6 +1278,7 @@ impl ConversationNamer for CountingNamer {
         Ok(NamingConversation {
             thread_id: target.thread_hint.clone(),
             transcript: "completed chat".to_owned(),
+            activity: String::new(),
         })
     }
     fn name(&mut self, _: &NamingConversation) -> Result<String> {
@@ -1207,6 +1391,7 @@ fn parallel_worker_forces_fresh_discovery_before_publication() {
             Ok(NamingConversation {
                 thread_id: target.thread_hint.clone(),
                 transcript: "completed chat".to_owned(),
+                activity: String::new(),
             })
         }
         fn name(&mut self, _: &NamingConversation) -> Result<String> {
@@ -1568,6 +1753,7 @@ fn wake_arriving_during_naming_restarts_discovery_without_waiting_for_polling() 
             Ok(NamingConversation {
                 thread_id: target.thread_hint.clone(),
                 transcript: "completed chat".to_owned(),
+                activity: String::new(),
             })
         }
 
@@ -1638,6 +1824,7 @@ fn fanout_resolution_does_not_hold_the_generated_names_lock() {
             Ok(NamingConversation {
                 thread_id: "01999999-1111-7777-8888-123456789abc".to_owned(),
                 transcript: "completed chat".to_owned(),
+                activity: String::new(),
             })
         }
 
@@ -1736,6 +1923,7 @@ fn worker_discovers_future_targets_and_rejects_stale_results() {
             Ok(NamingConversation {
                 thread_id: target.thread_hint.clone(),
                 transcript: "completed chat".to_owned(),
+                activity: String::new(),
             })
         }
         fn name(&mut self, _: &NamingConversation) -> Result<String> {
@@ -1843,6 +2031,7 @@ fn worker_re_resolves_truncated_identity_before_publishing() {
             Ok(NamingConversation {
                 thread_id: self.resolve(target)?,
                 transcript: "completed chat".to_owned(),
+                activity: String::new(),
             })
         }
 
@@ -1885,6 +2074,7 @@ fn stop_cancels_active_provider_work_before_joining() {
             Ok(NamingConversation {
                 thread_id: target.thread_hint.clone(),
                 transcript: "chat".to_owned(),
+                activity: String::new(),
             })
         }
         fn name(&mut self, _: &NamingConversation) -> Result<String> {

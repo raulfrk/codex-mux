@@ -12,6 +12,8 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 - Retry a bounded, state-bracketed Smart Left composer snapshot when live Max/Ultra redraws move the cursor row during probing, while continuing to fail through on persistent instability.
 - Stop Smart Naming promptly after disable, using a short cooperative grace period followed by PID/start-time-authenticated pidfd termination of only the owned daemon and its snapshotted descendants when the worker is blocked.
+- Prefer durable project, component, or conversation-theme titles using recent chronological context plus a bounded privacy-safe activity digest from existing structured history; recognize common monorepo manifests and Git worktrees without trusting pane cwd or adding another model round.
+- Add deterministic production-prompt evals across common repository layouts and an opt-in parallel live Luna eval corpus for naming accuracy, transient-topic rejection, formatting, and latency.
 
 ## [0.9.5] - 2026-08-21
 
